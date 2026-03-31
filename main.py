@@ -3,10 +3,14 @@ from fastapi.responses import JSONResponse
 import os
 import requests
 import xmlrpc.client
-from typing import Optional
+from typing import Optional, Any
 
 app = FastAPI()
 
+
+# =========================================================
+# Helpers generales
+# =========================================================
 
 def get_env(name: str, required: bool = True) -> str:
     value = os.getenv(name)
@@ -26,6 +30,50 @@ def normalize_rut(rut: str) -> str:
     return rut.strip().upper().replace(".", "").replace(" ", "")
 
 
+def to_int_env(name: str, required: bool = True) -> Optional[int]:
+    raw = get_env(name, required=required)
+    if not raw:
+        return None
+    return int(raw)
+
+
+def first_non_empty(*values):
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if value:
+            return value
+    return ""
+
+
+def recursive_find_first(data: Any, keys: list[str]) -> str:
+    """
+    Busca de forma recursiva el primer valor string no vacío
+    para cualquiera de las llaves indicadas.
+    """
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in keys and isinstance(value, str) and value.strip():
+                return value.strip()
+            found = recursive_find_first(value, keys)
+            if found:
+                return found
+
+    elif isinstance(data, list):
+        for item in data:
+            found = recursive_find_first(item, keys)
+            if found:
+                return found
+
+    return ""
+
+
+# =========================================================
+# Endpoints base
+# =========================================================
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "lemulux-odoo"}
@@ -38,24 +86,16 @@ def health():
 
 @app.get("/ml/test")
 def test_ml():
+    """
+    Prueba simple del token usando una orden puntual no sirve sin order_id.
+    Este endpoint solo confirma que el servicio está arriba y que hay token cargado.
+    """
     try:
         token = get_env("ML_ACCESS_TOKEN")
-        seller_id = "70127647"
-
-        r = requests.get(
-            f"https://api.mercadolibre.com/orders/search?seller={seller_id}&limit=1",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-        )
-
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text}
-
         return {
-            "status_code": r.status_code,
-            "response": data,
+            "status": "ok",
+            "token_loaded": bool(token),
+            "message": "OAuth cargado. La prueba real ocurre vía /ml/webhook con orders_v2.",
         }
     except Exception as e:
         return JSONResponse(
@@ -63,6 +103,10 @@ def test_ml():
             content={"error": "Exception", "detail": str(e)},
         )
 
+
+# =========================================================
+# OAuth Mercado Libre
+# =========================================================
 
 @app.get("/ml/oauth/callback")
 async def oauth_callback(request: Request):
@@ -116,6 +160,10 @@ async def oauth_callback(request: Request):
         )
 
 
+# =========================================================
+# Mercado Libre API
+# =========================================================
+
 def ml_headers():
     token = get_env("ML_ACCESS_TOKEN")
     return {"Authorization": f"Bearer {token}"}
@@ -155,13 +203,10 @@ def get_ml_shipment(shipment_id: str) -> dict:
 
 def extract_rut_from_billing_info(billing: dict) -> str:
     candidates = [
-        billing.get("doc_number"),
-        billing.get("billing_info", {}).get("doc_number")
-        if isinstance(billing.get("billing_info"), dict)
-        else None,
-        billing.get("additional_info", {}).get("doc_number")
-        if isinstance(billing.get("additional_info"), dict)
-        else None,
+        recursive_find_first(billing, ["doc_number"]),
+        recursive_find_first(billing, ["document_number"]),
+        recursive_find_first(billing, ["vat"]),
+        recursive_find_first(billing, ["rut"]),
     ]
 
     for candidate in candidates:
@@ -171,6 +216,20 @@ def extract_rut_from_billing_info(billing: dict) -> str:
 
     return ""
 
+
+def extract_activity_from_billing_info(billing: dict) -> str:
+    return first_non_empty(
+        recursive_find_first(billing, ["business_activity"]),
+        recursive_find_first(billing, ["activity"]),
+        recursive_find_first(billing, ["economic_activity"]),
+        recursive_find_first(billing, ["taxpayer_activity"]),
+        recursive_find_first(billing, ["giro"]),
+    )
+
+
+# =========================================================
+# Odoo API
+# =========================================================
 
 def odoo_connect():
     odoo_url = get_env("ODOO_URL")
@@ -186,6 +245,10 @@ def odoo_connect():
     models = xmlrpc.client.ServerProxy(f"{odoo_url}/xmlrpc/2/object")
     return odoo_db, odoo_api_key, uid, models
 
+
+# =========================================================
+# Partners / Clientes
+# =========================================================
 
 def find_partner_by_rut(models, odoo_db, uid, odoo_api_key, rut: str) -> Optional[int]:
     rut = normalize_rut(rut)
@@ -220,23 +283,24 @@ def find_partner_by_buyer_id(models, odoo_db, uid, odoo_api_key, buyer_id: str) 
     return ids[0] if ids else None
 
 
-def append_ml_buyer_id_to_partner(models, odoo_db, uid, odoo_api_key, partner_id: int, buyer_id: str):
-    if not buyer_id:
-        return
-
+def read_partner(models, odoo_db, uid, odoo_api_key, partner_id: int) -> dict:
     data = models.execute_kw(
         odoo_db,
         uid,
         odoo_api_key,
         "res.partner",
         "read",
-        [[partner_id], ["comment"]],
+        [[partner_id], ["name", "vat", "comment", "company_type", "is_company"]],
     )
+    return data[0] if data else {}
 
-    if not data:
+
+def append_ml_buyer_id_to_partner(models, odoo_db, uid, odoo_api_key, partner_id: int, buyer_id: str):
+    if not buyer_id:
         return
 
-    current_comment = data[0].get("comment") or ""
+    partner_data = read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
+    current_comment = partner_data.get("comment") or ""
     marker = f"ML_BUYER_ID:{buyer_id}"
 
     if marker in current_comment:
@@ -255,19 +319,7 @@ def append_ml_buyer_id_to_partner(models, odoo_db, uid, odoo_api_key, partner_id
 
 
 def update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id: int, buyer: dict, rut: str):
-    data = models.execute_kw(
-        odoo_db,
-        uid,
-        odoo_api_key,
-        "res.partner",
-        "read",
-        [[partner_id], ["name", "vat"]],
-    )
-
-    if not data:
-        return
-
-    current = data[0]
+    current = read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
     vals = {}
 
     if not current.get("vat") and rut:
@@ -309,25 +361,67 @@ def create_partner(models, odoo_db, uid, odoo_api_key, buyer: dict, rut: str) ->
     )
 
 
-def find_or_create_partner(buyer: dict, billing: dict) -> int:
+def find_or_create_partner(buyer: dict, billing: dict) -> tuple[int, dict]:
     odoo_db, odoo_api_key, uid, models = odoo_connect()
 
     buyer_id = str(buyer.get("id", ""))
     rut = extract_rut_from_billing_info(billing)
 
+    # 1. Buscar por RUT
     partner_id = find_partner_by_rut(models, odoo_db, uid, odoo_api_key, rut)
     if partner_id:
         append_ml_buyer_id_to_partner(models, odoo_db, uid, odoo_api_key, partner_id, buyer_id)
         update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id, buyer, rut)
-        return partner_id
+        return partner_id, read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
 
+    # 2. Buscar por buyer_id ML
     partner_id = find_partner_by_buyer_id(models, odoo_db, uid, odoo_api_key, buyer_id)
     if partner_id:
         update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id, buyer, rut)
-        return partner_id
+        return partner_id, read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
 
-    return create_partner(models, odoo_db, uid, odoo_api_key, buyer, rut)
+    # 3. Crear nuevo
+    partner_id = create_partner(models, odoo_db, uid, odoo_api_key, buyer, rut)
+    return partner_id, read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
 
+
+# =========================================================
+# Decisión factura / boleta
+# =========================================================
+
+def partner_looks_like_company(partner_data: dict) -> bool:
+    if not partner_data:
+        return False
+
+    if partner_data.get("company_type") == "company":
+        return True
+
+    if partner_data.get("is_company") is True:
+        return True
+
+    return False
+
+
+def decide_document_kind(partner_data: dict, billing: dict) -> tuple[str, str]:
+    """
+    Regla pedida:
+    - Si existe en Odoo como empresa -> factura
+    - Si ML trae actividad económica -> factura
+    - En los demás casos -> boleta
+    """
+    if partner_looks_like_company(partner_data):
+        return "factura", "Cliente existente en Odoo clasificado como empresa"
+
+    activity = extract_activity_from_billing_info(billing)
+    if activity:
+        return "factura", "Mercado Libre trae actividad económica"
+
+    return "boleta", "Sin actividad económica y no clasificado como empresa en Odoo"
+
+
+# =========================================================
+# Facturas / Boletas
+# =========================================================
 
 def find_existing_invoice(order_id: str) -> Optional[int]:
     odoo_db, odoo_api_key, uid, models = odoo_connect()
@@ -344,17 +438,20 @@ def find_existing_invoice(order_id: str) -> Optional[int]:
     return ids[0] if ids else None
 
 
-def create_invoice_in_odoo(order: dict, billing: dict) -> dict:
-    order_id = str(order["id"])
+def get_document_type_id(document_kind: str) -> int:
+    if document_kind == "factura":
+        doc_id = to_int_env("ODOO_DOC_TYPE_FACTURA_ID", required=True)
+        return doc_id
 
-    existing = find_existing_invoice(order_id)
-    if existing:
-        return {"ok": True, "message": "Factura ya existe", "invoice_id": existing}
+    if document_kind == "boleta":
+        doc_id = to_int_env("ODOO_DOC_TYPE_BOLETA_ID", required=True)
+        return doc_id
 
+    raise Exception(f"Tipo de documento no soportado: {document_kind}")
+
+
+def create_account_move(order: dict, partner_id: int, document_kind: str) -> int:
     odoo_db, odoo_api_key, uid, models = odoo_connect()
-
-    buyer = order.get("buyer", {})
-    partner_id = find_or_create_partner(buyer, billing)
 
     lines = []
     for row in order.get("order_items", []):
@@ -378,20 +475,23 @@ def create_invoice_in_odoo(order: dict, billing: dict) -> dict:
     if not lines:
         raise Exception("La orden no tiene líneas para facturar")
 
-    invoice_vals = {
+    document_type_id = get_document_type_id(document_kind)
+
+    vals = {
         "move_type": "out_invoice",
         "partner_id": partner_id,
-        "ref": f"ML-{order_id}",
+        "ref": f"ML-{order['id']}",
         "invoice_line_ids": lines,
+        "l10n_latam_document_type_id": document_type_id,
     }
 
-    invoice_id = models.execute_kw(
+    move_id = models.execute_kw(
         odoo_db,
         uid,
         odoo_api_key,
         "account.move",
         "create",
-        [invoice_vals],
+        [vals],
     )
 
     models.execute_kw(
@@ -400,11 +500,37 @@ def create_invoice_in_odoo(order: dict, billing: dict) -> dict:
         odoo_api_key,
         "account.move",
         "action_post",
-        [[invoice_id]],
+        [[move_id]],
     )
 
-    return {"ok": True, "message": "Factura creada", "invoice_id": invoice_id}
+    return move_id
 
+
+def create_document_in_odoo(order: dict, billing: dict) -> dict:
+    order_id = str(order["id"])
+
+    existing = find_existing_invoice(order_id)
+    if existing:
+        return {"ok": True, "message": "Documento ya existe", "invoice_id": existing}
+
+    buyer = order.get("buyer", {})
+    partner_id, partner_data = find_or_create_partner(buyer, billing)
+
+    document_kind, reason = decide_document_kind(partner_data, billing)
+    move_id = create_account_move(order, partner_id, document_kind)
+
+    return {
+        "ok": True,
+        "message": f"{document_kind.capitalize()} creada",
+        "document_kind": document_kind,
+        "reason": reason,
+        "invoice_id": move_id,
+    }
+
+
+# =========================================================
+# Webhook Mercado Libre
+# =========================================================
 
 @app.post("/ml/webhook")
 async def webhook(request: Request):
@@ -444,11 +570,11 @@ async def webhook(request: Request):
         if shipment_status != "shipped":
             return {
                 "ok": True,
-                "message": f"No se factura aún. Status envío: {shipment_status}",
+                "message": f"No se documenta aún. Status envío: {shipment_status}",
             }
 
         billing = get_ml_billing_info(order_id)
-        result = create_invoice_in_odoo(order, billing)
+        result = create_document_in_odoo(order, billing)
         return result
 
     except requests.HTTPError as e:
