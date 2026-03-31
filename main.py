@@ -49,10 +49,6 @@ def first_non_empty(*values):
 
 
 def recursive_find_first(data: Any, keys: list[str]) -> str:
-    """
-    Busca de forma recursiva el primer valor string no vacío
-    para cualquiera de las llaves indicadas.
-    """
     if isinstance(data, dict):
         for key, value in data.items():
             if key in keys and isinstance(value, str) and value.strip():
@@ -60,13 +56,11 @@ def recursive_find_first(data: Any, keys: list[str]) -> str:
             found = recursive_find_first(value, keys)
             if found:
                 return found
-
     elif isinstance(data, list):
         for item in data:
             found = recursive_find_first(item, keys)
             if found:
                 return found
-
     return ""
 
 
@@ -86,16 +80,12 @@ def health():
 
 @app.get("/ml/test")
 def test_ml():
-    """
-    Prueba simple del token usando una orden puntual no sirve sin order_id.
-    Este endpoint solo confirma que el servicio está arriba y que hay token cargado.
-    """
     try:
         token = get_env("ML_ACCESS_TOKEN")
         return {
             "status": "ok",
             "token_loaded": bool(token),
-            "message": "OAuth cargado. La prueba real ocurre vía /ml/webhook con orders_v2.",
+            "message": "Servicio operativo. La prueba real ocurre vía webhook orders_v2.",
         }
     except Exception as e:
         return JSONResponse(
@@ -121,13 +111,9 @@ async def oauth_callback(request: Request):
     except RuntimeError as e:
         return JSONResponse(
             status_code=500,
-            content={
-                "error": "Configuración incompleta en Railway",
-                "detail": str(e),
-            },
+            content={"error": "Configuración incompleta en Railway", "detail": str(e)},
         )
 
-    token_url = "https://api.mercadolibre.com/oauth/token"
     payload = {
         "grant_type": "authorization_code",
         "client_id": client_id,
@@ -137,7 +123,11 @@ async def oauth_callback(request: Request):
     }
 
     try:
-        response = requests.post(token_url, data=payload, timeout=30)
+        response = requests.post(
+            "https://api.mercadolibre.com/oauth/token",
+            data=payload,
+            timeout=30,
+        )
         try:
             data = response.json()
         except Exception:
@@ -153,10 +143,7 @@ async def oauth_callback(request: Request):
     except requests.RequestException as e:
         return JSONResponse(
             status_code=500,
-            content={
-                "error": "No se pudo conectar con Mercado Libre",
-                "detail": str(e),
-            },
+            content={"error": "No se pudo conectar con Mercado Libre", "detail": str(e)},
         )
 
 
@@ -213,7 +200,6 @@ def extract_rut_from_billing_info(billing: dict) -> str:
         rut = normalize_rut(candidate or "")
         if rut:
             return rut
-
     return ""
 
 
@@ -223,8 +209,37 @@ def extract_activity_from_billing_info(billing: dict) -> str:
         recursive_find_first(billing, ["activity"]),
         recursive_find_first(billing, ["economic_activity"]),
         recursive_find_first(billing, ["taxpayer_activity"]),
+        recursive_find_first(billing, ["activity_description"]),
         recursive_find_first(billing, ["giro"]),
+        recursive_find_first(billing, ["description_of_activity"]),
     )
+
+
+def extract_taxpayer_type_from_billing_info(billing: dict) -> str:
+    return first_non_empty(
+        recursive_find_first(billing, ["taxpayer_type"]),
+        recursive_find_first(billing, ["taxpayer_kind"]),
+        recursive_find_first(billing, ["taxpayer_category"]),
+        recursive_find_first(billing, ["contributor_type"]),
+        recursive_find_first(billing, ["tipo_contribuyente"]),
+    ).lower()
+
+
+def ml_looks_like_company(billing: dict, buyer: dict) -> bool:
+    name = first_non_empty(
+        recursive_find_first(billing, ["name"]),
+        recursive_find_first(billing, ["social_reason"]),
+        recursive_find_first(billing, ["razon_social"]),
+        buyer.get("nickname"),
+        buyer.get("first_name"),
+    ).upper()
+
+    company_markers = [
+        "SPA", "SPA.", "EIRL", "LTDA", "S.A", "S.A.", "SOCIEDAD",
+        "COMERCIAL", "COMERCIALIZADORA", "CONSTRUCTORA",
+        "TRANSPORTES", "INVERSIONES", "IMPORTADORA", "EXPORTADORA",
+    ]
+    return any(marker in name for marker in company_markers)
 
 
 # =========================================================
@@ -250,15 +265,15 @@ def odoo_connect():
 # Partners / Clientes
 # =========================================================
 
-def find_partner_by_rut(models, odoo_db, uid, odoo_api_key, rut: str) -> Optional[int]:
+def find_partner_by_rut(models, db, uid, api_key, rut: str) -> Optional[int]:
     rut = normalize_rut(rut)
     if not rut:
         return None
 
     ids = models.execute_kw(
-        odoo_db,
+        db,
         uid,
-        odoo_api_key,
+        api_key,
         "res.partner",
         "search",
         [[["vat", "=", rut]]],
@@ -267,14 +282,14 @@ def find_partner_by_rut(models, odoo_db, uid, odoo_api_key, rut: str) -> Optiona
     return ids[0] if ids else None
 
 
-def find_partner_by_buyer_id(models, odoo_db, uid, odoo_api_key, buyer_id: str) -> Optional[int]:
+def find_partner_by_buyer_id(models, db, uid, api_key, buyer_id: str) -> Optional[int]:
     if not buyer_id:
         return None
 
     ids = models.execute_kw(
-        odoo_db,
+        db,
         uid,
-        odoo_api_key,
+        api_key,
         "res.partner",
         "search",
         [[["comment", "ilike", f"ML_BUYER_ID:{buyer_id}"]]],
@@ -283,11 +298,11 @@ def find_partner_by_buyer_id(models, odoo_db, uid, odoo_api_key, buyer_id: str) 
     return ids[0] if ids else None
 
 
-def read_partner(models, odoo_db, uid, odoo_api_key, partner_id: int) -> dict:
+def read_partner(models, db, uid, api_key, partner_id: int) -> dict:
     data = models.execute_kw(
-        odoo_db,
+        db,
         uid,
-        odoo_api_key,
+        api_key,
         "res.partner",
         "read",
         [[partner_id], ["name", "vat", "comment", "company_type", "is_company"]],
@@ -295,11 +310,11 @@ def read_partner(models, odoo_db, uid, odoo_api_key, partner_id: int) -> dict:
     return data[0] if data else {}
 
 
-def append_ml_buyer_id_to_partner(models, odoo_db, uid, odoo_api_key, partner_id: int, buyer_id: str):
+def append_ml_buyer_id_to_partner(models, db, uid, api_key, partner_id: int, buyer_id: str):
     if not buyer_id:
         return
 
-    partner_data = read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
+    partner_data = read_partner(models, db, uid, api_key, partner_id)
     current_comment = partner_data.get("comment") or ""
     marker = f"ML_BUYER_ID:{buyer_id}"
 
@@ -309,17 +324,17 @@ def append_ml_buyer_id_to_partner(models, odoo_db, uid, odoo_api_key, partner_id
     new_comment = f"{current_comment}\n{marker}".strip()
 
     models.execute_kw(
-        odoo_db,
+        db,
         uid,
-        odoo_api_key,
+        api_key,
         "res.partner",
         "write",
         [[partner_id], {"comment": new_comment}],
     )
 
 
-def update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id: int, buyer: dict, rut: str):
-    current = read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
+def update_partner_missing_data(models, db, uid, api_key, partner_id: int, buyer: dict, rut: str):
+    current = read_partner(models, db, uid, api_key, partner_id)
     vals = {}
 
     if not current.get("vat") and rut:
@@ -331,30 +346,46 @@ def update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id: 
 
     if vals:
         models.execute_kw(
-            odoo_db,
+            db,
             uid,
-            odoo_api_key,
+            api_key,
             "res.partner",
             "write",
             [[partner_id], vals],
         )
 
 
-def create_partner(models, odoo_db, uid, odoo_api_key, buyer: dict, rut: str) -> int:
+def create_partner(models, db, uid, api_key, buyer: dict, billing: dict, rut: str) -> int:
     buyer_id = str(buyer.get("id", ""))
-    partner_name = buyer.get("nickname") or buyer.get("first_name") or "Cliente Mercado Libre"
+    partner_name = first_non_empty(
+        recursive_find_first(billing, ["name"]),
+        recursive_find_first(billing, ["social_reason"]),
+        recursive_find_first(billing, ["razon_social"]),
+        buyer.get("nickname"),
+        buyer.get("first_name"),
+        "Cliente Mercado Libre",
+    )
+
+    activity = extract_activity_from_billing_info(billing)
+    taxpayer_type = extract_taxpayer_type_from_billing_info(billing)
+
+    looks_company = bool(activity) or ml_looks_like_company(billing, buyer)
+    if taxpayer_type == "consumidor final":
+        looks_company = False
 
     vals = {
         "name": partner_name,
         "vat": rut or False,
         "comment": f"ML_BUYER_ID:{buyer_id}" if buyer_id else False,
         "customer_rank": 1,
+        "company_type": "company" if looks_company else "person",
+        "is_company": True if looks_company else False,
     }
 
     return models.execute_kw(
-        odoo_db,
+        db,
         uid,
-        odoo_api_key,
+        api_key,
         "res.partner",
         "create",
         [vals],
@@ -362,74 +393,73 @@ def create_partner(models, odoo_db, uid, odoo_api_key, buyer: dict, rut: str) ->
 
 
 def find_or_create_partner(buyer: dict, billing: dict) -> tuple[int, dict]:
-    odoo_db, odoo_api_key, uid, models = odoo_connect()
+    db, api_key, uid, models = odoo_connect()
 
     buyer_id = str(buyer.get("id", ""))
     rut = extract_rut_from_billing_info(billing)
 
-    # 1. Buscar por RUT
-    partner_id = find_partner_by_rut(models, odoo_db, uid, odoo_api_key, rut)
+    partner_id = find_partner_by_rut(models, db, uid, api_key, rut)
     if partner_id:
-        append_ml_buyer_id_to_partner(models, odoo_db, uid, odoo_api_key, partner_id, buyer_id)
-        update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id, buyer, rut)
-        return partner_id, read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
+        append_ml_buyer_id_to_partner(models, db, uid, api_key, partner_id, buyer_id)
+        update_partner_missing_data(models, db, uid, api_key, partner_id, buyer, rut)
+        return partner_id, read_partner(models, db, uid, api_key, partner_id)
 
-    # 2. Buscar por buyer_id ML
-    partner_id = find_partner_by_buyer_id(models, odoo_db, uid, odoo_api_key, buyer_id)
+    partner_id = find_partner_by_buyer_id(models, db, uid, api_key, buyer_id)
     if partner_id:
-        update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id, buyer, rut)
-        return partner_id, read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
+        update_partner_missing_data(models, db, uid, api_key, partner_id, buyer, rut)
+        return partner_id, read_partner(models, db, uid, api_key, partner_id)
 
-    # 3. Crear nuevo
-    partner_id = create_partner(models, odoo_db, uid, odoo_api_key, buyer, rut)
-    return partner_id, read_partner(models, odoo_db, uid, odoo_api_key, partner_id)
+    partner_id = create_partner(models, db, uid, api_key, buyer, billing, rut)
+    return partner_id, read_partner(models, db, uid, api_key, partner_id)
 
 
 # =========================================================
 # Decisión factura / boleta
 # =========================================================
 
-def partner_looks_like_company(partner_data: dict) -> bool:
+def partner_is_company(partner_data: dict) -> bool:
     if not partner_data:
         return False
-
     if partner_data.get("company_type") == "company":
         return True
-
     if partner_data.get("is_company") is True:
         return True
-
     return False
 
 
 def decide_document_kind(partner_data: dict, billing: dict) -> tuple[str, str]:
-    """
-    Regla pedida:
-    - Si existe en Odoo como empresa -> factura
-    - Si ML trae actividad económica -> factura
-    - En los demás casos -> boleta
-    """
-    if partner_looks_like_company(partner_data):
-        return "factura", "Cliente existente en Odoo clasificado como empresa"
-
+    rut = normalize_rut(partner_data.get("vat") or "")
     activity = extract_activity_from_billing_info(billing)
-    if activity:
-        return "factura", "Mercado Libre trae actividad económica"
+    taxpayer_type = extract_taxpayer_type_from_billing_info(billing)
 
-    return "boleta", "Sin actividad económica y no clasificado como empresa en Odoo"
+    # FACTURA:
+    # - empresa en Odoo
+    # - con RUT
+    # - con actividad económica
+    # - y no consumidor final
+    if (
+        partner_is_company(partner_data)
+        and rut
+        and activity
+        and taxpayer_type != "consumidor final"
+    ):
+        return "factura", "Empresa con RUT, actividad económica y no consumidor final"
+
+    # BOLETA en todos los demás casos
+    return "boleta", "Consumidor final, persona natural o sin actividad económica"
 
 
 # =========================================================
-# Facturas / Boletas
+# Documentos
 # =========================================================
 
-def find_existing_invoice(order_id: str) -> Optional[int]:
-    odoo_db, odoo_api_key, uid, models = odoo_connect()
+def find_existing_move(order_id: str) -> Optional[int]:
+    db, api_key, uid, models = odoo_connect()
 
     ids = models.execute_kw(
-        odoo_db,
+        db,
         uid,
-        odoo_api_key,
+        api_key,
         "account.move",
         "search",
         [[["ref", "=", f"ML-{order_id}"]]],
@@ -440,18 +470,14 @@ def find_existing_invoice(order_id: str) -> Optional[int]:
 
 def get_document_type_id(document_kind: str) -> int:
     if document_kind == "factura":
-        doc_id = to_int_env("ODOO_DOC_TYPE_FACTURA_ID", required=True)
-        return doc_id
-
+        return to_int_env("ODOO_DOC_TYPE_FACTURA_ID", required=True)
     if document_kind == "boleta":
-        doc_id = to_int_env("ODOO_DOC_TYPE_BOLETA_ID", required=True)
-        return doc_id
-
+        return to_int_env("ODOO_DOC_TYPE_BOLETA_ID", required=True)
     raise Exception(f"Tipo de documento no soportado: {document_kind}")
 
 
 def create_account_move(order: dict, partner_id: int, document_kind: str) -> int:
-    odoo_db, odoo_api_key, uid, models = odoo_connect()
+    db, api_key, uid, models = odoo_connect()
 
     lines = []
     for row in order.get("order_items", []):
@@ -461,43 +487,37 @@ def create_account_move(order: dict, partner_id: int, document_kind: str) -> int
         unit_price_net = round(unit_price_gross / 1.19, 2)
 
         lines.append(
-            (
-                0,
-                0,
-                {
-                    "name": title,
-                    "quantity": qty,
-                    "price_unit": unit_price_net,
-                },
-            )
+            (0, 0, {
+                "name": title,
+                "quantity": qty,
+                "price_unit": unit_price_net,
+            })
         )
 
     if not lines:
-        raise Exception("La orden no tiene líneas para facturar")
-
-    document_type_id = get_document_type_id(document_kind)
+        raise Exception("La orden no tiene líneas para documentar")
 
     vals = {
         "move_type": "out_invoice",
         "partner_id": partner_id,
         "ref": f"ML-{order['id']}",
         "invoice_line_ids": lines,
-        "l10n_latam_document_type_id": document_type_id,
+        "l10n_latam_document_type_id": get_document_type_id(document_kind),
     }
 
     move_id = models.execute_kw(
-        odoo_db,
+        db,
         uid,
-        odoo_api_key,
+        api_key,
         "account.move",
         "create",
         [vals],
     )
 
     models.execute_kw(
-        odoo_db,
+        db,
         uid,
-        odoo_api_key,
+        api_key,
         "account.move",
         "action_post",
         [[move_id]],
@@ -509,9 +529,13 @@ def create_account_move(order: dict, partner_id: int, document_kind: str) -> int
 def create_document_in_odoo(order: dict, billing: dict) -> dict:
     order_id = str(order["id"])
 
-    existing = find_existing_invoice(order_id)
+    existing = find_existing_move(order_id)
     if existing:
-        return {"ok": True, "message": "Documento ya existe", "invoice_id": existing}
+        return {
+            "ok": True,
+            "message": "Documento ya existe",
+            "move_id": existing,
+        }
 
     buyer = order.get("buyer", {})
     partner_id, partner_data = find_or_create_partner(buyer, billing)
@@ -524,7 +548,7 @@ def create_document_in_odoo(order: dict, billing: dict) -> dict:
         "message": f"{document_kind.capitalize()} creada",
         "document_kind": document_kind,
         "reason": reason,
-        "invoice_id": move_id,
+        "move_id": move_id,
     }
 
 
@@ -555,7 +579,7 @@ async def webhook(request: Request):
         if order.get("status") != "paid":
             return {
                 "ok": True,
-                "message": f"Orden no facturable todavía. Status orden: {order.get('status')}",
+                "message": f"Orden no documentable todavía. Status orden: {order.get('status')}",
             }
 
         shipping = order.get("shipping", {}) or {}
