@@ -48,48 +48,123 @@ async def oauth_callback(request: Request):
 
     response = requests.post(token_url, data=payload, timeout=30)
 
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
     return {
         "status_code": response.status_code,
-        "response": response.json()
+        "response": data
     }
 
 
-def get_ml_order(order_id):
+def ml_headers():
+    return {"Authorization": f"Bearer {ML_ACCESS_TOKEN}"}
+
+
+def get_ml_order(order_id: str):
     response = requests.get(
         f"https://api.mercadolibre.com/orders/{order_id}",
-        headers={"Authorization": f"Bearer {ML_ACCESS_TOKEN}"},
+        headers=ml_headers(),
+        timeout=30,
     )
+    response.raise_for_status()
     return response.json()
 
 
-def create_invoice(order):
-    uid, models = odoo_connect()
+def get_ml_shipment(shipment_id: str):
+    response = requests.get(
+        f"https://api.mercadolibre.com/shipments/{shipment_id}",
+        headers=ml_headers(),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
 
-    partner_id = models.execute_kw(
+
+def find_existing_invoice(uid, models, order_id: str):
+    ids = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY,
-        "res.partner", "create",
-        [{
-            "name": "Cliente MercadoLibre",
-            "customer_rank": 1
-        }]
+        "account.move", "search",
+        [[["ref", "=", f"ML-{order_id}"]]],
+        {"limit": 1}
+    )
+    return ids[0] if ids else None
+
+
+def find_or_create_partner(uid, models, buyer):
+    buyer_id = str(buyer.get("id", ""))
+    partner_name = (
+        buyer.get("nickname")
+        or buyer.get("first_name")
+        or "Cliente Mercado Libre"
     )
 
+    partner_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY,
+        "res.partner", "search",
+        [[["comment", "=", f"ML_BUYER_ID:{buyer_id}"]]],
+        {"limit": 1}
+    )
+    if partner_ids:
+        return partner_ids[0]
+
+    vals = {
+        "name": partner_name,
+        "comment": f"ML_BUYER_ID:{buyer_id}",
+        "customer_rank": 1,
+    }
+
+    return models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY,
+        "res.partner", "create",
+        [vals]
+    )
+
+
+def create_invoice_in_odoo(order):
+    uid, models = odoo_connect()
+    order_id = str(order["id"])
+
+    existing_invoice_id = find_existing_invoice(uid, models, order_id)
+    if existing_invoice_id:
+        return {
+            "ok": True,
+            "message": "Factura ya existe",
+            "invoice_id": existing_invoice_id
+        }
+
+    buyer = order.get("buyer", {})
+    partner_id = find_or_create_partner(uid, models, buyer)
+
     lines = []
-    for item in order["order_items"]:
+    for row in order.get("order_items", []):
+        title = row.get("item", {}).get("title", "Producto Mercado Libre")
+        qty = row.get("quantity", 1)
+        unit_price_gross = float(row.get("unit_price", 0))
+        unit_price_net = round(unit_price_gross / 1.19, 2)
+
         lines.append((0, 0, {
-            "name": item["item"]["title"],
-            "quantity": item["quantity"],
-            "price_unit": round(item["unit_price"] / 1.19, 2)
+            "name": title,
+            "quantity": qty,
+            "price_unit": unit_price_net,
         }))
+
+    if not lines:
+        raise Exception("La orden no tiene líneas para facturar")
+
+    invoice_vals = {
+        "move_type": "out_invoice",
+        "partner_id": partner_id,
+        "ref": f"ML-{order_id}",
+        "invoice_line_ids": lines,
+    }
 
     invoice_id = models.execute_kw(
         ODOO_DB, uid, ODOO_API_KEY,
         "account.move", "create",
-        [{
-            "move_type": "out_invoice",
-            "partner_id": partner_id,
-            "invoice_line_ids": lines,
-        }]
+        [invoice_vals]
     )
 
     models.execute_kw(
@@ -98,23 +173,59 @@ def create_invoice(order):
         [[invoice_id]]
     )
 
-    return invoice_id
+    return {
+        "ok": True,
+        "message": "Factura creada",
+        "invoice_id": invoice_id
+    }
 
 
 @app.post("/ml/webhook")
 async def webhook(request: Request):
     data = await request.json()
 
-    if data.get("topic") != "orders_v2":
-        return {"ok": True}
+    topic = data.get("topic")
+    resource = data.get("resource", "")
 
-    order_id = data["resource"].split("/")[-1]
+    if topic != "orders_v2":
+        return {"ok": True, "message": "Topic ignorado"}
 
-    order = get_ml_order(order_id)
+    order_id = resource.split("/")[-1]
+    if not order_id:
+        raise HTTPException(status_code=400, detail="No se pudo extraer order_id")
 
-    if order.get("status") != "paid":
-        return {"ok": True, "message": "Aún no pagado"}
+    try:
+        order = get_ml_order(order_id)
 
-    invoice_id = create_invoice(order)
+        if order.get("status") != "paid":
+            return {
+                "ok": True,
+                "message": f"Orden no facturable aún. Status orden: {order.get('status')}"
+            }
 
-    return {"ok": True, "invoice_id": invoice_id}
+        shipping = order.get("shipping", {}) or {}
+        shipment_id = shipping.get("id")
+
+        if not shipment_id:
+            return {
+                "ok": True,
+                "message": "La orden no tiene shipment_id aún"
+            }
+
+        shipment = get_ml_shipment(str(shipment_id))
+        shipment_status = shipment.get("status")
+
+        if shipment_status != "shipped":
+            return {
+                "ok": True,
+                "message": f"Aún no se factura. Status envío: {shipment_status}"
+            }
+
+        result = create_invoice_in_odoo(order)
+        return result
+
+    except requests.HTTPError as e:
+        detail = e.response.text if e.response is not None else str(e)
+        raise HTTPException(status_code=500, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
