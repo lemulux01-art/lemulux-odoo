@@ -8,10 +8,6 @@ from typing import Optional
 app = FastAPI()
 
 
-# =========================================================
-# Helpers generales
-# =========================================================
-
 def get_env(name: str, required: bool = True) -> str:
     value = os.getenv(name)
     if value is None:
@@ -27,13 +23,8 @@ def get_env(name: str, required: bool = True) -> str:
 def normalize_rut(rut: str) -> str:
     if not rut:
         return ""
-    rut = rut.strip().upper().replace(".", "").replace(" ", "")
-    return rut
+    return rut.strip().upper().replace(".", "").replace(" ", "")
 
-
-# =========================================================
-# Endpoints base
-# =========================================================
 
 @app.get("/")
 def root():
@@ -47,16 +38,16 @@ def health():
 
 @app.get("/ml/test")
 def test_ml():
-    """
-    Prueba si el token actual de Mercado Libre sigue vigente.
-    """
     try:
         token = get_env("ML_ACCESS_TOKEN")
+        seller_id = "70127647"
+
         r = requests.get(
-            "https://api.mercadolibre.com/users/me",
+            f"https://api.mercadolibre.com/orders/search?seller={seller_id}&limit=1",
             headers={"Authorization": f"Bearer {token}"},
             timeout=30,
         )
+
         try:
             data = r.json()
         except Exception:
@@ -72,10 +63,6 @@ def test_ml():
             content={"error": "Exception", "detail": str(e)},
         )
 
-
-# =========================================================
-# OAuth Mercado Libre
-# =========================================================
 
 @app.get("/ml/oauth/callback")
 async def oauth_callback(request: Request):
@@ -129,10 +116,6 @@ async def oauth_callback(request: Request):
         )
 
 
-# =========================================================
-# Mercado Libre API
-# =========================================================
-
 def ml_headers():
     token = get_env("ML_ACCESS_TOKEN")
     return {"Authorization": f"Bearer {token}"}
@@ -171,9 +154,6 @@ def get_ml_shipment(shipment_id: str) -> dict:
 
 
 def extract_rut_from_billing_info(billing: dict) -> str:
-    """
-    Intenta extraer doc_number/RUT desde distintas estructuras posibles.
-    """
     candidates = [
         billing.get("doc_number"),
         billing.get("billing_info", {}).get("doc_number")
@@ -192,10 +172,6 @@ def extract_rut_from_billing_info(billing: dict) -> str:
     return ""
 
 
-# =========================================================
-# Odoo API
-# =========================================================
-
 def odoo_connect():
     odoo_url = get_env("ODOO_URL")
     odoo_db = get_env("ODOO_DB")
@@ -210,10 +186,6 @@ def odoo_connect():
     models = xmlrpc.client.ServerProxy(f"{odoo_url}/xmlrpc/2/object")
     return odoo_db, odoo_api_key, uid, models
 
-
-# =========================================================
-# Partners / Clientes
-# =========================================================
 
 def find_partner_by_rut(models, odoo_db, uid, odoo_api_key, rut: str) -> Optional[int]:
     rut = normalize_rut(rut)
@@ -302,11 +274,7 @@ def update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id: 
         vals["vat"] = rut
 
     if not current.get("name") or current.get("name") == "Cliente Mercado Libre":
-        suggested_name = (
-            buyer.get("nickname")
-            or buyer.get("first_name")
-            or "Cliente Mercado Libre"
-        )
+        suggested_name = buyer.get("nickname") or buyer.get("first_name") or "Cliente Mercado Libre"
         vals["name"] = suggested_name
 
     if vals:
@@ -322,11 +290,7 @@ def update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id: 
 
 def create_partner(models, odoo_db, uid, odoo_api_key, buyer: dict, rut: str) -> int:
     buyer_id = str(buyer.get("id", ""))
-    partner_name = (
-        buyer.get("nickname")
-        or buyer.get("first_name")
-        or "Cliente Mercado Libre"
-    )
+    partner_name = buyer.get("nickname") or buyer.get("first_name") or "Cliente Mercado Libre"
 
     vals = {
         "name": partner_name,
@@ -351,26 +315,19 @@ def find_or_create_partner(buyer: dict, billing: dict) -> int:
     buyer_id = str(buyer.get("id", ""))
     rut = extract_rut_from_billing_info(billing)
 
-    # 1. Buscar por RUT
     partner_id = find_partner_by_rut(models, odoo_db, uid, odoo_api_key, rut)
     if partner_id:
         append_ml_buyer_id_to_partner(models, odoo_db, uid, odoo_api_key, partner_id, buyer_id)
         update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id, buyer, rut)
         return partner_id
 
-    # 2. Buscar por buyer_id de ML
     partner_id = find_partner_by_buyer_id(models, odoo_db, uid, odoo_api_key, buyer_id)
     if partner_id:
         update_partner_missing_data(models, odoo_db, uid, odoo_api_key, partner_id, buyer, rut)
         return partner_id
 
-    # 3. Crear nuevo
     return create_partner(models, odoo_db, uid, odoo_api_key, buyer, rut)
 
-
-# =========================================================
-# Facturas
-# =========================================================
 
 def find_existing_invoice(order_id: str) -> Optional[int]:
     odoo_db, odoo_api_key, uid, models = odoo_connect()
@@ -448,10 +405,6 @@ def create_invoice_in_odoo(order: dict, billing: dict) -> dict:
 
     return {"ok": True, "message": "Factura creada", "invoice_id": invoice_id}
 
-
-# =========================================================
-# Webhook Mercado Libre
-# =========================================================
 
 @app.post("/ml/webhook")
 async def webhook(request: Request):
