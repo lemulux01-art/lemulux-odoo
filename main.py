@@ -474,3 +474,20 @@ async def webhook(request: Request):
             status_code=500,
             content={"error": "Exception", "detail": str(e)},
         )
+        @app.get("/ml/test")
+def test_ml():
+    token = get_env("ML_ACCESS_TOKEN")
+    r = requests.get(
+        "https://api.mercadolibre.com/users/me",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+
+    return {
+        "status_code": r.status_code,
+        "response": data
+    }
