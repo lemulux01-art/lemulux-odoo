@@ -130,17 +130,135 @@ def health():
     return {"status": "healthy"}
 
 
-@app.get("/ml/test")
-def test_ml():
+# =========================================================
+# Diagnóstico completo
+# =========================================================
+
+@app.get("/ml/diagnostico")
+def diagnostico():
+    """
+    Verifica el estado de todos los componentes del sistema:
+    - Variables de entorno
+    - Conexión y token de Mercado Libre
+    - Conexión a Odoo
+    - Configuración de tipos de documento
+    """
+    resultado = {
+        "servicio": "ok",
+        "variables": {},
+        "mercadolibre": {},
+        "odoo": {},
+        "documentos": {},
+    }
+
+    # ── 1. Variables de entorno ──────────────────────────
+    faltantes = [k for k in REQUIRED_ENV_VARS if not os.getenv(k, "").strip()]
+    placeholders = [k for k in ["ML_ACCESS_TOKEN", "ML_REFRESH_TOKEN"] if os.getenv(k, "") == "placeholder"]
+
+    resultado["variables"] = {
+        "ok": len(faltantes) == 0 and len(placeholders) == 0,
+        "faltantes": faltantes,
+        "placeholders": placeholders,
+    }
+
+    # ── 2. Mercado Libre ─────────────────────────────────
     try:
         token = get_env("ML_ACCESS_TOKEN")
-        return {
-            "status": "ok",
-            "token_loaded": bool(token),
-            "message": "Servicio operativo. La prueba real ocurre vía webhook orders_v2.",
-        }
+        response = requests.get(
+            "https://api.mercadolibre.com/users/me",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            resultado["mercadolibre"] = {
+                "ok": True,
+                "user_id": data.get("id"),
+                "nickname": data.get("nickname"),
+                "email": data.get("email"),
+                "token_valido": True,
+            }
+        elif response.status_code == 401:
+            resultado["mercadolibre"] = {
+                "ok": False,
+                "error": "Token expirado o inválido (401)",
+                "token_valido": False,
+            }
+        else:
+            resultado["mercadolibre"] = {
+                "ok": False,
+                "error": f"Error inesperado: {response.status_code}",
+                "token_valido": False,
+            }
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": "Exception", "detail": str(e)})
+        resultado["mercadolibre"] = {"ok": False, "error": str(e)}
+
+    # ── 3. Odoo ──────────────────────────────────────────
+    try:
+        odoo_url = get_env("ODOO_URL")
+        odoo_db = get_env("ODOO_DB")
+        odoo_user = get_env("ODOO_USER")
+        odoo_api_key = get_env("ODOO_API_KEY")
+
+        common = xmlrpc.client.ServerProxy(f"{odoo_url}/xmlrpc/2/common")
+        uid = common.authenticate(odoo_db, odoo_user, odoo_api_key, {})
+
+        if uid:
+            resultado["odoo"] = {
+                "ok": True,
+                "uid": uid,
+                "url": odoo_url,
+                "db": odoo_db,
+            }
+        else:
+            resultado["odoo"] = {
+                "ok": False,
+                "error": "Autenticación fallida — verifica ODOO_USER y ODOO_API_KEY",
+            }
+    except Exception as e:
+        resultado["odoo"] = {"ok": False, "error": str(e)}
+
+    # ── 4. Tipos de documento ────────────────────────────
+    try:
+        factura_id = to_int_env("ODOO_DOC_TYPE_FACTURA_ID")
+        boleta_id = to_int_env("ODOO_DOC_TYPE_BOLETA_ID")
+
+        if resultado["odoo"].get("ok") and uid:
+            models = xmlrpc.client.ServerProxy(f"{get_env('ODOO_URL')}/xmlrpc/2/object")
+
+            def check_doc_type(doc_id, nombre):
+                ids = models.execute_kw(
+                    odoo_db, uid, odoo_api_key,
+                    "l10n_latam.document.type", "search",
+                    [[["id", "=", doc_id]]],
+                    {"limit": 1},
+                )
+                return {"id": doc_id, "existe": bool(ids), "nombre": nombre}
+
+            resultado["documentos"] = {
+                "ok": True,
+                "factura": check_doc_type(factura_id, "Factura Electrónica"),
+                "boleta": check_doc_type(boleta_id, "Boleta Electrónica"),
+            }
+        else:
+            resultado["documentos"] = {
+                "ok": False,
+                "error": "No se pudo verificar — Odoo no está conectado",
+            }
+    except Exception as e:
+        resultado["documentos"] = {"ok": False, "error": str(e)}
+
+    # ── Resumen general ──────────────────────────────────
+    todo_ok = all([
+        resultado["variables"]["ok"],
+        resultado["mercadolibre"].get("ok", False),
+        resultado["odoo"].get("ok", False),
+        resultado["documentos"].get("ok", False),
+    ])
+
+    resultado["estado_general"] = "✅ Todo operativo" if todo_ok else "⚠️ Hay problemas — revisa los detalles"
+
+    return resultado
 
 
 # =========================================================
@@ -148,10 +266,6 @@ def test_ml():
 # =========================================================
 
 def persist_tokens_to_railway(access_token: str, refresh_token: str):
-    """
-    Guarda los tokens renovados como variables de entorno en Railway
-    vía su API GraphQL. Así sobreviven a reinicios del contenedor.
-    """
     railway_api_token = os.getenv("RAILWAY_API_TOKEN", "")
     project_id = os.getenv("RAILWAY_PROJECT_ID", "")
     environment_id = os.getenv("RAILWAY_ENVIRONMENT_ID", "")
@@ -209,11 +323,6 @@ def persist_tokens_to_railway(access_token: str, refresh_token: str):
 # =========================================================
 
 def refresh_ml_token() -> bool:
-    """
-    Renueva el access_token usando el refresh_token.
-    1. Actualiza os.environ en memoria → efecto inmediato
-    2. Persiste en Railway vía API → sobrevive reinicios
-    """
     try:
         payload = {
             "grant_type": "refresh_token",
@@ -237,11 +346,8 @@ def refresh_ml_token() -> bool:
             logger.error("Token refresh: respuesta sin access_token")
             return False
 
-        # 1. Actualizar en memoria (inmediato, sin downtime)
         os.environ["ML_ACCESS_TOKEN"] = new_access_token
         os.environ["ML_REFRESH_TOKEN"] = new_refresh_token
-
-        # 2. Persistir en Railway (para sobrevivir reinicios)
         persist_tokens_to_railway(new_access_token, new_refresh_token)
 
         logger.info("✅ Token ML renovado y persistido")
@@ -261,7 +367,6 @@ def ml_headers() -> dict:
 
 
 def ml_get(url: str) -> dict:
-    """GET a ML con reintento automático si el token expiró (401)."""
     response = requests.get(url, headers=ml_headers(), timeout=30)
 
     if response.status_code == 401:
@@ -362,7 +467,7 @@ async def oauth_callback(request: Request):
 
 @app.post("/ml/refresh-token")
 def manual_refresh_token():
-    """Fuerza renovación del token manualmente. Útil para pruebas o recuperación."""
+    """Fuerza renovación del token manualmente."""
     success = refresh_ml_token()
     if success:
         return {"ok": True, "message": "Token renovado y persistido en Railway"}
@@ -443,7 +548,7 @@ def should_be_company_from_ml(billing: dict, buyer: dict) -> bool:
 
 
 # =========================================================
-# Odoo: contexto único por request (una sola autenticación)
+# Odoo: contexto único por request
 # =========================================================
 
 @dataclass
@@ -635,10 +740,6 @@ def decide_document_kind(partner_data: dict, billing: dict) -> tuple[str, str]:
 # =========================================================
 
 def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
-    """
-    Solo considera existente un documento ya confirmado o cancelado.
-    Ignora borradores para poder recuperarse de fallos parciales.
-    """
     ids = odoo_exec(
         ctx, "account.move", "search",
         [[
@@ -690,8 +791,6 @@ def create_account_move(ctx: OdooCtx, order: dict, partner_id: int, document_kin
 
 def create_document_in_odoo(order: dict, billing: dict) -> dict:
     order_id = str(order["id"])
-
-    # Una sola conexión para todo el flujo del request
     ctx = odoo_connect()
 
     existing = find_existing_move(ctx, order_id)
@@ -779,6 +878,5 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     if topic != "orders_v2":
         return {"ok": True, "message": "Topic ignorado"}
 
-    # Responde 200 inmediatamente → evita reintentos de ML por timeout
     background_tasks.add_task(process_order_webhook, data)
     return {"ok": True, "message": "Recibido"}
