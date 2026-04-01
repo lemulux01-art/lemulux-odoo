@@ -38,7 +38,7 @@ REQUIRED_ENV_VARS = [
     "ODOO_DOC_TYPE_BOLETA_ID",
 ]
 
-# Evitar reprocesar misma orden demasiadas veces
+# Evita tormenta de webhooks duplicados
 RECENT_ORDERS: dict[str, float] = {}
 RECENT_ORDERS_LOCK = Lock()
 DEDUP_SECONDS = 60
@@ -61,10 +61,10 @@ def get_env(name: str, required: bool = True) -> str:
 
 
 def to_int_env(name: str, required: bool = True) -> Optional[int]:
-    value = get_env(name, required=required)
-    if not value:
+    raw = get_env(name, required=required)
+    if not raw:
         return None
-    return int(value)
+    return int(raw)
 
 
 def normalize_rut(rut: str) -> str:
@@ -136,8 +136,19 @@ def health():
     return {"status": "healthy"}
 
 
+@app.get("/ml/diagnostico")
+def diagnostico():
+    result = {
+        "service": "ok",
+        "env_ok": True,
+        "ml_token_loaded": bool(os.getenv("ML_ACCESS_TOKEN")),
+        "refresh_token_loaded": bool(os.getenv("ML_REFRESH_TOKEN")),
+    }
+    return result
+
+
 # =========================================================
-# MERCADO LIBRE AUTH
+# AUTH MERCADO LIBRE
 # =========================================================
 
 def persist_tokens_in_memory(access_token: str, refresh_token: str):
@@ -225,6 +236,17 @@ async def oauth_callback(request: Request):
         )
 
 
+@app.post("/ml/refresh-token")
+def manual_refresh_token():
+    success = refresh_ml_token()
+    if success:
+        return {"ok": True, "message": "Token renovado"}
+    return JSONResponse(
+        status_code=500,
+        content={"ok": False, "message": "No se pudo renovar el token"},
+    )
+
+
 # =========================================================
 # MERCADO LIBRE API
 # =========================================================
@@ -289,7 +311,7 @@ def get_ml_billing_info(order_id: str) -> dict:
 
 
 # =========================================================
-# EXTRACCIÓN DESDE BILLING_INFO
+# EXTRACCIÓN BILLING_INFO
 # =========================================================
 
 def extract_rut_from_billing_info(billing: dict) -> str:
@@ -417,7 +439,6 @@ def get_chile_country_id(ctx: OdooCtx) -> int:
 
 
 def get_rut_identification_type_id(ctx: OdooCtx) -> Optional[int]:
-    # CORRECCIÓN: dominio bien formado
     domain = [["name", "ilike", "RUT"]]
     ids = odoo_exec(
         ctx,
@@ -485,7 +506,7 @@ def find_or_create_partner(ctx: OdooCtx, buyer: dict, billing: dict) -> tuple[in
 
 
 # =========================================================
-# FACTURA / BOLETA
+# DOCUMENTO
 # =========================================================
 
 def decide_document_kind(partner_data: dict, billing: dict) -> tuple[str, str]:
@@ -550,6 +571,7 @@ def create_document_in_odoo(order: dict, billing: dict) -> dict:
 
     existing = find_existing_move(ctx, order_id)
     if existing:
+        logger.info(f"[{order_id}] Documento ya existe: move_id={existing}")
         return {"ok": True, "message": "Documento ya existe", "move_id": existing}
 
     buyer = order.get("buyer", {}) or {}
@@ -577,7 +599,7 @@ def process_order_webhook(data: dict):
         return
 
     if should_skip_recent_order(order_id):
-        logger.info(f"[{order_id}] Webhook duplicado reciente, se omite")
+        logger.info(f"[{order_id}] Webhook duplicado reciente, omitido")
         return
 
     try:
@@ -611,7 +633,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Body inválido"})
 
-    if data.get("topic") != "orders_v2":
+    topic = data.get("topic")
+    resource = data.get("resource", "")
+    logger.info(f"Webhook recibido: topic={topic} resource={resource}")
+
+    if topic != "orders_v2":
         return {"ok": True, "message": "Topic ignorado"}
 
     background_tasks.add_task(process_order_webhook, data)
