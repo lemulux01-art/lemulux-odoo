@@ -85,6 +85,11 @@ IVA_RATE = 1.19
 ML_DEFAULT_EMAIL = "odoo@lemulux.com"
 RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2"
 
+# Status de envío que gatillan la creación del documento
+# ML Chile usa Cross Docking: el status "en camino" es ready_to_ship + substatus específico
+SHIPMENT_STATUSES_DOCUMENTABLES = {"shipped", "ready_to_ship"}
+SHIPMENT_SUBSTATUSES_DOCUMENTABLES = {"picked_up", "authorized_by_carrier", "in_hub"}
+
 REQUIRED_ENV_VARS = [
     "ML_ACCESS_TOKEN",
     "ML_REFRESH_TOKEN",
@@ -136,13 +141,6 @@ def health():
 
 @app.get("/ml/diagnostico")
 def diagnostico():
-    """
-    Verifica el estado de todos los componentes del sistema:
-    - Variables de entorno
-    - Conexión y token de Mercado Libre
-    - Conexión a Odoo
-    - Configuración de tipos de documento
-    """
     resultado = {
         "servicio": "ok",
         "variables": {},
@@ -151,10 +149,9 @@ def diagnostico():
         "documentos": {},
     }
 
-    # ── 1. Variables de entorno ──────────────────────────
+    # ── 1. Variables ─────────────────────────────────────
     faltantes = [k for k in REQUIRED_ENV_VARS if not os.getenv(k, "").strip()]
     placeholders = [k for k in ["ML_ACCESS_TOKEN", "ML_REFRESH_TOKEN"] if os.getenv(k, "") == "placeholder"]
-
     resultado["variables"] = {
         "ok": len(faltantes) == 0 and len(placeholders) == 0,
         "faltantes": faltantes,
@@ -194,6 +191,9 @@ def diagnostico():
         resultado["mercadolibre"] = {"ok": False, "error": str(e)}
 
     # ── 3. Odoo ──────────────────────────────────────────
+    uid = None
+    odoo_db = None
+    odoo_api_key = None
     try:
         odoo_url = get_env("ODOO_URL")
         odoo_db = get_env("ODOO_DB")
@@ -204,12 +204,7 @@ def diagnostico():
         uid = common.authenticate(odoo_db, odoo_user, odoo_api_key, {})
 
         if uid:
-            resultado["odoo"] = {
-                "ok": True,
-                "uid": uid,
-                "url": odoo_url,
-                "db": odoo_db,
-            }
+            resultado["odoo"] = {"ok": True, "uid": uid, "url": odoo_url, "db": odoo_db}
         else:
             resultado["odoo"] = {
                 "ok": False,
@@ -248,16 +243,14 @@ def diagnostico():
     except Exception as e:
         resultado["documentos"] = {"ok": False, "error": str(e)}
 
-    # ── Resumen general ──────────────────────────────────
+    # ── Resumen ──────────────────────────────────────────
     todo_ok = all([
         resultado["variables"]["ok"],
         resultado["mercadolibre"].get("ok", False),
         resultado["odoo"].get("ok", False),
         resultado["documentos"].get("ok", False),
     ])
-
     resultado["estado_general"] = "✅ Todo operativo" if todo_ok else "⚠️ Hay problemas — revisa los detalles"
-
     return resultado
 
 
@@ -308,12 +301,10 @@ def persist_tokens_to_railway(access_token: str, refresh_token: str):
         )
         response.raise_for_status()
         data = response.json()
-
         if data.get("errors"):
             logger.error(f"❌ Railway API error al persistir tokens: {data['errors']}")
         else:
             logger.info("✅ Tokens ML persistidos en Railway correctamente")
-
     except Exception as e:
         logger.error(f"❌ Error al persistir tokens en Railway: {e}", exc_info=True)
 
@@ -330,7 +321,6 @@ def refresh_ml_token() -> bool:
             "client_secret": get_env("ML_CLIENT_SECRET"),
             "refresh_token": get_env("ML_REFRESH_TOKEN"),
         }
-
         response = requests.post(
             "https://api.mercadolibre.com/oauth/token",
             data=payload,
@@ -368,13 +358,11 @@ def ml_headers() -> dict:
 
 def ml_get(url: str) -> dict:
     response = requests.get(url, headers=ml_headers(), timeout=30)
-
     if response.status_code == 401:
         logger.warning(f"Token ML expirado al consultar {url}, renovando...")
         if not refresh_ml_token():
             raise Exception("No se pudo renovar el token de Mercado Libre")
         response = requests.get(url, headers=ml_headers(), timeout=30)
-
     response.raise_for_status()
     return response.json()
 
@@ -390,16 +378,13 @@ def get_ml_shipment(shipment_id: str) -> dict:
 def get_ml_billing_info(order_id: str) -> dict:
     url = f"https://api.mercadolibre.com/orders/{order_id}/billing_info"
     response = requests.get(url, headers=ml_headers(), timeout=30)
-
     if response.status_code == 401:
         logger.warning("Token ML expirado al obtener billing_info, renovando...")
         if not refresh_ml_token():
             raise Exception("No se pudo renovar el token de Mercado Libre")
         response = requests.get(url, headers=ml_headers(), timeout=30)
-
     if response.status_code == 404:
         return {}
-
     response.raise_for_status()
     return response.json()
 
@@ -467,7 +452,6 @@ async def oauth_callback(request: Request):
 
 @app.post("/ml/refresh-token")
 def manual_refresh_token():
-    """Fuerza renovación del token manualmente."""
     success = refresh_ml_token()
     if success:
         return {"ok": True, "message": "Token renovado y persistido en Railway"}
@@ -537,7 +521,6 @@ def ml_looks_like_company(billing: dict, buyer: dict) -> bool:
 def should_be_company_from_ml(billing: dict, buyer: dict) -> bool:
     taxpayer_type = extract_taxpayer_type_from_billing_info(billing)
     activity = extract_activity_from_billing_info(billing)
-
     if taxpayer_type == "consumidor final":
         return False
     if activity:
@@ -817,6 +800,34 @@ def create_document_in_odoo(order: dict, billing: dict) -> dict:
 
 
 # =========================================================
+# Lógica de envío documentable (ML Chile - Cross Docking)
+# =========================================================
+
+def shipment_es_documentable(shipment: dict) -> bool:
+    """
+    ML Chile usa Cross Docking. El status "en camino" no es "shipped"
+    sino "ready_to_ship" con substatuses específicos.
+
+    Tabla de referencia:
+    - En preparación  → status: handling
+    - En camino       → status: ready_to_ship + substatus: picked_up / authorized_by_carrier
+    - En distribución → status: ready_to_ship + substatus: in_hub
+    - Entregado       → status: delivered
+    - Envío directo   → status: shipped
+    """
+    status = shipment.get("status", "")
+    substatus = shipment.get("substatus", "")
+
+    if status == "shipped":
+        return True
+
+    if status == "ready_to_ship" and substatus in SHIPMENT_SUBSTATUSES_DOCUMENTABLES:
+        return True
+
+    return False
+
+
+# =========================================================
 # Procesamiento de orden (corre en background)
 # =========================================================
 
@@ -844,13 +855,15 @@ def process_order_webhook(data: dict):
             return
 
         shipment = get_ml_shipment(str(shipment_id))
-        shipment_status = shipment.get("status")
-        logger.info(f"[{order_id}] Status envío: {shipment_status}")
+        shipment_status = shipment.get("status", "")
+        shipment_substatus = shipment.get("substatus", "")
+        logger.info(f"[{order_id}] Status envío: {shipment_status} / Substatus: {shipment_substatus}")
 
-        if shipment_status != "shipped":
-            logger.info(f"[{order_id}] No se documenta aún. Status envío: {shipment_status}")
+        if not shipment_es_documentable(shipment):
+            logger.info(f"[{order_id}] No se documenta aún. Status: {shipment_status} / Substatus: {shipment_substatus}")
             return
 
+        logger.info(f"[{order_id}] Envío documentable, creando documento...")
         billing = get_ml_billing_info(order_id)
         result = create_document_in_odoo(order, billing)
         logger.info(f"[{order_id}] Resultado final: {result}")
@@ -878,5 +891,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     if topic != "orders_v2":
         return {"ok": True, "message": "Topic ignorado"}
 
+    # Responde 200 inmediatamente → evita reintentos de ML por timeout
     background_tasks.add_task(process_order_webhook, data)
     return {"ok": True, "message": "Recibido"}
