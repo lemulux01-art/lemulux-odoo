@@ -7,9 +7,8 @@ import xmlrpc.client
 from typing import Optional, Any
 from dataclasses import dataclass
 
-
 # =========================================================
-# Logging estructurado
+# Logging
 # =========================================================
 
 logging.basicConfig(
@@ -19,7 +18,6 @@ logging.basicConfig(
 logger = logging.getLogger("lemulux")
 
 app = FastAPI()
-
 
 # =========================================================
 # Helpers generales
@@ -85,11 +83,6 @@ IVA_RATE = 1.19
 ML_DEFAULT_EMAIL = "odoo@lemulux.com"
 RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2"
 
-# Status de envío que gatillan la creación del documento
-# ML Chile usa Cross Docking: el status "en camino" es ready_to_ship + substatus específico
-SHIPMENT_STATUSES_DOCUMENTABLES = {"shipped", "ready_to_ship"}
-SHIPMENT_SUBSTATUSES_DOCUMENTABLES = {"picked_up", "authorized_by_carrier", "in_hub"}
-
 REQUIRED_ENV_VARS = [
     "ML_ACCESS_TOKEN",
     "ML_REFRESH_TOKEN",
@@ -107,7 +100,6 @@ REQUIRED_ENV_VARS = [
     "RAILWAY_ENVIRONMENT_ID",
     "RAILWAY_SERVICE_ID",
 ]
-
 
 # =========================================================
 # Validación al arrancar
@@ -135,10 +127,6 @@ def health():
     return {"status": "healthy"}
 
 
-# =========================================================
-# Diagnóstico completo
-# =========================================================
-
 @app.get("/ml/diagnostico")
 def diagnostico():
     resultado = {
@@ -149,16 +137,12 @@ def diagnostico():
         "documentos": {},
     }
 
-    # ── 1. Variables ─────────────────────────────────────
     faltantes = [k for k in REQUIRED_ENV_VARS if not os.getenv(k, "").strip()]
-    placeholders = [k for k in ["ML_ACCESS_TOKEN", "ML_REFRESH_TOKEN"] if os.getenv(k, "") == "placeholder"]
     resultado["variables"] = {
-        "ok": len(faltantes) == 0 and len(placeholders) == 0,
+        "ok": len(faltantes) == 0,
         "faltantes": faltantes,
-        "placeholders": placeholders,
     }
 
-    # ── 2. Mercado Libre ─────────────────────────────────
     try:
         token = get_env("ML_ACCESS_TOKEN")
         response = requests.get(
@@ -166,31 +150,17 @@ def diagnostico():
             headers={"Authorization": f"Bearer {token}"},
             timeout=10,
         )
-        if response.status_code == 200:
-            data = response.json()
-            resultado["mercadolibre"] = {
-                "ok": True,
-                "user_id": data.get("id"),
-                "nickname": data.get("nickname"),
-                "email": data.get("email"),
-                "token_valido": True,
-            }
-        elif response.status_code == 401:
-            resultado["mercadolibre"] = {
-                "ok": False,
-                "error": "Token expirado o inválido (401)",
-                "token_valido": False,
-            }
-        else:
-            resultado["mercadolibre"] = {
-                "ok": False,
-                "error": f"Error inesperado: {response.status_code}",
-                "token_valido": False,
-            }
+        resultado["mercadolibre"] = {
+            "status_code": response.status_code,
+            "ok": response.status_code == 200,
+        }
+        try:
+            resultado["mercadolibre"]["response"] = response.json()
+        except Exception:
+            resultado["mercadolibre"]["response"] = response.text
     except Exception as e:
         resultado["mercadolibre"] = {"ok": False, "error": str(e)}
 
-    # ── 3. Odoo ──────────────────────────────────────────
     uid = None
     odoo_db = None
     odoo_api_key = None
@@ -206,14 +176,10 @@ def diagnostico():
         if uid:
             resultado["odoo"] = {"ok": True, "uid": uid, "url": odoo_url, "db": odoo_db}
         else:
-            resultado["odoo"] = {
-                "ok": False,
-                "error": "Autenticación fallida — verifica ODOO_USER y ODOO_API_KEY",
-            }
+            resultado["odoo"] = {"ok": False, "error": "Autenticación fallida en Odoo"}
     except Exception as e:
         resultado["odoo"] = {"ok": False, "error": str(e)}
 
-    # ── 4. Tipos de documento ────────────────────────────
     try:
         factura_id = to_int_env("ODOO_DOC_TYPE_FACTURA_ID")
         boleta_id = to_int_env("ODOO_DOC_TYPE_BOLETA_ID")
@@ -238,19 +204,11 @@ def diagnostico():
         else:
             resultado["documentos"] = {
                 "ok": False,
-                "error": "No se pudo verificar — Odoo no está conectado",
+                "error": "No se pudo verificar Odoo",
             }
     except Exception as e:
         resultado["documentos"] = {"ok": False, "error": str(e)}
 
-    # ── Resumen ──────────────────────────────────────────
-    todo_ok = all([
-        resultado["variables"]["ok"],
-        resultado["mercadolibre"].get("ok", False),
-        resultado["odoo"].get("ok", False),
-        resultado["documentos"].get("ok", False),
-    ])
-    resultado["estado_general"] = "✅ Todo operativo" if todo_ok else "⚠️ Hay problemas — revisa los detalles"
     return resultado
 
 
@@ -333,7 +291,7 @@ def refresh_ml_token() -> bool:
         new_refresh_token = data.get("refresh_token") or get_env("ML_REFRESH_TOKEN")
 
         if not new_access_token:
-            logger.error("Token refresh: respuesta sin access_token")
+            logger.error("Respuesta sin access_token al renovar")
             return False
 
         os.environ["ML_ACCESS_TOKEN"] = new_access_token
@@ -349,7 +307,7 @@ def refresh_ml_token() -> bool:
 
 
 # =========================================================
-# Mercado Libre API (con renovación automática ante 401)
+# Mercado Libre API
 # =========================================================
 
 def ml_headers() -> dict:
@@ -369,10 +327,6 @@ def ml_get(url: str) -> dict:
 
 def get_ml_order(order_id: str) -> dict:
     return ml_get(f"https://api.mercadolibre.com/orders/{order_id}")
-
-
-def get_ml_shipment(shipment_id: str) -> dict:
-    return ml_get(f"https://api.mercadolibre.com/shipments/{shipment_id}")
 
 
 def get_ml_billing_info(order_id: str) -> dict:
@@ -400,24 +354,14 @@ async def oauth_callback(request: Request):
         raise HTTPException(status_code=400, detail="No se recibió code")
 
     try:
-        client_id = get_env("ML_CLIENT_ID")
-        client_secret = get_env("ML_CLIENT_SECRET")
-        redirect_uri = get_env("ML_REDIRECT_URI")
-    except RuntimeError as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Configuración incompleta en Railway", "detail": str(e)},
-        )
+        payload = {
+            "grant_type": "authorization_code",
+            "client_id": get_env("ML_CLIENT_ID"),
+            "client_secret": get_env("ML_CLIENT_SECRET"),
+            "code": code,
+            "redirect_uri": get_env("ML_REDIRECT_URI"),
+        }
 
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "code": code,
-        "redirect_uri": redirect_uri,
-    }
-
-    try:
         response = requests.post(
             "https://api.mercadolibre.com/oauth/token",
             data=payload,
@@ -443,6 +387,7 @@ async def oauth_callback(request: Request):
             status_code=response.status_code,
             content={"status_code": response.status_code, "response": data},
         )
+
     except requests.RequestException as e:
         return JSONResponse(
             status_code=500,
@@ -531,7 +476,7 @@ def should_be_company_from_ml(billing: dict, buyer: dict) -> bool:
 
 
 # =========================================================
-# Odoo: contexto único por request
+# Odoo contexto
 # =========================================================
 
 @dataclass
@@ -543,24 +488,34 @@ class OdooCtx:
 
 
 def odoo_connect() -> OdooCtx:
-    odoo_url = get_env("ODOO_URL")
-    odoo_db = get_env("ODOO_DB")
-    odoo_user = get_env("ODOO_USER")
-    odoo_api_key = get_env("ODOO_API_KEY")
-
-    common = xmlrpc.client.ServerProxy(f"{odoo_url}/xmlrpc/2/common")
-    uid = common.authenticate(odoo_db, odoo_user, odoo_api_key, {})
+    common = xmlrpc.client.ServerProxy(f"{get_env('ODOO_URL')}/xmlrpc/2/common")
+    uid = common.authenticate(
+        get_env("ODOO_DB"),
+        get_env("ODOO_USER"),
+        get_env("ODOO_API_KEY"),
+        {},
+    )
     if not uid:
         raise Exception("No se pudo autenticar en Odoo")
 
-    models = xmlrpc.client.ServerProxy(f"{odoo_url}/xmlrpc/2/object")
-    return OdooCtx(db=odoo_db, api_key=odoo_api_key, uid=uid, models=models)
+    models = xmlrpc.client.ServerProxy(f"{get_env('ODOO_URL')}/xmlrpc/2/object")
+    return OdooCtx(
+        db=get_env("ODOO_DB"),
+        api_key=get_env("ODOO_API_KEY"),
+        uid=uid,
+        models=models,
+    )
 
 
 def odoo_exec(ctx: OdooCtx, model: str, method: str, args: list, kwargs: dict = None) -> Any:
     return ctx.models.execute_kw(
-        ctx.db, ctx.uid, ctx.api_key,
-        model, method, args, kwargs or {},
+        ctx.db,
+        ctx.uid,
+        ctx.api_key,
+        model,
+        method,
+        args,
+        kwargs or {},
     )
 
 
@@ -580,7 +535,9 @@ def find_partner_by_buyer_id(ctx: OdooCtx, buyer_id: str) -> Optional[int]:
     if not buyer_id:
         return None
     ids = odoo_exec(
-        ctx, "res.partner", "search",
+        ctx,
+        "res.partner",
+        "search",
         [[["comment", "ilike", f"ML_BUYER_ID:{buyer_id}"]]],
         {"limit": 1},
     )
@@ -589,7 +546,9 @@ def find_partner_by_buyer_id(ctx: OdooCtx, buyer_id: str) -> Optional[int]:
 
 def read_partner(ctx: OdooCtx, partner_id: int) -> dict:
     data = odoo_exec(
-        ctx, "res.partner", "read",
+        ctx,
+        "res.partner",
+        "read",
         [[partner_id], ["name", "vat", "email", "comment", "company_type", "is_company"]],
     )
     return data[0] if data else {}
@@ -629,15 +588,11 @@ def update_partner_missing_data(ctx: OdooCtx, partner_id: int, buyer: dict, bill
 
     desired_company = should_be_company_from_ml(billing, buyer)
     if desired_company:
-        if current.get("company_type") != "company":
-            vals["company_type"] = "company"
-        if current.get("is_company") is not True:
-            vals["is_company"] = True
+        vals["company_type"] = "company"
+        vals["is_company"] = True
     else:
-        if current.get("company_type") != "person":
-            vals["company_type"] = "person"
-        if current.get("is_company") is not False:
-            vals["is_company"] = False
+        vals["company_type"] = "person"
+        vals["is_company"] = False
 
     if vals:
         odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
@@ -724,7 +679,9 @@ def decide_document_kind(partner_data: dict, billing: dict) -> tuple[str, str]:
 
 def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
     ids = odoo_exec(
-        ctx, "account.move", "search",
+        ctx,
+        "account.move",
+        "search",
         [[
             ["ref", "=", f"ML-{order_id}"],
             ["state", "in", ["posted", "cancel"]],
@@ -800,35 +757,7 @@ def create_document_in_odoo(order: dict, billing: dict) -> dict:
 
 
 # =========================================================
-# Lógica de envío documentable (ML Chile - Cross Docking)
-# =========================================================
-
-def shipment_es_documentable(shipment: dict) -> bool:
-    """
-    ML Chile usa Cross Docking. El status "en camino" no es "shipped"
-    sino "ready_to_ship" con substatuses específicos.
-
-    Tabla de referencia:
-    - En preparación  → status: handling
-    - En camino       → status: ready_to_ship + substatus: picked_up / authorized_by_carrier
-    - En distribución → status: ready_to_ship + substatus: in_hub
-    - Entregado       → status: delivered
-    - Envío directo   → status: shipped
-    """
-    status = shipment.get("status", "")
-    substatus = shipment.get("substatus", "")
-
-    if status == "shipped":
-        return True
-
-    if status == "ready_to_ship" and substatus in SHIPMENT_SUBSTATUSES_DOCUMENTABLES:
-        return True
-
-    return False
-
-
-# =========================================================
-# Procesamiento de orden (corre en background)
+# Procesamiento desde venta registrada
 # =========================================================
 
 def process_order_webhook(data: dict):
@@ -840,30 +769,15 @@ def process_order_webhook(data: dict):
         return
 
     try:
-        logger.info(f"[{order_id}] Procesando orden...")
+        logger.info(f"[{order_id}] Procesando orden desde venta registrada...")
         order = get_ml_order(order_id)
 
+        # Nueva regla pedida: documentar desde venta registrada, no desde envío
         if order.get("status") != "paid":
             logger.info(f"[{order_id}] Orden no pagada. Status: {order.get('status')}")
             return
 
-        shipping = order.get("shipping", {}) or {}
-        shipment_id = shipping.get("id")
-
-        if not shipment_id:
-            logger.info(f"[{order_id}] Sin shipment_id todavía")
-            return
-
-        shipment = get_ml_shipment(str(shipment_id))
-        shipment_status = shipment.get("status", "")
-        shipment_substatus = shipment.get("substatus", "")
-        logger.info(f"[{order_id}] Status envío: {shipment_status} / Substatus: {shipment_substatus}")
-
-        if not shipment_es_documentable(shipment):
-            logger.info(f"[{order_id}] No se documenta aún. Status: {shipment_status} / Substatus: {shipment_substatus}")
-            return
-
-        logger.info(f"[{order_id}] Envío documentable, creando documento...")
+        logger.info(f"[{order_id}] Venta registrada/pagada. Creando documento...")
         billing = get_ml_billing_info(order_id)
         result = create_document_in_odoo(order, billing)
         logger.info(f"[{order_id}] Resultado final: {result}")
@@ -887,10 +801,8 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         return JSONResponse(status_code=400, content={"error": "Body inválido"})
 
     topic = data.get("topic")
-
     if topic != "orders_v2":
         return {"ok": True, "message": "Topic ignorado"}
 
-    # Responde 200 inmediatamente → evita reintentos de ML por timeout
     background_tasks.add_task(process_order_webhook, data)
     return {"ok": True, "message": "Recibido"}
