@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 import os
 import time
+import threading
 import logging
 import requests
 import xmlrpc.client
@@ -48,6 +49,9 @@ REQUIRED_ENV_VARS = [
 RECENT_ORDERS: dict[str, float] = {}
 RECENT_ORDERS_LOCK = Lock()
 DEDUP_SECONDS = 60
+
+# Renovación automática del token cada 5 horas
+TOKEN_REFRESH_INTERVAL = 5 * 60 * 60  # 5 horas en segundos
 
 
 # =========================================================
@@ -120,12 +124,30 @@ def should_skip_recent_order(order_id: str) -> bool:
 # STARTUP
 # =========================================================
 
+def schedule_token_refresh():
+    """
+    Hilo en background que renueva el token ML cada 5 horas.
+    El token dura 6 horas — renovar a las 5 evita cualquier caída.
+    """
+    while True:
+        time.sleep(TOKEN_REFRESH_INTERVAL)
+        logger.info("⏰ Renovación programada del token ML (cada 5h)...")
+        success = refresh_ml_token()
+        if not success:
+            logger.error("❌ Falló la renovación programada del token ML")
+
+
 @app.on_event("startup")
-async def validate_env():
+async def on_startup():
     missing = [k for k in REQUIRED_ENV_VARS if not os.getenv(k, "").strip()]
     if missing:
         raise RuntimeError(f"Variables faltantes: {missing}")
     logger.info("✅ Variables de entorno cargadas correctamente")
+
+    # Iniciar renovación automática en hilo daemon
+    t = threading.Thread(target=schedule_token_refresh, daemon=True)
+    t.start()
+    logger.info("⏰ Renovación automática del token ML iniciada (cada 5 horas)")
 
 
 # =========================================================
@@ -144,13 +166,12 @@ def health():
 
 @app.get("/ml/diagnostico")
 def diagnostico():
-    result = {
+    return {
         "service": "ok",
         "env_ok": True,
         "ml_token_loaded": bool(os.getenv("ML_ACCESS_TOKEN")),
         "refresh_token_loaded": bool(os.getenv("ML_REFRESH_TOKEN")),
     }
-    return result
 
 
 # =========================================================
@@ -438,8 +459,10 @@ def get_rut_identification_type_id(ctx: OdooCtx) -> Optional[int]:
 
 
 def read_partner(ctx: OdooCtx, partner_id: int) -> dict:
-    fields = ["name", "vat", "email", "comment", "company_type", "is_company",
-              "country_id", "l10n_cl_sii_taxpayer_type"]
+    fields = [
+        "name", "vat", "email", "l10n_cl_dte_email", "comment",
+        "company_type", "is_company", "country_id", "l10n_cl_sii_taxpayer_type",
+    ]
     if model_has_field(ctx, "res.partner", "l10n_latam_identification_type_id"):
         fields.append("l10n_latam_identification_type_id")
     data = odoo_exec(ctx, "res.partner", "read", [[partner_id], fields])
@@ -456,25 +479,23 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
 
 def build_partner_vals_from_ml(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> dict:
     """
-    Construye los campos del partner para Odoo 18 Chile.
-
-    Campos obligatorios para emitir DTE:
+    Campos obligatorios para emitir DTE en Odoo 18 Chile:
     - country_id = Chile
     - l10n_cl_sii_taxpayer_type = "1" (empresa) o "4" (consumidor final)
+    - l10n_cl_dte_email = email DTE (campo separado de email, obligatorio)
     - l10n_latam_identification_type_id = RUT
     - vat = número de RUT
     """
     chile_country_id = get_chile_country_id(ctx)
     rut_identification_type_id = get_rut_identification_type_id(ctx)
     is_company = should_be_company_from_ml(billing, buyer)
-
-    # Tipo de contribuyente SII — campo OBLIGATORIO para DTE en Odoo 18 Chile
     sii_taxpayer_type = SII_TAXPAYER_EMPRESA if is_company else SII_TAXPAYER_CONSUMIDOR
 
     vals = {
         "name": extract_name_from_billing_info(billing, buyer),
         "vat": rut or False,
         "email": ML_DEFAULT_EMAIL,
+        "l10n_cl_dte_email": ML_DEFAULT_EMAIL,
         "customer_rank": 1,
         "company_type": "company" if is_company else "person",
         "is_company": is_company,
@@ -482,7 +503,6 @@ def build_partner_vals_from_ml(ctx: OdooCtx, buyer: dict, billing: dict, rut: st
         "l10n_cl_sii_taxpayer_type": sii_taxpayer_type,
     }
 
-    # Tipo de identificación RUT (necesario para generación correcta del XML DTE)
     if rut and rut_identification_type_id and model_has_field(ctx, "res.partner", "l10n_latam_identification_type_id"):
         vals["l10n_latam_identification_type_id"] = rut_identification_type_id
 
@@ -496,8 +516,8 @@ def create_partner(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> int:
 
 def update_partner_if_needed(ctx: OdooCtx, partner_id: int, buyer: dict, billing: dict, rut: str):
     """
-    Actualiza el partner si le falta l10n_cl_sii_taxpayer_type.
-    Esto corrige partners creados antes del fix.
+    Actualiza partners existentes que les falten campos DTE obligatorios.
+    Corrige partners creados antes de los fixes.
     """
     current = read_partner(ctx, partner_id)
     vals = {}
@@ -505,6 +525,9 @@ def update_partner_if_needed(ctx: OdooCtx, partner_id: int, buyer: dict, billing
     if not current.get("l10n_cl_sii_taxpayer_type"):
         is_company = should_be_company_from_ml(billing, buyer)
         vals["l10n_cl_sii_taxpayer_type"] = SII_TAXPAYER_EMPRESA if is_company else SII_TAXPAYER_CONSUMIDOR
+
+    if not current.get("l10n_cl_dte_email"):
+        vals["l10n_cl_dte_email"] = ML_DEFAULT_EMAIL
 
     if not current.get("country_id"):
         vals["country_id"] = get_chile_country_id(ctx)
