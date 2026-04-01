@@ -222,7 +222,7 @@ def extract_taxpayer_type_from_billing_info(billing: dict) -> str:
         recursive_find_first(billing, ["taxpayer_category"]),
         recursive_find_first(billing, ["contributor_type"]),
         recursive_find_first(billing, ["tipo_contribuyente"]),
-    ).lower()
+    ).strip().lower()
 
 
 def ml_looks_like_company(billing: dict, buyer: dict) -> bool:
@@ -240,6 +240,22 @@ def ml_looks_like_company(billing: dict, buyer: dict) -> bool:
         "TRANSPORTES", "INVERSIONES", "IMPORTADORA", "EXPORTADORA",
     ]
     return any(marker in name for marker in company_markers)
+
+
+def should_be_company_from_ml(billing: dict, buyer: dict) -> bool:
+    taxpayer_type = extract_taxpayer_type_from_billing_info(billing)
+    activity = extract_activity_from_billing_info(billing)
+
+    if taxpayer_type == "consumidor final":
+        return False
+
+    if activity:
+        return True
+
+    if ml_looks_like_company(billing, buyer):
+        return True
+
+    return False
 
 
 # =========================================================
@@ -333,7 +349,7 @@ def append_ml_buyer_id_to_partner(models, db, uid, api_key, partner_id: int, buy
     )
 
 
-def update_partner_missing_data(models, db, uid, api_key, partner_id: int, buyer: dict, rut: str):
+def update_partner_missing_data(models, db, uid, api_key, partner_id: int, buyer: dict, billing: dict, rut: str):
     current = read_partner(models, db, uid, api_key, partner_id)
     vals = {}
 
@@ -341,8 +357,30 @@ def update_partner_missing_data(models, db, uid, api_key, partner_id: int, buyer
         vals["vat"] = rut
 
     if not current.get("name") or current.get("name") == "Cliente Mercado Libre":
-        suggested_name = buyer.get("nickname") or buyer.get("first_name") or "Cliente Mercado Libre"
+        suggested_name = first_non_empty(
+            recursive_find_first(billing, ["name"]),
+            recursive_find_first(billing, ["social_reason"]),
+            recursive_find_first(billing, ["razon_social"]),
+            buyer.get("nickname"),
+            buyer.get("first_name"),
+            "Cliente Mercado Libre",
+        )
         vals["name"] = suggested_name
+
+    # Ajuste conceptual:
+    # si viene como consumidor final o persona, mantener/forzar person
+    # si claramente viene como empresa, mantener/forzar company
+    desired_company = should_be_company_from_ml(billing, buyer)
+    if desired_company:
+        if current.get("company_type") != "company":
+            vals["company_type"] = "company"
+        if current.get("is_company") is not True:
+            vals["is_company"] = True
+    else:
+        if current.get("company_type") != "person":
+            vals["company_type"] = "person"
+        if current.get("is_company") is not False:
+            vals["is_company"] = False
 
     if vals:
         models.execute_kw(
@@ -366,12 +404,7 @@ def create_partner(models, db, uid, api_key, buyer: dict, billing: dict, rut: st
         "Cliente Mercado Libre",
     )
 
-    activity = extract_activity_from_billing_info(billing)
-    taxpayer_type = extract_taxpayer_type_from_billing_info(billing)
-
-    looks_company = bool(activity) or ml_looks_like_company(billing, buyer)
-    if taxpayer_type == "consumidor final":
-        looks_company = False
+    looks_company = should_be_company_from_ml(billing, buyer)
 
     vals = {
         "name": partner_name,
@@ -401,12 +434,12 @@ def find_or_create_partner(buyer: dict, billing: dict) -> tuple[int, dict]:
     partner_id = find_partner_by_rut(models, db, uid, api_key, rut)
     if partner_id:
         append_ml_buyer_id_to_partner(models, db, uid, api_key, partner_id, buyer_id)
-        update_partner_missing_data(models, db, uid, api_key, partner_id, buyer, rut)
+        update_partner_missing_data(models, db, uid, api_key, partner_id, buyer, billing, rut)
         return partner_id, read_partner(models, db, uid, api_key, partner_id)
 
     partner_id = find_partner_by_buyer_id(models, db, uid, api_key, buyer_id)
     if partner_id:
-        update_partner_missing_data(models, db, uid, api_key, partner_id, buyer, rut)
+        update_partner_missing_data(models, db, uid, api_key, partner_id, buyer, billing, rut)
         return partner_id, read_partner(models, db, uid, api_key, partner_id)
 
     partner_id = create_partner(models, db, uid, api_key, buyer, billing, rut)
@@ -432,21 +465,21 @@ def decide_document_kind(partner_data: dict, billing: dict) -> tuple[str, str]:
     activity = extract_activity_from_billing_info(billing)
     taxpayer_type = extract_taxpayer_type_from_billing_info(billing)
 
-    # FACTURA:
-    # - empresa en Odoo
-    # - con RUT
-    # - con actividad económica
-    # - y no consumidor final
-    if (
-        partner_is_company(partner_data)
-        and rut
-        and activity
-        and taxpayer_type != "consumidor final"
-    ):
-        return "factura", "Empresa con RUT, actividad económica y no consumidor final"
+    # Ajuste conceptual final:
+    # BOLETA si consumidor final
+    if taxpayer_type == "consumidor final":
+        return "boleta", "Tipo de contribuyente consumidor final"
+
+    # BOLETA si es persona
+    if partner_data.get("company_type") == "person":
+        return "boleta", "Cliente clasificado como persona"
+
+    # FACTURA solo si es empresa + rut + actividad + no consumidor final
+    if partner_is_company(partner_data) and rut and activity:
+        return "factura", "Empresa con RUT y actividad económica"
 
     # BOLETA en todos los demás casos
-    return "boleta", "Consumidor final, persona natural o sin actividad económica"
+    return "boleta", "No cumple condiciones mínimas para factura"
 
 
 # =========================================================
