@@ -24,6 +24,12 @@ app = FastAPI()
 IVA_RATE = 1.19
 ML_DEFAULT_EMAIL = "odoo@lemulux.com"
 
+# Valores de l10n_cl_sii_taxpayer_type en Odoo 18 Chile
+# "1" = 1a Categoría  → empresa contribuyente → factura
+# "4" = Consumidor Final → persona natural → boleta
+SII_TAXPAYER_EMPRESA    = "1"
+SII_TAXPAYER_CONSUMIDOR = "4"
+
 REQUIRED_ENV_VARS = [
     "ML_ACCESS_TOKEN",
     "ML_REFRESH_TOKEN",
@@ -164,7 +170,6 @@ def refresh_ml_token() -> bool:
             "client_secret": get_env("ML_CLIENT_SECRET"),
             "refresh_token": get_env("ML_REFRESH_TOKEN"),
         }
-
         response = requests.post(
             "https://api.mercadolibre.com/oauth/token",
             data=payload,
@@ -203,13 +208,11 @@ async def oauth_callback(request: Request):
             "code": code,
             "redirect_uri": get_env("ML_REDIRECT_URI"),
         }
-
         response = requests.post(
             "https://api.mercadolibre.com/oauth/token",
             data=payload,
             timeout=30,
         )
-
         try:
             data = response.json()
         except Exception:
@@ -228,7 +231,6 @@ async def oauth_callback(request: Request):
             status_code=response.status_code,
             content={"status_code": response.status_code, "response": data},
         )
-
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -268,14 +270,14 @@ def ml_get(url: str, retries: int = 4) -> dict:
 
         if response.status_code == 429:
             wait_time = 2 * (attempt + 1)
-            logger.warning(f"429 Too Many Requests en {url}. Reintento en {wait_time}s")
+            logger.warning(f"429 en {url}. Reintento en {wait_time}s")
             time.sleep(wait_time)
             continue
 
         response.raise_for_status()
         return response.json()
 
-    raise Exception(f"Mercado Libre devolvió 429 demasiadas veces para {url}")
+    raise Exception(f"ML devolvió 429 demasiadas veces para {url}")
 
 
 def get_ml_order(order_id: str) -> dict:
@@ -284,7 +286,6 @@ def get_ml_order(order_id: str) -> dict:
 
 def get_ml_billing_info(order_id: str) -> dict:
     url = f"https://api.mercadolibre.com/orders/{order_id}/billing_info"
-
     for attempt in range(4):
         response = requests.get(url, headers=ml_headers(), timeout=30)
 
@@ -307,7 +308,7 @@ def get_ml_billing_info(order_id: str) -> dict:
         response.raise_for_status()
         return response.json()
 
-    raise Exception(f"Mercado Libre devolvió 429 demasiadas veces en billing_info para {order_id}")
+    raise Exception(f"ML devolvió 429 demasiadas veces en billing_info para {order_id}")
 
 
 # =========================================================
@@ -364,21 +365,17 @@ def extract_taxpayer_type_from_billing_info(billing: dict) -> str:
 
 
 def ml_indicates_final_consumer(billing: dict) -> bool:
-    taxpayer_type = extract_taxpayer_type_from_billing_info(billing)
-    markers = ["consumidor final", "final consumer", "consumer final", "cf"]
-    return any(marker in taxpayer_type for marker in markers)
+    t = extract_taxpayer_type_from_billing_info(billing)
+    return any(x in t for x in ["consumidor final", "final consumer", "consumer final", "cf"])
 
 
 def should_be_company_from_ml(billing: dict, buyer: dict) -> bool:
     if ml_indicates_final_consumer(billing):
         return False
-
     if extract_activity_from_billing_info(billing):
         return True
-
     name = extract_name_from_billing_info(billing, buyer).upper()
-    company_markers = ["SPA", "EIRL", "LTDA", "S.A", "SOCIEDAD", "COMERCIAL"]
-    return any(marker in name for marker in company_markers)
+    return any(m in name for m in ["SPA", "EIRL", "LTDA", "S.A", "SOCIEDAD", "COMERCIAL"])
 
 
 # =========================================================
@@ -403,7 +400,6 @@ def odoo_connect() -> OdooCtx:
     )
     if not uid:
         raise Exception("No se pudo autenticar en Odoo")
-
     models = xmlrpc.client.ServerProxy(f"{get_env('ODOO_URL')}/xmlrpc/2/object")
     return OdooCtx(
         db=get_env("ODOO_DB"),
@@ -415,13 +411,8 @@ def odoo_connect() -> OdooCtx:
 
 def odoo_exec(ctx: OdooCtx, model: str, method: str, args: list, kwargs: dict = None) -> Any:
     return ctx.models.execute_kw(
-        ctx.db,
-        ctx.uid,
-        ctx.api_key,
-        model,
-        method,
-        args,
-        kwargs or {},
+        ctx.db, ctx.uid, ctx.api_key,
+        model, method, args, kwargs or {},
     )
 
 
@@ -431,27 +422,24 @@ def model_has_field(ctx: OdooCtx, model: str, field_name: str) -> bool:
 
 
 def get_chile_country_id(ctx: OdooCtx) -> int:
-    domain = [["code", "=", "CL"]]
-    ids = odoo_exec(ctx, "res.country", "search", [domain], {"limit": 1})
+    ids = odoo_exec(ctx, "res.country", "search", [[["code", "=", "CL"]]], {"limit": 1})
     if not ids:
-        raise Exception("No se encontró el país Chile en Odoo")
+        raise Exception("No se encontró Chile en Odoo")
     return ids[0]
 
 
 def get_rut_identification_type_id(ctx: OdooCtx) -> Optional[int]:
-    domain = [["name", "ilike", "RUT"]]
     ids = odoo_exec(
-        ctx,
-        "l10n_latam.identification.type",
-        "search",
-        [domain],
+        ctx, "l10n_latam.identification.type", "search",
+        [[["name", "ilike", "RUT"]]],
         {"limit": 1},
     )
     return ids[0] if ids else None
 
 
 def read_partner(ctx: OdooCtx, partner_id: int) -> dict:
-    fields = ["name", "vat", "email", "comment", "company_type", "is_company", "country_id"]
+    fields = ["name", "vat", "email", "comment", "company_type", "is_company",
+              "country_id", "l10n_cl_sii_taxpayer_type"]
     if model_has_field(ctx, "res.partner", "l10n_latam_identification_type_id"):
         fields.append("l10n_latam_identification_type_id")
     data = odoo_exec(ctx, "res.partner", "read", [[partner_id], fields])
@@ -462,26 +450,40 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
     rut = normalize_rut(rut)
     if not rut:
         return None
-    domain = [["vat", "=", rut]]
-    ids = odoo_exec(ctx, "res.partner", "search", [domain], {"limit": 1})
+    ids = odoo_exec(ctx, "res.partner", "search", [[["vat", "=", rut]]], {"limit": 1})
     return ids[0] if ids else None
 
 
 def build_partner_vals_from_ml(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> dict:
+    """
+    Construye los campos del partner para Odoo 18 Chile.
+
+    Campos obligatorios para emitir DTE:
+    - country_id = Chile
+    - l10n_cl_sii_taxpayer_type = "1" (empresa) o "4" (consumidor final)
+    - l10n_latam_identification_type_id = RUT
+    - vat = número de RUT
+    """
     chile_country_id = get_chile_country_id(ctx)
     rut_identification_type_id = get_rut_identification_type_id(ctx)
+    is_company = should_be_company_from_ml(billing, buyer)
+
+    # Tipo de contribuyente SII — campo OBLIGATORIO para DTE en Odoo 18 Chile
+    sii_taxpayer_type = SII_TAXPAYER_EMPRESA if is_company else SII_TAXPAYER_CONSUMIDOR
 
     vals = {
         "name": extract_name_from_billing_info(billing, buyer),
         "vat": rut or False,
         "email": ML_DEFAULT_EMAIL,
         "customer_rank": 1,
-        "company_type": "company" if should_be_company_from_ml(billing, buyer) else "person",
-        "is_company": True if should_be_company_from_ml(billing, buyer) else False,
+        "company_type": "company" if is_company else "person",
+        "is_company": is_company,
         "country_id": chile_country_id,
+        "l10n_cl_sii_taxpayer_type": sii_taxpayer_type,
     }
 
-    if rut_identification_type_id and model_has_field(ctx, "res.partner", "l10n_latam_identification_type_id"):
+    # Tipo de identificación RUT (necesario para generación correcta del XML DTE)
+    if rut and rut_identification_type_id and model_has_field(ctx, "res.partner", "l10n_latam_identification_type_id"):
         vals["l10n_latam_identification_type_id"] = rut_identification_type_id
 
     return vals
@@ -492,12 +494,33 @@ def create_partner(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> int:
     return odoo_exec(ctx, "res.partner", "create", [vals])
 
 
+def update_partner_if_needed(ctx: OdooCtx, partner_id: int, buyer: dict, billing: dict, rut: str):
+    """
+    Actualiza el partner si le falta l10n_cl_sii_taxpayer_type.
+    Esto corrige partners creados antes del fix.
+    """
+    current = read_partner(ctx, partner_id)
+    vals = {}
+
+    if not current.get("l10n_cl_sii_taxpayer_type"):
+        is_company = should_be_company_from_ml(billing, buyer)
+        vals["l10n_cl_sii_taxpayer_type"] = SII_TAXPAYER_EMPRESA if is_company else SII_TAXPAYER_CONSUMIDOR
+
+    if not current.get("country_id"):
+        vals["country_id"] = get_chile_country_id(ctx)
+
+    if vals:
+        odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
+        logger.info(f"Partner {partner_id} actualizado con campos DTE: {list(vals.keys())}")
+
+
 def find_or_create_partner(ctx: OdooCtx, buyer: dict, billing: dict) -> tuple[int, dict]:
     rut = extract_rut_from_billing_info(billing)
     partner_id = find_partner_by_rut(ctx, rut)
 
     if partner_id:
         logger.info(f"Partner encontrado por RUT {rut}: partner_id={partner_id}")
+        update_partner_if_needed(ctx, partner_id, buyer, billing, rut)
         return partner_id, read_partner(ctx, partner_id)
 
     partner_id = create_partner(ctx, buyer, billing, rut)
@@ -529,20 +552,22 @@ def get_document_type_id(document_kind: str) -> int:
 
 
 def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
-    domain = [["ref", "=", f"ML-{order_id}"]]
-    ids = odoo_exec(ctx, "account.move", "search", [domain], {"limit": 1})
+    """Solo retorna documentos confirmados — ignora borradores rotos."""
+    ids = odoo_exec(
+        ctx, "account.move", "search",
+        [[["ref", "=", f"ML-{order_id}"], ["state", "in", ["posted", "cancel"]]]],
+        {"limit": 1},
+    )
     return ids[0] if ids else None
 
 
 def create_account_move(ctx: OdooCtx, order: dict, partner_id: int, document_kind: str) -> int:
     lines = []
-
     for row in order.get("order_items", []):
         title = row.get("item", {}).get("title", "Producto Mercado Libre")
         qty = row.get("quantity", 1)
         unit_price_gross = float(row.get("unit_price", 0))
         unit_price_net = round(unit_price_gross / IVA_RATE, 2)
-
         lines.append((0, 0, {
             "name": title,
             "quantity": qty,
@@ -581,7 +606,7 @@ def create_document_in_odoo(order: dict, billing: dict) -> dict:
     logger.info(f"[{order_id}] Documento decidido: {document_kind} — {reason}")
 
     move_id = create_account_move(ctx, order, partner_id, document_kind)
-    logger.info(f"[{order_id}] Documento creado en Odoo: move_id={move_id}")
+    logger.info(f"[{order_id}] ✅ Documento creado en Odoo: move_id={move_id} tipo={document_kind}")
 
     return {"ok": True, "move_id": move_id, "document_kind": document_kind}
 
@@ -603,17 +628,17 @@ def process_order_webhook(data: dict):
         return
 
     try:
-        logger.info(f"[{order_id}] Procesando orden desde venta registrada...")
+        logger.info(f"[{order_id}] Procesando orden...")
         order = get_ml_order(order_id)
 
         if order.get("status") != "paid":
             logger.info(f"[{order_id}] Orden no pagada. Status: {order.get('status')}")
             return
 
-        logger.info(f"[{order_id}] Venta registrada/pagada. Creando documento...")
+        logger.info(f"[{order_id}] Orden pagada. Creando documento...")
         billing = get_ml_billing_info(order_id)
         result = create_document_in_odoo(order, billing)
-        logger.info(f"[{order_id}] Resultado final: {result}")
+        logger.info(f"[{order_id}] Resultado: {result}")
 
     except requests.HTTPError as e:
         detail = e.response.text if e.response is not None else str(e)
