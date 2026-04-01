@@ -82,7 +82,7 @@ def recursive_find_first(data: Any, keys: list[str]) -> str:
 # =========================================================
 
 IVA_RATE = 1.19
-
+ML_DEFAULT_EMAIL = "odoo@lemulux.com"
 RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2"
 
 REQUIRED_ENV_VARS = [
@@ -151,10 +151,6 @@ def persist_tokens_to_railway(access_token: str, refresh_token: str):
     """
     Guarda los tokens renovados como variables de entorno en Railway
     vía su API GraphQL. Así sobreviven a reinicios del contenedor.
-
-    Nota: Railway aplica los cambios en el próximo deploy/reinicio.
-    El proceso actual ya los tiene en memoria (os.environ), así que
-    no hay interrupción del servicio.
     """
     railway_api_token = os.getenv("RAILWAY_API_TOKEN", "")
     project_id = os.getenv("RAILWAY_PROJECT_ID", "")
@@ -349,7 +345,6 @@ async def oauth_callback(request: Request):
                 os.environ["ML_ACCESS_TOKEN"] = access_token
             if refresh_token:
                 os.environ["ML_REFRESH_TOKEN"] = refresh_token
-            # Persistir en Railway también
             if access_token and refresh_token:
                 persist_tokens_to_railway(access_token, refresh_token)
             logger.info("✅ Tokens OAuth guardados en memoria y Railway")
@@ -507,7 +502,7 @@ def find_partner_by_buyer_id(ctx: OdooCtx, buyer_id: str) -> Optional[int]:
 def read_partner(ctx: OdooCtx, partner_id: int) -> dict:
     data = odoo_exec(
         ctx, "res.partner", "read",
-        [[partner_id], ["name", "vat", "comment", "company_type", "is_company"]],
+        [[partner_id], ["name", "vat", "email", "comment", "company_type", "is_company"]],
     )
     return data[0] if data else {}
 
@@ -530,6 +525,9 @@ def update_partner_missing_data(ctx: OdooCtx, partner_id: int, buyer: dict, bill
 
     if not current.get("vat") and rut:
         vals["vat"] = rut
+
+    if not current.get("email"):
+        vals["email"] = ML_DEFAULT_EMAIL
 
     if not current.get("name") or current.get("name") == "Cliente Mercado Libre":
         vals["name"] = first_non_empty(
@@ -573,6 +571,7 @@ def create_partner(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> int:
     vals = {
         "name": partner_name,
         "vat": rut or False,
+        "email": ML_DEFAULT_EMAIL,
         "comment": f"ML_BUYER_ID:{buyer_id}" if buyer_id else False,
         "customer_rank": 1,
         "company_type": "company" if looks_company else "person",
