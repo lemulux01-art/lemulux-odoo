@@ -23,13 +23,12 @@ logger = logging.getLogger("lemulux")
 app = FastAPI()
 
 IVA_RATE = 1.19
-ML_DEFAULT_EMAIL = "odoo@lemulux.com"
+ML_DEFAULT_EMAIL = "boleta@lemulux.com"
+DEFAULT_BOLETA_ACTIVITY = "(boleta)"
 
-# Valores de l10n_cl_sii_taxpayer_type en Odoo 18 Chile
-# "1" = 1a Categoría  → empresa contribuyente → factura
-# "4" = Consumidor Final → persona natural → boleta
-SII_TAXPAYER_EMPRESA    = "1"
-SII_TAXPAYER_CONSUMIDOR = "4"
+# Odoo Chile
+SII_TAXPAYER_EMPRESA = "1"       # 1a categoría
+SII_TAXPAYER_CONSUMIDOR = "4"    # consumidor final
 
 REQUIRED_ENV_VARS = [
     "ML_ACCESS_TOKEN",
@@ -51,7 +50,7 @@ RECENT_ORDERS_LOCK = Lock()
 DEDUP_SECONDS = 60
 
 # Renovación automática del token cada 5 horas
-TOKEN_REFRESH_INTERVAL = 5 * 60 * 60  # 5 horas en segundos
+TOKEN_REFRESH_INTERVAL = 5 * 60 * 60
 
 
 # =========================================================
@@ -125,10 +124,6 @@ def should_skip_recent_order(order_id: str) -> bool:
 # =========================================================
 
 def schedule_token_refresh():
-    """
-    Hilo en background que renueva el token ML cada 5 horas.
-    El token dura 6 horas — renovar a las 5 evita cualquier caída.
-    """
     while True:
         time.sleep(TOKEN_REFRESH_INTERVAL)
         logger.info("⏰ Renovación programada del token ML (cada 5h)...")
@@ -144,7 +139,6 @@ async def on_startup():
         raise RuntimeError(f"Variables faltantes: {missing}")
     logger.info("✅ Variables de entorno cargadas correctamente")
 
-    # Iniciar renovación automática en hilo daemon
     t = threading.Thread(target=schedule_token_refresh, daemon=True)
     t.start()
     logger.info("⏰ Renovación automática del token ML iniciada (cada 5 horas)")
@@ -305,6 +299,10 @@ def get_ml_order(order_id: str) -> dict:
     return ml_get(f"https://api.mercadolibre.com/orders/{order_id}")
 
 
+def get_ml_shipment(shipment_id: str) -> dict:
+    return ml_get(f"https://api.mercadolibre.com/shipments/{shipment_id}")
+
+
 def get_ml_billing_info(order_id: str) -> dict:
     url = f"https://api.mercadolibre.com/orders/{order_id}/billing_info"
     for attempt in range(4):
@@ -363,7 +361,7 @@ def extract_name_from_billing_info(billing: dict, buyer: dict) -> str:
 
 
 def extract_activity_from_billing_info(billing: dict) -> str:
-    return first_non_empty(
+    activity = first_non_empty(
         recursive_find_first(billing, ["business_activity"]),
         recursive_find_first(billing, ["activity"]),
         recursive_find_first(billing, ["economic_activity"]),
@@ -372,6 +370,7 @@ def extract_activity_from_billing_info(billing: dict) -> str:
         recursive_find_first(billing, ["giro"]),
         recursive_find_first(billing, ["description_of_activity"]),
     )
+    return activity.strip() if activity else ""
 
 
 def extract_taxpayer_type_from_billing_info(billing: dict) -> str:
@@ -477,15 +476,30 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
     return ids[0] if ids else None
 
 
+def find_partner_by_buyer_id(ctx: OdooCtx, buyer_id: str) -> Optional[int]:
+    if not buyer_id:
+        return None
+    ids = odoo_exec(
+        ctx, "res.partner", "search",
+        [[["comment", "ilike", f"ML_BUYER_ID:{buyer_id}"]]],
+        {"limit": 1},
+    )
+    return ids[0] if ids else None
+
+
+def append_ml_buyer_id_to_partner(ctx: OdooCtx, partner_id: int, buyer_id: str):
+    if not buyer_id:
+        return
+    partner_data = read_partner(ctx, partner_id)
+    current_comment = partner_data.get("comment") or ""
+    marker = f"ML_BUYER_ID:{buyer_id}"
+    if marker in current_comment:
+        return
+    new_comment = f"{current_comment}\n{marker}".strip()
+    odoo_exec(ctx, "res.partner", "write", [[partner_id], {"comment": new_comment}])
+
+
 def build_partner_vals_from_ml(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> dict:
-    """
-    Campos obligatorios para emitir DTE en Odoo 18 Chile:
-    - country_id = Chile
-    - l10n_cl_sii_taxpayer_type = "1" (empresa) o "4" (consumidor final)
-    - l10n_cl_dte_email = email DTE (campo separado de email, obligatorio)
-    - l10n_latam_identification_type_id = RUT
-    - vat = número de RUT
-    """
     chile_country_id = get_chile_country_id(ctx)
     rut_identification_type_id = get_rut_identification_type_id(ctx)
     is_company = should_be_company_from_ml(billing, buyer)
@@ -506,25 +520,33 @@ def build_partner_vals_from_ml(ctx: OdooCtx, buyer: dict, billing: dict, rut: st
     if rut and rut_identification_type_id and model_has_field(ctx, "res.partner", "l10n_latam_identification_type_id"):
         vals["l10n_latam_identification_type_id"] = rut_identification_type_id
 
+    activity = extract_activity_from_billing_info(billing)
+    if not activity and not is_company:
+        if model_has_field(ctx, "res.partner", "activity_description"):
+            vals["activity_description"] = DEFAULT_BOLETA_ACTIVITY
+        elif model_has_field(ctx, "res.partner", "x_studio_activity_description"):
+            vals["x_studio_activity_description"] = DEFAULT_BOLETA_ACTIVITY
+        elif model_has_field(ctx, "res.partner", "x_giro"):
+            vals["x_giro"] = DEFAULT_BOLETA_ACTIVITY
+
     return vals
 
 
-def create_partner(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> int:
-    vals = build_partner_vals_from_ml(ctx, buyer, billing, rut)
-    return odoo_exec(ctx, "res.partner", "create", [vals])
-
-
 def update_partner_if_needed(ctx: OdooCtx, partner_id: int, buyer: dict, billing: dict, rut: str):
-    """
-    Actualiza partners existentes que les falten campos DTE obligatorios.
-    Corrige partners creados antes de los fixes.
-    """
     current = read_partner(ctx, partner_id)
     vals = {}
 
+    is_company = should_be_company_from_ml(billing, buyer)
+    sii_taxpayer_type = SII_TAXPAYER_EMPRESA if is_company else SII_TAXPAYER_CONSUMIDOR
+
+    if not current.get("vat") and rut:
+        vals["vat"] = rut
+
     if not current.get("l10n_cl_sii_taxpayer_type"):
-        is_company = should_be_company_from_ml(billing, buyer)
-        vals["l10n_cl_sii_taxpayer_type"] = SII_TAXPAYER_EMPRESA if is_company else SII_TAXPAYER_CONSUMIDOR
+        vals["l10n_cl_sii_taxpayer_type"] = sii_taxpayer_type
+
+    if not current.get("email"):
+        vals["email"] = ML_DEFAULT_EMAIL
 
     if not current.get("l10n_cl_dte_email"):
         vals["l10n_cl_dte_email"] = ML_DEFAULT_EMAIL
@@ -532,50 +554,101 @@ def update_partner_if_needed(ctx: OdooCtx, partner_id: int, buyer: dict, billing
     if not current.get("country_id"):
         vals["country_id"] = get_chile_country_id(ctx)
 
+    activity = extract_activity_from_billing_info(billing)
+    if not activity and not is_company:
+        if model_has_field(ctx, "res.partner", "activity_description"):
+            vals["activity_description"] = DEFAULT_BOLETA_ACTIVITY
+        elif model_has_field(ctx, "res.partner", "x_studio_activity_description"):
+            vals["x_studio_activity_description"] = DEFAULT_BOLETA_ACTIVITY
+        elif model_has_field(ctx, "res.partner", "x_giro"):
+            vals["x_giro"] = DEFAULT_BOLETA_ACTIVITY
+
     if vals:
         odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
         logger.info(f"Partner {partner_id} actualizado con campos DTE: {list(vals.keys())}")
 
 
-def find_or_create_partner(ctx: OdooCtx, buyer: dict, billing: dict) -> tuple[int, dict]:
-    rut = extract_rut_from_billing_info(billing)
-    partner_id = find_partner_by_rut(ctx, rut)
+def ensure_partner_dte_fields(ctx: OdooCtx, partner_id: int, billing: dict, buyer: dict):
+    current = read_partner(ctx, partner_id)
+    vals = {}
 
+    is_company = should_be_company_from_ml(billing, buyer)
+    sii_taxpayer_type = SII_TAXPAYER_EMPRESA if is_company else SII_TAXPAYER_CONSUMIDOR
+
+    if not current.get("email"):
+        vals["email"] = ML_DEFAULT_EMAIL
+
+    if not current.get("l10n_cl_dte_email"):
+        vals["l10n_cl_dte_email"] = ML_DEFAULT_EMAIL
+
+    if not current.get("country_id"):
+        vals["country_id"] = get_chile_country_id(ctx)
+
+    if not current.get("l10n_cl_sii_taxpayer_type"):
+        vals["l10n_cl_sii_taxpayer_type"] = sii_taxpayer_type
+
+    activity = extract_activity_from_billing_info(billing)
+    if not activity and not is_company:
+        if model_has_field(ctx, "res.partner", "activity_description"):
+            vals["activity_description"] = DEFAULT_BOLETA_ACTIVITY
+        elif model_has_field(ctx, "res.partner", "x_studio_activity_description"):
+            vals["x_studio_activity_description"] = DEFAULT_BOLETA_ACTIVITY
+        elif model_has_field(ctx, "res.partner", "x_giro"):
+            vals["x_giro"] = DEFAULT_BOLETA_ACTIVITY
+
+    if vals:
+        odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
+        logger.info(f"Partner {partner_id} forzado con campos DTE: {list(vals.keys())}")
+
+
+def create_partner(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> int:
+    vals = build_partner_vals_from_ml(ctx, buyer, billing, rut)
+    partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
+    logger.info(f"Partner creado para RUT {rut or 'sin_rut'}: partner_id={partner_id}")
+    return partner_id
+
+
+def find_or_create_partner(ctx: OdooCtx, buyer: dict, billing: dict) -> tuple[int, dict]:
+    buyer_id = str(buyer.get("id", ""))
+    rut = extract_rut_from_billing_info(billing)
+
+    partner_id = find_partner_by_rut(ctx, rut)
     if partner_id:
-        logger.info(f"Partner encontrado por RUT {rut}: partner_id={partner_id}")
+        append_ml_buyer_id_to_partner(ctx, partner_id, buyer_id)
+        update_partner_if_needed(ctx, partner_id, buyer, billing, rut)
+        return partner_id, read_partner(ctx, partner_id)
+
+    partner_id = find_partner_by_buyer_id(ctx, buyer_id)
+    if partner_id:
         update_partner_if_needed(ctx, partner_id, buyer, billing, rut)
         return partner_id, read_partner(ctx, partner_id)
 
     partner_id = create_partner(ctx, buyer, billing, rut)
-    logger.info(f"Partner creado para RUT {rut}: partner_id={partner_id}")
     return partner_id, read_partner(ctx, partner_id)
 
 
 # =========================================================
-# DOCUMENTO
+# DECISIÓN FACTURA / BOLETA
 # =========================================================
 
 def decide_document_kind(partner_data: dict, billing: dict) -> tuple[str, str]:
-    if ml_indicates_final_consumer(billing):
-        return "boleta", "ML indica consumidor final"
-
     rut = normalize_rut(partner_data.get("vat") or "")
     activity = extract_activity_from_billing_info(billing)
 
+    if partner_data.get("l10n_cl_sii_taxpayer_type") == SII_TAXPAYER_CONSUMIDOR:
+        return "boleta", "Consumidor final"
+    if partner_data.get("company_type") == "person":
+        return "boleta", "Persona natural"
     if partner_data.get("company_type") == "company" and rut and activity:
-        return "factura", "Empresa con RUT y actividad económica"
-
+        return "factura", "Empresa con RUT y actividad"
     return "boleta", "Fallback seguro a boleta"
 
 
-def get_document_type_id(document_kind: str) -> int:
-    if document_kind == "factura":
-        return to_int_env("ODOO_DOC_TYPE_FACTURA_ID", required=True)
-    return to_int_env("ODOO_DOC_TYPE_BOLETA_ID", required=True)
-
+# =========================================================
+# DOCUMENTOS ODOO
+# =========================================================
 
 def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
-    """Solo retorna documentos confirmados — ignora borradores rotos."""
     ids = odoo_exec(
         ctx, "account.move", "search",
         [[["ref", "=", f"ML-{order_id}"], ["state", "in", ["posted", "cancel"]]]],
@@ -584,7 +657,13 @@ def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
     return ids[0] if ids else None
 
 
-def create_account_move(ctx: OdooCtx, order: dict, partner_id: int, document_kind: str) -> int:
+def get_document_type_id(document_kind: str) -> int:
+    if document_kind == "factura":
+        return to_int_env("ODOO_DOC_TYPE_FACTURA_ID", required=True)
+    return to_int_env("ODOO_DOC_TYPE_BOLETA_ID", required=True)
+
+
+def create_account_move(ctx: OdooCtx, order: dict, partner_id: int, document_kind: str, billing: dict, buyer: dict) -> int:
     lines = []
     for row in order.get("order_items", []):
         title = row.get("item", {}).get("title", "Producto Mercado Libre")
@@ -599,6 +678,8 @@ def create_account_move(ctx: OdooCtx, order: dict, partner_id: int, document_kin
 
     if not lines:
         raise Exception("La orden no tiene líneas para documentar")
+
+    ensure_partner_dte_fields(ctx, partner_id, billing, buyer)
 
     vals = {
         "move_type": "out_invoice",
@@ -622,32 +703,43 @@ def create_document_in_odoo(order: dict, billing: dict) -> dict:
         logger.info(f"[{order_id}] Documento ya existe: move_id={existing}")
         return {"ok": True, "message": "Documento ya existe", "move_id": existing}
 
-    buyer = order.get("buyer", {}) or {}
+    buyer = order.get("buyer", {})
     partner_id, partner_data = find_or_create_partner(ctx, buyer, billing)
-
     document_kind, reason = decide_document_kind(partner_data, billing)
+
     logger.info(f"[{order_id}] Documento decidido: {document_kind} — {reason}")
 
-    move_id = create_account_move(ctx, order, partner_id, document_kind)
-    logger.info(f"[{order_id}] ✅ Documento creado en Odoo: move_id={move_id} tipo={document_kind}")
+    move_id = create_account_move(ctx, order, partner_id, document_kind, billing, buyer)
+    logger.info(f"[{order_id}] Documento creado en Odoo: move_id={move_id}")
 
-    return {"ok": True, "move_id": move_id, "document_kind": document_kind}
+    return {
+        "ok": True,
+        "message": f"{document_kind.capitalize()} creada",
+        "document_kind": document_kind,
+        "reason": reason,
+        "move_id": move_id,
+    }
 
 
 # =========================================================
-# PROCESO PRINCIPAL
+# PROCESAMIENTO WEBHOOK
 # =========================================================
 
 def process_order_webhook(data: dict):
+    topic = data.get("topic")
     resource = data.get("resource", "")
-    order_id = resource.split("/")[-1]
+    logger.info(f"Webhook recibido: topic={topic} resource={resource}")
 
+    if topic != "orders_v2":
+        return
+
+    order_id = resource.split("/")[-1]
     if not order_id:
         logger.error("No se pudo extraer order_id del webhook")
         return
 
     if should_skip_recent_order(order_id):
-        logger.info(f"[{order_id}] Webhook duplicado reciente, omitido")
+        logger.info(f"[{order_id}] Webhook duplicado reciente, se ignora")
         return
 
     try:
@@ -659,9 +751,10 @@ def process_order_webhook(data: dict):
             return
 
         logger.info(f"[{order_id}] Orden pagada. Creando documento...")
+
         billing = get_ml_billing_info(order_id)
         result = create_document_in_odoo(order, billing)
-        logger.info(f"[{order_id}] Resultado: {result}")
+        logger.info(f"[{order_id}] Resultado final: {result}")
 
     except requests.HTTPError as e:
         detail = e.response.text if e.response is not None else str(e)
@@ -671,7 +764,7 @@ def process_order_webhook(data: dict):
 
 
 # =========================================================
-# WEBHOOK
+# WEBHOOK ML
 # =========================================================
 
 @app.post("/ml/webhook")
@@ -680,13 +773,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         data = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Body inválido"})
-
-    topic = data.get("topic")
-    resource = data.get("resource", "")
-    logger.info(f"Webhook recibido: topic={topic} resource={resource}")
-
-    if topic != "orders_v2":
-        return {"ok": True, "message": "Topic ignorado"}
 
     background_tasks.add_task(process_order_webhook, data)
     return {"ok": True, "message": "Recibido"}
