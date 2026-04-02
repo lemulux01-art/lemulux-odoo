@@ -44,12 +44,10 @@ REQUIRED_ENV_VARS = [
     "ODOO_DOC_TYPE_BOLETA_ID",
 ]
 
-# Evita tormenta de webhooks duplicados
 RECENT_ORDERS: dict[str, float] = {}
 RECENT_ORDERS_LOCK = Lock()
 DEDUP_SECONDS = 60
 
-# Renovación automática del token cada 5 horas
 TOKEN_REFRESH_INTERVAL = 5 * 60 * 60
 
 
@@ -272,7 +270,7 @@ def ml_headers() -> dict:
     return {"Authorization": f"Bearer {get_env('ML_ACCESS_TOKEN')}"}
 
 
-def ml_get(url: str, retries: int = 4) -> dict:
+def ml_get(url: str, retries: int = 6) -> dict:
     for attempt in range(retries):
         response = requests.get(url, headers=ml_headers(), timeout=30)
 
@@ -284,7 +282,7 @@ def ml_get(url: str, retries: int = 4) -> dict:
                 raise Exception("Token ML inválido o expirado")
 
         if response.status_code == 429:
-            wait_time = 2 * (attempt + 1)
+            wait_time = min(5 * (attempt + 1), 30)
             logger.warning(f"429 en {url}. Reintento en {wait_time}s")
             time.sleep(wait_time)
             continue
@@ -299,13 +297,9 @@ def get_ml_order(order_id: str) -> dict:
     return ml_get(f"https://api.mercadolibre.com/orders/{order_id}")
 
 
-def get_ml_shipment(shipment_id: str) -> dict:
-    return ml_get(f"https://api.mercadolibre.com/shipments/{shipment_id}")
-
-
 def get_ml_billing_info(order_id: str) -> dict:
     url = f"https://api.mercadolibre.com/orders/{order_id}/billing_info"
-    for attempt in range(4):
+    for attempt in range(6):
         response = requests.get(url, headers=ml_headers(), timeout=30)
 
         if response.status_code == 401:
@@ -319,7 +313,7 @@ def get_ml_billing_info(order_id: str) -> dict:
             return {}
 
         if response.status_code == 429:
-            wait_time = 2 * (attempt + 1)
+            wait_time = min(5 * (attempt + 1), 30)
             logger.warning(f"429 en billing_info {order_id}. Reintento en {wait_time}s")
             time.sleep(wait_time)
             continue
@@ -436,9 +430,12 @@ def odoo_exec(ctx: OdooCtx, model: str, method: str, args: list, kwargs: dict = 
     )
 
 
+def model_fields(ctx: OdooCtx, model: str) -> dict:
+    return odoo_exec(ctx, model, "fields_get", [], {"attributes": ["type", "relation", "string"]})
+
+
 def model_has_field(ctx: OdooCtx, model: str, field_name: str) -> bool:
-    fields_info = odoo_exec(ctx, model, "fields_get", [], {"attributes": ["type"]})
-    return field_name in fields_info
+    return field_name in model_fields(ctx, model)
 
 
 def get_chile_country_id(ctx: OdooCtx) -> int:
@@ -462,8 +459,21 @@ def read_partner(ctx: OdooCtx, partner_id: int) -> dict:
         "name", "vat", "email", "l10n_cl_dte_email", "comment",
         "company_type", "is_company", "country_id", "l10n_cl_sii_taxpayer_type",
     ]
-    if model_has_field(ctx, "res.partner", "l10n_latam_identification_type_id"):
+    f = model_fields(ctx, "res.partner")
+    for extra in [
+        "activity_description",
+        "l10n_cl_activity_description",
+        "x_studio_activity_description",
+        "x_giro",
+        "giro",
+        "business_activity",
+    ]:
+        if extra in f:
+            fields.append(extra)
+
+    if "l10n_latam_identification_type_id" in f:
         fields.append("l10n_latam_identification_type_id")
+
     data = odoo_exec(ctx, "res.partner", "read", [[partner_id], fields])
     return data[0] if data else {}
 
@@ -499,6 +509,115 @@ def append_ml_buyer_id_to_partner(ctx: OdooCtx, partner_id: int, buyer_id: str):
     odoo_exec(ctx, "res.partner", "write", [[partner_id], {"comment": new_comment}])
 
 
+# =========================================================
+# GIRO / ACTIVITY ROBUSTO
+# =========================================================
+
+def get_partner_activity_candidates(ctx: OdooCtx) -> list[tuple[str, dict]]:
+    """
+    Devuelve TODOS los campos candidatos para giro/actividad.
+    """
+    fields = model_fields(ctx, "res.partner")
+    candidates = []
+
+    preferred = [
+        "activity_description",
+        "l10n_cl_activity_description",
+        "x_studio_activity_description",
+        "x_giro",
+        "giro",
+        "business_activity",
+    ]
+
+    for name in preferred:
+        if name in fields:
+            candidates.append((name, fields[name]))
+
+    for name, meta in fields.items():
+        if any(name == x for x, _ in candidates):
+            continue
+        label = (meta.get("string") or "").lower()
+        n = name.lower()
+        if "giro" in n or "giro" in label:
+            candidates.append((name, meta))
+        elif "activity" in n or "actividad" in label:
+            if meta.get("type") in ("char", "text", "many2one"):
+                candidates.append((name, meta))
+
+    return candidates
+
+
+def get_default_activity_value_for_field(ctx: OdooCtx, field_meta: dict) -> Any:
+    ftype = field_meta.get("type")
+
+    if ftype in ("char", "text"):
+        return DEFAULT_BOLETA_ACTIVITY
+
+    if ftype == "many2one":
+        relation = field_meta.get("relation")
+        if not relation:
+            return None
+
+        try:
+            ids = odoo_exec(
+                ctx, relation, "search",
+                [[["name", "ilike", "boleta"]]],
+                {"limit": 1},
+            )
+            if ids:
+                return ids[0]
+        except Exception:
+            pass
+
+        try:
+            ids = odoo_exec(ctx, relation, "search", [[]], {"limit": 1})
+            if ids:
+                return ids[0]
+        except Exception:
+            pass
+
+        try:
+            rel_fields = model_fields(ctx, relation)
+            if "name" in rel_fields:
+                return odoo_exec(ctx, relation, "create", [{"name": DEFAULT_BOLETA_ACTIVITY}])
+        except Exception:
+            pass
+
+    return None
+
+
+def apply_partner_activity_values(vals: dict, ctx: OdooCtx, activity_text: str, current_partner: Optional[dict] = None):
+    """
+    Escribe el giro en TODOS los campos candidatos que estén vacíos.
+    """
+    candidates = get_partner_activity_candidates(ctx)
+
+    if not candidates:
+        logger.warning("No se detectaron campos candidatos de giro/actividad en res.partner")
+        return
+
+    for field_name, meta in candidates:
+        current_val = current_partner.get(field_name) if current_partner else None
+        if current_val:
+            continue
+
+        ftype = meta.get("type")
+        if activity_text and ftype in ("char", "text"):
+            vals[field_name] = activity_text
+        else:
+            default_val = get_default_activity_value_for_field(ctx, meta)
+            if default_val:
+                vals[field_name] = default_val
+
+
+def has_any_partner_activity(current_partner: dict, ctx: OdooCtx) -> bool:
+    for field_name, _meta in get_partner_activity_candidates(ctx):
+        val = current_partner.get(field_name)
+        if val:
+            return True
+    return False
+
+
 def build_partner_vals_from_ml(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> dict:
     chile_country_id = get_chile_country_id(ctx)
     rut_identification_type_id = get_rut_identification_type_id(ctx)
@@ -517,17 +636,12 @@ def build_partner_vals_from_ml(ctx: OdooCtx, buyer: dict, billing: dict, rut: st
         "l10n_cl_sii_taxpayer_type": sii_taxpayer_type,
     }
 
-    if rut and rut_identification_type_id and model_has_field(ctx, "res.partner", "l10n_latam_identification_type_id"):
+    f = model_fields(ctx, "res.partner")
+    if rut and rut_identification_type_id and "l10n_latam_identification_type_id" in f:
         vals["l10n_latam_identification_type_id"] = rut_identification_type_id
 
-    activity = extract_activity_from_billing_info(billing)
-    if not activity and not is_company:
-        if model_has_field(ctx, "res.partner", "activity_description"):
-            vals["activity_description"] = DEFAULT_BOLETA_ACTIVITY
-        elif model_has_field(ctx, "res.partner", "x_studio_activity_description"):
-            vals["x_studio_activity_description"] = DEFAULT_BOLETA_ACTIVITY
-        elif model_has_field(ctx, "res.partner", "x_giro"):
-            vals["x_giro"] = DEFAULT_BOLETA_ACTIVITY
+    activity = extract_activity_from_billing_info(billing) or DEFAULT_BOLETA_ACTIVITY
+    apply_partner_activity_values(vals, ctx, activity)
 
     return vals
 
@@ -554,18 +668,13 @@ def update_partner_if_needed(ctx: OdooCtx, partner_id: int, buyer: dict, billing
     if not current.get("country_id"):
         vals["country_id"] = get_chile_country_id(ctx)
 
-    activity = extract_activity_from_billing_info(billing)
-    if not activity and not is_company:
-        if model_has_field(ctx, "res.partner", "activity_description"):
-            vals["activity_description"] = DEFAULT_BOLETA_ACTIVITY
-        elif model_has_field(ctx, "res.partner", "x_studio_activity_description"):
-            vals["x_studio_activity_description"] = DEFAULT_BOLETA_ACTIVITY
-        elif model_has_field(ctx, "res.partner", "x_giro"):
-            vals["x_giro"] = DEFAULT_BOLETA_ACTIVITY
+    if not has_any_partner_activity(current, ctx):
+        activity = extract_activity_from_billing_info(billing) or DEFAULT_BOLETA_ACTIVITY
+        apply_partner_activity_values(vals, ctx, activity, current)
 
     if vals:
         odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
-        logger.info(f"Partner {partner_id} actualizado con campos DTE: {list(vals.keys())}")
+        logger.info(f"Partner {partner_id} actualizado con campos DTE/giro: {list(vals.keys())}")
 
 
 def ensure_partner_dte_fields(ctx: OdooCtx, partner_id: int, billing: dict, buyer: dict):
@@ -587,18 +696,21 @@ def ensure_partner_dte_fields(ctx: OdooCtx, partner_id: int, billing: dict, buye
     if not current.get("l10n_cl_sii_taxpayer_type"):
         vals["l10n_cl_sii_taxpayer_type"] = sii_taxpayer_type
 
-    activity = extract_activity_from_billing_info(billing)
-    if not activity and not is_company:
-        if model_has_field(ctx, "res.partner", "activity_description"):
-            vals["activity_description"] = DEFAULT_BOLETA_ACTIVITY
-        elif model_has_field(ctx, "res.partner", "x_studio_activity_description"):
-            vals["x_studio_activity_description"] = DEFAULT_BOLETA_ACTIVITY
-        elif model_has_field(ctx, "res.partner", "x_giro"):
-            vals["x_giro"] = DEFAULT_BOLETA_ACTIVITY
+    if not has_any_partner_activity(current, ctx):
+        activity = extract_activity_from_billing_info(billing) or DEFAULT_BOLETA_ACTIVITY
+        apply_partner_activity_values(vals, ctx, activity, current)
 
     if vals:
         odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
-        logger.info(f"Partner {partner_id} forzado con campos DTE: {list(vals.keys())}")
+        logger.info(f"Partner {partner_id} forzado con campos DTE/giro: {list(vals.keys())}")
+
+    # Verificación final dura
+    refreshed = read_partner(ctx, partner_id)
+    if not has_any_partner_activity(refreshed, ctx):
+        raise Exception(
+            f"No se pudo asignar giro/actividad al partner {partner_id}. "
+            f"Revisar campo real de giro en Odoo."
+        )
 
 
 def create_partner(ctx: OdooCtx, buyer: dict, billing: dict, rut: str) -> int:
