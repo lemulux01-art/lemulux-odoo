@@ -659,18 +659,403 @@ def ui_bandeja():
     <head>
       <meta charset='utf-8'>
       <meta name='viewport' content='width=device-width, initial-scale=1'>
-      <title>Lemulux Odoo</title>
+      <title>Lemulux Odoo | Bandeja</title>
       <style>
-        body { font-family: Arial, sans-serif; padding: 24px; background: #0f172a; color: #e2e8f0; }
-        table { width: 100%; border-collapse: collapse; background: #111827; }
-        th, td { border: 1px solid #334155; padding: 10px; text-align: left; }
-        th { background: #1e293b; }
-        button { background: #22c55e; border: 0; color: white; padding: 8px 12px; cursor: pointer; }
+        :root {
+          --bg: #0f172a;
+          --panel: #111827;
+          --panel-2: #1f2937;
+          --border: #334155;
+          --text: #e5e7eb;
+          --muted: #94a3b8;
+          --ok: #22c55e;
+          --warn: #f59e0b;
+          --bad: #ef4444;
+          --blue: #3b82f6;
+        }
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          font-family: Arial, sans-serif;
+          background: var(--bg);
+          color: var(--text);
+        }
+        .wrap {
+          max-width: 1280px;
+          margin: 0 auto;
+          padding: 24px;
+        }
+        .topbar {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 16px;
+          margin-bottom: 20px;
+          flex-wrap: wrap;
+        }
+        .title { font-size: 28px; font-weight: 700; }
+        .subtitle { color: var(--muted); margin-top: 6px; }
+        .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+        button, select, input {
+          border-radius: 10px;
+          border: 1px solid var(--border);
+          background: var(--panel);
+          color: var(--text);
+          padding: 10px 12px;
+          font-size: 14px;
+        }
+        button {
+          cursor: pointer;
+          background: var(--blue);
+          border: none;
+          font-weight: 600;
+        }
+        button.secondary { background: var(--panel-2); border: 1px solid var(--border); }
+        button.success { background: var(--ok); color: #052e16; }
+        button.warn { background: var(--warn); color: #3b2300; }
+        button.danger { background: var(--bad); color: white; }
+        .grid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 14px;
+          margin-bottom: 18px;
+        }
+        .card {
+          background: var(--panel);
+          border: 1px solid var(--border);
+          border-radius: 16px;
+          padding: 16px;
+        }
+        .card h3 { margin: 0 0 8px 0; font-size: 14px; color: var(--muted); font-weight: 600; }
+        .card .value { font-size: 28px; font-weight: 700; }
+        .toolbar {
+          display: flex;
+          gap: 10px;
+          margin-bottom: 18px;
+          flex-wrap: wrap;
+        }
+        .toolbar input { min-width: 260px; }
+        table {
+          width: 100%;
+          border-collapse: collapse;
+          background: var(--panel);
+          border: 1px solid var(--border);
+          border-radius: 16px;
+          overflow: hidden;
+        }
+        th, td {
+          padding: 12px;
+          border-bottom: 1px solid var(--border);
+          text-align: left;
+          vertical-align: top;
+          font-size: 14px;
+        }
+        th {
+          background: #0b1220;
+          color: var(--muted);
+          font-weight: 700;
+        }
+        tr:hover td { background: rgba(255,255,255,0.02); }
+        .badge {
+          display: inline-block;
+          padding: 5px 10px;
+          border-radius: 999px;
+          font-size: 12px;
+          font-weight: 700;
+        }
+        .badge-pendiente { background: rgba(245,158,11,0.15); color: #fbbf24; }
+        .badge-enviado { background: rgba(34,197,94,0.15); color: #4ade80; }
+        .badge-error { background: rgba(239,68,68,0.15); color: #f87171; }
+        .badge-default { background: rgba(148,163,184,0.15); color: #cbd5e1; }
+        .row-actions {
+          display: flex;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .small { color: var(--muted); font-size: 12px; }
+        .empty {
+          text-align: center;
+          padding: 36px;
+          color: var(--muted);
+          background: var(--panel);
+          border: 1px solid var(--border);
+          border-radius: 16px;
+        }
+        .modal {
+          position: fixed;
+          inset: 0;
+          background: rgba(2,6,23,0.78);
+          display: none;
+          align-items: center;
+          justify-content: center;
+          padding: 20px;
+        }
+        .modal.open { display: flex; }
+        .modal-card {
+          width: min(680px, 100%);
+          background: var(--panel);
+          border: 1px solid var(--border);
+          border-radius: 18px;
+          padding: 20px;
+        }
+        .modal-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 12px;
+        }
+        .modal-grid .full { grid-column: 1 / -1; }
+        label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+        .muted-link { color: #93c5fd; text-decoration: none; }
+        .footer-note { margin-top: 16px; color: var(--muted); font-size: 12px; }
+        @media (max-width: 980px) {
+          .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+          .modal-grid { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 640px) {
+          .grid { grid-template-columns: 1fr; }
+          table, thead, tbody, th, td, tr { display: block; }
+          thead { display: none; }
+          tr { border-bottom: 1px solid var(--border); }
+          td { padding: 10px 12px; }
+          td::before {
+            content: attr(data-label);
+            display: block;
+            color: var(--muted);
+            font-size: 12px;
+            margin-bottom: 4px;
+          }
+        }
       </style>
     </head>
     <body>
-      <h1>Bandeja de Ventas ML</h1>
-      <p>Usa <code>/ventas</code> para consumir la API.</p>
+      <div class='wrap'>
+        <div class='topbar'>
+          <div>
+            <div class='title'>Bandeja de ventas ML → Odoo</div>
+            <div class='subtitle'>Control manual de ventas antes de crear factura o boleta en Odoo.</div>
+          </div>
+          <div class='actions'>
+            <button class='secondary' onclick='refreshData()'>Actualizar</button>
+            <a class='muted-link' href='/health' target='_blank' rel='noreferrer'>Ver health</a>
+            <a class='muted-link' href='/ventas' target='_blank' rel='noreferrer'>Ver API</a>
+          </div>
+        </div>
+
+        <div class='grid'>
+          <div class='card'><h3>Total</h3><div class='value' id='totalCount'>0</div></div>
+          <div class='card'><h3>Pendientes</h3><div class='value' id='pendCount'>0</div></div>
+          <div class='card'><h3>Enviadas</h3><div class='value' id='sentCount'>0</div></div>
+          <div class='card'><h3>Con error</h3><div class='value' id='errorCount'>0</div></div>
+        </div>
+
+        <div class='toolbar'>
+          <input id='searchInput' placeholder='Buscar por ID, cliente, RUT, email o tipo' oninput='renderTable()' />
+          <select id='statusFilter' onchange='renderTable()'>
+            <option value=''>Todos los estados</option>
+            <option value='pendiente'>Pendiente</option>
+            <option value='enviado'>Enviado</option>
+            <option value='error'>Error</option>
+          </select>
+        </div>
+
+        <div id='tableWrap'></div>
+
+        <div class='footer-note'>Panel embebido en FastAPI. Si no ves datos, revisa que el webhook esté poblando la tabla <strong>ventas</strong>.</div>
+      </div>
+
+      <div class='modal' id='editModal'>
+        <div class='modal-card'>
+          <div class='topbar' style='margin-bottom:14px;'>
+            <div>
+              <div class='title' style='font-size:22px;'>Editar venta</div>
+              <div class='subtitle' id='modalSubtitle'></div>
+            </div>
+            <button class='secondary' onclick='closeModal()'>Cerrar</button>
+          </div>
+          <div class='modal-grid'>
+            <div>
+              <label>Email</label>
+              <input id='editEmail' class='full-input' />
+            </div>
+            <div>
+              <label>Tipo sugerido</label>
+              <select id='editTipo'>
+                <option value='Boleta'>Boleta</option>
+                <option value='Factura'>Factura</option>
+              </select>
+            </div>
+            <div class='full'>
+              <label>Giro</label>
+              <input id='editGiro' />
+            </div>
+          </div>
+          <div class='row-actions' style='margin-top:16px;'>
+            <button onclick='saveEdit()'>Guardar cambios</button>
+            <button class='success' onclick='saveAndAuthorize()'>Guardar y autorizar</button>
+          </div>
+        </div>
+      </div>
+
+      <script>
+        let ventas = [];
+        let currentEditId = null;
+
+        function badgeClass(status) {
+          if (status === 'pendiente') return 'badge badge-pendiente';
+          if (status === 'enviado') return 'badge badge-enviado';
+          if (status === 'error') return 'badge badge-error';
+          return 'badge badge-default';
+        }
+
+        function safe(v) {
+          return v === null || v === undefined || v === '' ? '—' : String(v);
+        }
+
+        function updateStats(items) {
+          document.getElementById('totalCount').textContent = items.length;
+          document.getElementById('pendCount').textContent = items.filter(v => v.estado === 'pendiente').length;
+          document.getElementById('sentCount').textContent = items.filter(v => v.estado === 'enviado').length;
+          document.getElementById('errorCount').textContent = items.filter(v => v.estado === 'error').length;
+        }
+
+        function filteredVentas() {
+          const q = document.getElementById('searchInput').value.trim().toLowerCase();
+          const status = document.getElementById('statusFilter').value;
+          return ventas.filter(v => {
+            const hayStatus = !status || (v.estado || '') === status;
+            const hayTexto = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.giro]
+              .filter(Boolean)
+              .join(' ')
+              .toLowerCase()
+              .includes(q);
+            return hayStatus && hayTexto;
+          });
+        }
+
+        function renderTable() {
+          const items = filteredVentas();
+          updateStats(ventas);
+          const wrap = document.getElementById('tableWrap');
+          if (!items.length) {
+            wrap.innerHTML = `<div class='empty'>No hay ventas para mostrar.</div>`;
+            return;
+          }
+
+          wrap.innerHTML = `
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Cliente</th>
+                  <th>RUT</th>
+                  <th>Tipo</th>
+                  <th>Estado</th>
+                  <th>Correo</th>
+                  <th>Giro</th>
+                  <th>Move ID</th>
+                  <th>Acciones</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${items.map(v => `
+                  <tr>
+                    <td data-label='ID'><strong>${safe(v.id)}</strong><div class='small'>${safe(v.creado_en)}</div></td>
+                    <td data-label='Cliente'>${safe(v.cliente)}</td>
+                    <td data-label='RUT'>${safe(v.rut)}</td>
+                    <td data-label='Tipo'>${safe(v.tipo_sugerido)}</td>
+                    <td data-label='Estado'><span class='${badgeClass(v.estado)}'>${safe(v.estado)}</span>${v.error ? `<div class='small' style='margin-top:6px;color:#fca5a5;'>${safe(v.error)}</div>` : ''}</td>
+                    <td data-label='Correo'>${safe(v.email)}</td>
+                    <td data-label='Giro'>${safe(v.giro)}</td>
+                    <td data-label='Move ID'>${safe(v.move_id)}</td>
+                    <td data-label='Acciones'>
+                      <div class='row-actions'>
+                        <button class='secondary' onclick='openEdit(${JSON.stringify(String(v.id)).replace(/"/g, '&quot;')})'>Editar</button>
+                        ${v.estado !== 'enviado' ? `<button class='success' onclick='authorizeVenta(${JSON.stringify(String(v.id)).replace(/"/g, '&quot;')})'>Autorizar</button>` : ''}
+                      </div>
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          `;
+        }
+
+        async function refreshData() {
+          const wrap = document.getElementById('tableWrap');
+          wrap.innerHTML = `<div class='empty'>Cargando ventas...</div>`;
+          try {
+            const res = await fetch('/ventas');
+            const data = await res.json();
+            ventas = Array.isArray(data.items) ? data.items : [];
+            renderTable();
+          } catch (err) {
+            wrap.innerHTML = `<div class='empty'>No se pudo cargar la bandeja. Revisa <a class='muted-link' href='/health' target='_blank'>/health</a>.</div>`;
+          }
+        }
+
+        function openEdit(id) {
+          const venta = ventas.find(v => String(v.id) === String(id));
+          if (!venta) return;
+          currentEditId = String(id);
+          document.getElementById('modalSubtitle').textContent = `Venta ${venta.id} · ${venta.cliente || 'Sin cliente'}`;
+          document.getElementById('editEmail').value = venta.email || '';
+          document.getElementById('editTipo').value = venta.tipo_sugerido || 'Boleta';
+          document.getElementById('editGiro').value = venta.giro || '';
+          document.getElementById('editModal').classList.add('open');
+        }
+
+        function closeModal() {
+          currentEditId = null;
+          document.getElementById('editModal').classList.remove('open');
+        }
+
+        async function saveEdit() {
+          if (!currentEditId) return;
+          const payload = {
+            email: document.getElementById('editEmail').value,
+            tipo_sugerido: document.getElementById('editTipo').value,
+            giro: document.getElementById('editGiro').value,
+          };
+          const res = await fetch(`/ventas/${currentEditId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!res.ok) {
+            alert('No se pudo guardar la venta.');
+            return;
+          }
+          closeModal();
+          await refreshData();
+        }
+
+        async function authorizeVenta(id) {
+          if (!confirm(`¿Autorizar la venta ${id} y enviarla a Odoo?`)) return;
+          const res = await fetch(`/ventas/${id}/autorizar`, { method: 'POST' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            alert(data.detail || 'No se pudo autorizar la venta.');
+            await refreshData();
+            return;
+          }
+          alert(`Venta ${id} autorizada correctamente.`);
+          await refreshData();
+        }
+
+        async function saveAndAuthorize() {
+          if (!currentEditId) return;
+          await saveEdit();
+          if (currentEditId) return;
+          const lastId = document.getElementById('modalSubtitle').textContent.split(' ')[1];
+          if (lastId) await authorizeVenta(lastId);
+        }
+
+        document.getElementById('editModal').addEventListener('click', (e) => {
+          if (e.target.id === 'editModal') closeModal();
+        });
+
+        refreshData();
+      </script>
     </body>
     </html>
     """
