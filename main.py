@@ -12,7 +12,6 @@ import psycopg2.extras
 import json
 from typing import Optional, Any
 from dataclasses import dataclass
-from threading import Lock
 
 # =========================
 # CONFIG
@@ -30,45 +29,71 @@ IVA_RATE = 1.19
 ML_DEFAULT_EMAIL = "boleta@lemulux.com"
 TOKEN_REFRESH_INTERVAL = 5 * 60 * 60  # 5 horas
 
+DB_AVAILABLE = False
+DB_INIT_ERROR = None
+
 
 # =========================
 # BASE DE DATOS PostgreSQL
 # =========================
 
 def get_db():
-    db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+    db_url = (os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "").strip()
     if not db_url:
         raise RuntimeError("Falta DATABASE_URL en variables de entorno")
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
-    return psycopg2.connect(db_url, cursor_factory=psycopg2.extras.RealDictCursor)
+    return psycopg2.connect(
+        db_url,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+        connect_timeout=10,
+    )
 
 
-def init_db():
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS ventas (
-                    id TEXT PRIMARY KEY,
-                    cliente TEXT,
-                    rut TEXT,
-                    email TEXT,
-                    giro TEXT,
-                    tipo_sugerido TEXT,
-                    estado TEXT DEFAULT 'pendiente',
-                    order_json TEXT,
-                    billing_json TEXT,
-                    move_id INTEGER,
-                    error TEXT,
-                    creado_en TIMESTAMP DEFAULT NOW(),
-                    enviado_en TIMESTAMP
-                )
-            """)
-        conn.commit()
-    logger.info("✅ Tabla ventas verificada en PostgreSQL")
+def init_db() -> bool:
+    global DB_AVAILABLE, DB_INIT_ERROR
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS ventas (
+                        id TEXT PRIMARY KEY,
+                        cliente TEXT,
+                        rut TEXT,
+                        email TEXT,
+                        giro TEXT,
+                        tipo_sugerido TEXT,
+                        estado TEXT DEFAULT 'pendiente',
+                        order_json TEXT,
+                        billing_json TEXT,
+                        move_id INTEGER,
+                        error TEXT,
+                        creado_en TIMESTAMP DEFAULT NOW(),
+                        enviado_en TIMESTAMP
+                    )
+                """)
+            conn.commit()
+        DB_AVAILABLE = True
+        DB_INIT_ERROR = None
+        logger.info("✅ Tabla ventas verificada en PostgreSQL")
+        return True
+    except Exception as e:
+        DB_AVAILABLE = False
+        DB_INIT_ERROR = str(e)
+        logger.exception(f"❌ Base de datos no disponible al iniciar: {e}")
+        return False
+
+
+def ensure_db_ready():
+    if not DB_AVAILABLE:
+        detail = "Base de datos no disponible"
+        if DB_INIT_ERROR:
+            detail += f": {DB_INIT_ERROR}"
+        raise HTTPException(status_code=503, detail=detail)
 
 
 def save_venta(order: dict, billing: dict, tipo_sugerido: str, cliente: str, rut: str, giro: str):
+    ensure_db_ready()
     oid = str(order["id"])
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -86,6 +111,7 @@ def save_venta(order: dict, billing: dict, tipo_sugerido: str, cliente: str, rut
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
+    ensure_db_ready()
     with get_db() as conn:
         with conn.cursor() as cur:
             if estado:
@@ -97,6 +123,7 @@ def list_ventas(estado: Optional[str] = None) -> list:
 
 
 def get_venta(oid: str) -> Optional[dict]:
+    ensure_db_ready()
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM ventas WHERE id = %s", (oid,))
@@ -105,6 +132,9 @@ def get_venta(oid: str) -> Optional[dict]:
 
 
 def update_venta(oid: str, **kwargs):
+    ensure_db_ready()
+    if not kwargs:
+        return
     fields = ", ".join(f"{k} = %s" for k in kwargs)
     values = list(kwargs.values()) + [oid]
     with get_db() as conn:
@@ -477,12 +507,20 @@ async def on_startup():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "lemulux-odoo"}
+    return {
+        "status": "ok",
+        "service": "lemulux-odoo",
+        "database": "up" if DB_AVAILABLE else "down",
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy" if DB_AVAILABLE else "degraded",
+        "database": "up" if DB_AVAILABLE else "down",
+        "database_error": DB_INIT_ERROR,
+    }
 
 
 @app.get("/ml/oauth/callback")
@@ -577,7 +615,7 @@ def patch_venta(id: str, payload: VentaUpdate):
     venta = get_venta(id)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
-    updates = payload.dict(exclude_unset=True)
+    updates = payload.model_dump(exclude_unset=True)
     if updates:
         update_venta(id, **updates)
     return {"ok": True}
