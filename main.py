@@ -178,8 +178,11 @@ def update_venta(oid: str, **kwargs):
 # =========================
 
 class VentaUpdate(BaseModel):
+    cliente: Optional[str] = None
+    rut: Optional[str] = None
     email: Optional[str] = None
     giro: Optional[str] = None
+    direccion: Optional[str] = None
     tipo_sugerido: Optional[str] = None
 
 
@@ -397,26 +400,55 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
 def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str,
                           giro: str, direccion: str, es_empresa: bool) -> int:
     partner_id = find_partner_by_rut(ctx, rut)
+    taxpayer_type = "1" if es_empresa else "4"
+
     if partner_id:
-        current = odoo_exec(
-            ctx,
-            "res.partner",
-            "read",
-            [[partner_id], ["l10n_cl_sii_taxpayer_type", "email", "l10n_cl_dte_email", "country_id"]],
-        )
-        current = current[0] if current else {}
-        vals = {}
-        if not current.get("l10n_cl_sii_taxpayer_type"):
-            vals["l10n_cl_sii_taxpayer_type"] = "1" if es_empresa else "4"
-        if not current.get("email"):
-            vals["email"] = email
-        if not current.get("l10n_cl_dte_email"):
-            vals["l10n_cl_dte_email"] = email
-        if not current.get("country_id"):
-            vals["country_id"] = get_chile_country_id(ctx)
-        if vals:
-            odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
+        vals = {
+            "name": nombre,
+            "vat": rut or False,
+            "email": email,
+            "l10n_cl_dte_email": email,
+            "country_id": get_chile_country_id(ctx),
+            "l10n_cl_sii_taxpayer_type": taxpayer_type,
+            "company_type": "company" if es_empresa else "person",
+            "is_company": es_empresa,
+        }
+        if direccion:
+            vals["street"] = direccion
+        if es_empresa and giro:
+            vals["x_giro"] = giro
+        rut_type_id = get_rut_id_type(ctx)
+        if rut and rut_type_id:
+            vals["l10n_latam_identification_type_id"] = rut_type_id
+        odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
+        logger.info(f"Partner actualizado: id={partner_id} empresa={es_empresa}")
         return partner_id
+
+    chile_id = get_chile_country_id(ctx)
+    rut_type_id = get_rut_id_type(ctx)
+
+    vals = {
+        "name": nombre,
+        "vat": rut or False,
+        "email": email,
+        "l10n_cl_dte_email": email,
+        "customer_rank": 1,
+        "company_type": "company" if es_empresa else "person",
+        "is_company": es_empresa,
+        "country_id": chile_id,
+        "l10n_cl_sii_taxpayer_type": taxpayer_type,
+    }
+
+    if direccion:
+        vals["street"] = direccion
+    if es_empresa and giro:
+        vals["x_giro"] = giro
+    if rut and rut_type_id:
+        vals["l10n_latam_identification_type_id"] = rut_type_id
+
+    partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
+    logger.info(f"Partner creado: id={partner_id} empresa={es_empresa}")
+    return partner_id
 
     chile_id = get_chile_country_id(ctx)
     rut_type_id = get_rut_id_type(ctx)
@@ -460,7 +492,10 @@ def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
     return ids[0] if ids else None
 
 
-def create_document(order: dict, billing_raw: dict, tipo: str, email: str, giro: str) -> int:
+def create_document(order: dict, billing_raw: dict, tipo: str, email: str, giro: str,
+                    cliente_override: Optional[str] = None,
+                    rut_override: Optional[str] = None,
+                    direccion_override: Optional[str] = None) -> int:
     ctx = odoo_connect()
     order_id = str(order["id"])
 
@@ -470,9 +505,11 @@ def create_document(order: dict, billing_raw: dict, tipo: str, email: str, giro:
         return existing
 
     billing_info = get_billing_info(billing_raw)
-    rut = extract_rut(billing_info)
-    nombre = extract_name(billing_info, order.get("buyer", {}))
-    direccion = extract_direccion(billing_info)
+    rut = normalize_rut(rut_override) if rut_override else extract_rut(billing_info)
+    nombre = (cliente_override or extract_name(billing_info, order.get("buyer", {})) or "Cliente ML").strip()
+    direccion = (direccion_override or extract_direccion(billing_info) or "").strip()
+    email = (email or ML_DEFAULT_EMAIL).strip()
+    giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
 
     partner_id = get_or_create_partner(ctx, nombre, rut, email, giro, direccion, es_empresa)
@@ -565,6 +602,10 @@ def actualizar_venta(oid: str, payload: VentaUpdate):
         raise HTTPException(status_code=404, detail="Venta no encontrada")
 
     updates = {k: v for k, v in payload.dict().items() if v is not None}
+    if "rut" in updates:
+        updates["rut"] = normalize_rut(updates["rut"])
+    if "tipo_sugerido" in updates and updates["tipo_sugerido"] not in ["Boleta", "Factura"]:
+        raise HTTPException(status_code=400, detail="tipo_sugerido inválido")
     update_venta(oid, **updates)
     return {"ok": True, "id": oid, "updated": updates}
 
@@ -584,8 +625,20 @@ def autorizar_venta(oid: str):
         tipo = venta.get("tipo_sugerido") or "Boleta"
         email = venta.get("email") or ML_DEFAULT_EMAIL
         giro = venta.get("giro") or ""
+        cliente = venta.get("cliente") or "Cliente ML"
+        rut = venta.get("rut") or ""
+        direccion = venta.get("direccion") or ""
 
-        move_id = create_document(order, billing, tipo, email, giro)
+        move_id = create_document(
+            order,
+            billing,
+            tipo,
+            email,
+            giro,
+            cliente_override=cliente,
+            rut_override=rut,
+            direccion_override=direccion,
+        )
         update_venta(oid, estado="enviado", move_id=move_id, error=None, enviado_en="NOW()")
         return {"ok": True, "id": oid, "move_id": move_id}
     except Exception as e:
@@ -874,18 +927,30 @@ def ui_bandeja():
           </div>
           <div class='modal-grid'>
             <div>
-              <label>Email</label>
-              <input id='editEmail' class='full-input' />
-            </div>
-            <div>
-              <label>Tipo sugerido</label>
-              <select id='editTipo'>
+              <label>Tipo documento</label>
+              <select id='editTipo' onchange='toggleFacturaFields()'>
                 <option value='Boleta'>Boleta</option>
                 <option value='Factura'>Factura</option>
               </select>
             </div>
+            <div>
+              <label>Email DTE / correo</label>
+              <input id='editEmail' />
+            </div>
             <div class='full'>
-              <label>Giro</label>
+              <label>Nombre cliente / razón social</label>
+              <input id='editCliente' />
+            </div>
+            <div>
+              <label>RUT</label>
+              <input id='editRut' />
+            </div>
+            <div>
+              <label>Dirección</label>
+              <input id='editDireccion' />
+            </div>
+            <div class='full' id='facturaFields'>
+              <label>Giro (solo factura)</label>
               <input id='editGiro' />
             </div>
           </div>
@@ -909,6 +974,21 @@ def ui_bandeja():
 
         function safe(v) {
           return v === null || v === undefined || v === '' ? '—' : String(v);
+        }
+
+        function copyId(id) {
+          try {
+            navigator.clipboard.writeText(id);
+            alert('ID copiado: ' + id);
+          } catch (e) {
+            const temp = document.createElement('input');
+            temp.value = id;
+            document.body.appendChild(temp);
+            temp.select();
+            document.execCommand('copy');
+            document.body.removeChild(temp);
+            alert('ID copiado: ' + id);
+          }
         }
 
         function updateStats(items) {
@@ -946,8 +1026,9 @@ def ui_bandeja():
               <thead>
                 <tr>
                   <th>ID</th>
-                  <th>Cliente</th>
+                  <th>Cliente / Razón social</th>
                   <th>RUT</th>
+                  <th>Dirección</th>
                   <th>Tipo</th>
                   <th>Estado</th>
                   <th>Correo</th>
@@ -959,9 +1040,16 @@ def ui_bandeja():
               <tbody>
                 ${items.map(v => `
                   <tr>
-                    <td data-label='ID'><strong>${safe(v.id)}</strong><div class='small'>${safe(v.creado_en)}</div></td>
-                    <td data-label='Cliente'>${safe(v.cliente)}</td>
+                    <td data-label='ID'>
+  <div style="display:flex; align-items:center; gap:8px;">
+    <strong style="font-size:15px;">${safe(v.id)}</strong>
+    <button class="secondary" style="padding:4px 8px; font-size:12px;" onclick="copyId('${safe(v.id)}')">Copiar</button>
+  </div>
+  <div class='small'>${safe(v.creado_en)}</div>
+</td>
+                    <td data-label='Cliente / Razón social'>${safe(v.cliente)}</td>
                     <td data-label='RUT'>${safe(v.rut)}</td>
+                    <td data-label='Dirección'>${safe(v.direccion)}</td>
                     <td data-label='Tipo'>${safe(v.tipo_sugerido)}</td>
                     <td data-label='Estado'><span class='${badgeClass(v.estado)}'>${safe(v.estado)}</span>${v.error ? `<div class='small' style='margin-top:6px;color:#fca5a5;'>${safe(v.error)}</div>` : ''}</td>
                     <td data-label='Correo'>${safe(v.email)}</td>
@@ -993,14 +1081,23 @@ def ui_bandeja():
           }
         }
 
+        function toggleFacturaFields() {
+          const tipo = document.getElementById('editTipo').value;
+          document.getElementById('facturaFields').style.display = tipo === 'Factura' ? 'block' : 'none';
+        }
+
         function openEdit(id) {
           const venta = ventas.find(v => String(v.id) === String(id));
           if (!venta) return;
           currentEditId = String(id);
           document.getElementById('modalSubtitle').textContent = `Venta ${venta.id} · ${venta.cliente || 'Sin cliente'}`;
-          document.getElementById('editEmail').value = venta.email || '';
           document.getElementById('editTipo').value = venta.tipo_sugerido || 'Boleta';
+          document.getElementById('editEmail').value = venta.email || '';
+          document.getElementById('editCliente').value = venta.cliente || '';
+          document.getElementById('editRut').value = venta.rut || '';
+          document.getElementById('editDireccion').value = venta.direccion || '';
           document.getElementById('editGiro').value = venta.giro || '';
+          toggleFacturaFields();
           document.getElementById('editModal').classList.add('open');
         }
 
@@ -1012,8 +1109,11 @@ def ui_bandeja():
         async function saveEdit() {
           if (!currentEditId) return;
           const payload = {
-            email: document.getElementById('editEmail').value,
             tipo_sugerido: document.getElementById('editTipo').value,
+            email: document.getElementById('editEmail').value,
+            cliente: document.getElementById('editCliente').value,
+            rut: document.getElementById('editRut').value,
+            direccion: document.getElementById('editDireccion').value,
             giro: document.getElementById('editGiro').value,
           };
           const res = await fetch(`/ventas/${currentEditId}`, {
