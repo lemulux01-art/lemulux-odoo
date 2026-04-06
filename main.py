@@ -3,16 +3,16 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 import os
 import time
-import sqlite3
-import json
 import threading
 import logging
 import requests
 import xmlrpc.client
+import psycopg2
+import psycopg2.extras
+import json
 from typing import Optional, Any
 from dataclasses import dataclass
 from threading import Lock
-from contextlib import contextmanager
 
 # =========================
 # CONFIG
@@ -29,90 +29,90 @@ app = FastAPI()
 IVA_RATE = 1.19
 ML_DEFAULT_EMAIL = "boleta@lemulux.com"
 DEFAULT_BOLETA_ACTIVITY = "(boleta)"
-DB_PATH = "/data/lemulux.db"  # Railway Volume o local
-
-LOCK = Lock()
 TOKEN_REFRESH_INTERVAL = 5 * 60 * 60  # 5 horas
 
 
 # =========================
-# BASE DE DATOS SQLite
+# BASE DE DATOS PostgreSQL
 # =========================
 
 def get_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+    if not db_url:
+        raise RuntimeError("Falta DATABASE_URL o POSTGRES_URL en variables de entorno")
+    # psycopg2 necesita postgresql:// no postgres://
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(db_url, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def init_db():
     with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS ventas (
-                id TEXT PRIMARY KEY,
-                cliente TEXT,
-                rut TEXT,
-                email TEXT,
-                giro TEXT,
-                tipo_sugerido TEXT,
-                estado TEXT DEFAULT 'pendiente',
-                order_json TEXT,
-                billing_json TEXT,
-                move_id INTEGER,
-                error TEXT,
-                creado_en TEXT DEFAULT (datetime('now', 'localtime')),
-                enviado_en TEXT
-            )
-        """)
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ventas (
+                    id TEXT PRIMARY KEY,
+                    cliente TEXT,
+                    rut TEXT,
+                    email TEXT,
+                    giro TEXT,
+                    tipo_sugerido TEXT,
+                    estado TEXT DEFAULT 'pendiente',
+                    order_json TEXT,
+                    billing_json TEXT,
+                    move_id INTEGER,
+                    error TEXT,
+                    creado_en TIMESTAMP DEFAULT NOW(),
+                    enviado_en TIMESTAMP
+                )
+            """)
         conn.commit()
+    logger.info("✅ Tabla ventas verificada en PostgreSQL")
 
 
 def save_venta(order: dict, billing: dict, tipo_sugerido: str, cliente: str, rut: str, giro: str):
     oid = str(order["id"])
     with get_db() as conn:
-        existing = conn.execute("SELECT id FROM ventas WHERE id = ?", (oid,)).fetchone()
-        if existing:
-            logger.info(f"[{oid}] Venta ya existe en bandeja, no se duplica")
-            return
-
-        conn.execute("""
-            INSERT INTO ventas (id, cliente, rut, email, giro, tipo_sugerido, estado, order_json, billing_json)
-            VALUES (?, ?, ?, ?, ?, ?, 'pendiente', ?, ?)
-        """, (
-            oid, cliente, rut, ML_DEFAULT_EMAIL, giro,
-            tipo_sugerido,
-            json.dumps(order),
-            json.dumps(billing),
-        ))
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM ventas WHERE id = %s", (oid,))
+            if cur.fetchone():
+                logger.info(f"[{oid}] Venta ya existe en bandeja")
+                return
+            cur.execute("""
+                INSERT INTO ventas (id, cliente, rut, email, giro, tipo_sugerido, estado, order_json, billing_json)
+                VALUES (%s, %s, %s, %s, %s, %s, 'pendiente', %s, %s)
+            """, (oid, cliente, rut, ML_DEFAULT_EMAIL, giro, tipo_sugerido,
+                  json.dumps(order), json.dumps(billing)))
         conn.commit()
-    logger.info(f"[{oid}] Venta guardada en bandeja como {tipo_sugerido}")
+    logger.info(f"[{oid}] Guardada en bandeja como {tipo_sugerido}")
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
     with get_db() as conn:
-        if estado:
-            rows = conn.execute(
-                "SELECT * FROM ventas WHERE estado = ? ORDER BY creado_en DESC", (estado,)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM ventas ORDER BY creado_en DESC"
-            ).fetchall()
+        with conn.cursor() as cur:
+            if estado:
+                cur.execute(
+                    "SELECT * FROM ventas WHERE estado = %s ORDER BY creado_en DESC", (estado,))
+            else:
+                cur.execute("SELECT * FROM ventas ORDER BY creado_en DESC")
+            rows = cur.fetchall()
     return [dict(r) for r in rows]
 
 
 def get_venta(oid: str) -> Optional[dict]:
     with get_db() as conn:
-        row = conn.execute("SELECT * FROM ventas WHERE id = ?", (oid,)).fetchone()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ventas WHERE id = %s", (oid,))
+            row = cur.fetchone()
     return dict(row) if row else None
 
 
 def update_venta(oid: str, **kwargs):
-    fields = ", ".join(f"{k} = ?" for k in kwargs)
+    fields = ", ".join(f"{k} = %s" for k in kwargs)
     values = list(kwargs.values()) + [oid]
     with get_db() as conn:
-        conn.execute(f"UPDATE ventas SET {fields} WHERE id = ?", values)
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE ventas SET {fields} WHERE id = %s", values)
         conn.commit()
 
 
@@ -285,7 +285,7 @@ def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
     return ids[0] if ids else None
 
 
-def get_chile_country_id(ctx: OdooCtx) -> int:
+def get_chile_country_id(ctx: OdooCtx) -> Optional[int]:
     ids = odoo_exec(ctx, "res.country", "search", [[["code", "=", "CL"]]], {"limit": 1})
     return ids[0] if ids else None
 
@@ -304,15 +304,12 @@ def get_tax_19(ctx: OdooCtx) -> Optional[int]:
 
 
 def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
-    """Busca por variantes normalizadas del RUT para evitar duplicados."""
     rut_norm = normalize_rut(rut)
     if not rut_norm:
         return None
-
     variantes = [rut_norm]
     if len(rut_norm) > 1:
         variantes.append(rut_norm[:-1] + "-" + rut_norm[-1])
-
     for variante in variantes:
         ids = odoo_exec(ctx, "res.partner", "search",
             [[["vat", "=", variante]]], {"limit": 1})
@@ -324,7 +321,6 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
 def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str, giro: str, es_empresa: bool) -> int:
     partner_id = find_partner_by_rut(ctx, rut)
     if partner_id:
-        # Actualizar campos DTE si faltan
         current = odoo_exec(ctx, "res.partner", "read",
             [[partner_id], ["l10n_cl_sii_taxpayer_type", "email", "l10n_cl_dte_email", "country_id"]])
         current = current[0] if current else {}
@@ -339,7 +335,7 @@ def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str, giro:
             vals["country_id"] = get_chile_country_id(ctx)
         if vals:
             odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
-        logger.info(f"Partner existente encontrado: id={partner_id}")
+        logger.info(f"Partner existente: id={partner_id}")
         return partner_id
 
     chile_id = get_chile_country_id(ctx)
@@ -357,7 +353,6 @@ def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str, giro:
         "l10n_cl_sii_taxpayer_type": "1" if es_empresa else "4",
         "x_giro": giro or DEFAULT_BOLETA_ACTIVITY,
     }
-
     if rut and rut_type_id:
         vals["l10n_latam_identification_type_id"] = rut_type_id
 
@@ -383,7 +378,7 @@ def create_document(order: dict, billing: dict, tipo: str, email: str, giro: str
 
     existing = find_existing_move(ctx, order_id)
     if existing:
-        logger.info(f"[{order_id}] Documento ya existe en Odoo: move_id={existing}")
+        logger.info(f"[{order_id}] Documento ya existe: move_id={existing}")
         return existing
 
     rut = extract_rut(billing)
@@ -391,7 +386,6 @@ def create_document(order: dict, billing: dict, tipo: str, email: str, giro: str
     es_empresa = tipo == "Factura"
 
     partner_id = get_or_create_partner(ctx, nombre, rut, email, giro, es_empresa)
-
     journal_id = get_journal(ctx, tipo)
     doc_type_id = (
         int(get_env("ODOO_DOC_TYPE_FACTURA_ID")) if tipo == "Factura"
@@ -437,7 +431,6 @@ def create_document(order: dict, billing: dict, tipo: str, email: str, giro: str
 @app.on_event("startup")
 async def on_startup():
     init_db()
-    logger.info("✅ Base de datos SQLite inicializada")
     t = threading.Thread(target=schedule_token_refresh, daemon=True)
     t.start()
     logger.info("⏰ Renovación automática de token ML iniciada (cada 5h)")
@@ -617,7 +610,7 @@ def dashboard():
   header h1 { font-size: 1.2rem; font-weight: 600; }
   .badge { background: rgba(255,255,255,0.2); border-radius: 20px; padding: 2px 10px; font-size: 0.8rem; }
   .container { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
-  .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
   .filter-btn { padding: 6px 16px; border-radius: 20px; border: 1px solid #ddd; background: white; cursor: pointer; font-size: 0.85rem; transition: all 0.2s; }
   .filter-btn.active { background: #6a1b9a; color: white; border-color: #6a1b9a; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }
@@ -626,7 +619,7 @@ def dashboard():
   .stat-card .label { font-size: 0.75rem; color: #888; margin-top: 2px; }
   .pendiente .num { color: #e65100; }
   .enviada .num { color: #2e7d32; }
-  .error .num { color: #c62828; }
+  .error-stat .num { color: #c62828; }
   table { width: 100%; background: white; border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); border-collapse: collapse; overflow: hidden; }
   th { background: #f0f0f0; padding: 12px 14px; text-align: left; font-size: 0.8rem; color: #666; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
   td { padding: 12px 14px; border-top: 1px solid #f0f0f0; font-size: 0.88rem; vertical-align: middle; }
@@ -643,7 +636,7 @@ def dashboard():
   .btn-green { background: #43a047; color: white; }
   .btn-red { background: #e53935; color: white; }
   .btn-edit { background: #f5f5f5; color: #333; border: 1px solid #ddd; }
-  .actions { display: flex; gap: 6px; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .empty { text-align: center; padding: 40px; color: #999; }
   .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 100; align-items: center; justify-content: center; }
   .modal-bg.open { display: flex; }
@@ -654,6 +647,7 @@ def dashboard():
   .form-group input, .form-group select { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.88rem; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   .refresh-btn { margin-left: auto; padding: 6px 14px; background: white; border: 1px solid #ddd; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+  .approve-all-btn { padding: 6px 16px; background: #43a047; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -668,7 +662,7 @@ def dashboard():
   <div class="stats">
     <div class="stat-card pendiente"><div class="num" id="cnt-pendiente">-</div><div class="label">Pendientes</div></div>
     <div class="stat-card enviada"><div class="num" id="cnt-enviada">-</div><div class="label">Enviadas a Odoo</div></div>
-    <div class="stat-card error"><div class="num" id="cnt-error">-</div><div class="label">Con error</div></div>
+    <div class="stat-card error-stat"><div class="num" id="cnt-error">-</div><div class="label">Con error</div></div>
     <div class="stat-card"><div class="num" id="cnt-rechazada">-</div><div class="label">Rechazadas</div></div>
   </div>
 
@@ -678,6 +672,7 @@ def dashboard():
     <button class="filter-btn" onclick="setFilter('enviada', this)">Enviadas</button>
     <button class="filter-btn" onclick="setFilter('error', this)">Con error</button>
     <button class="filter-btn" onclick="setFilter('rechazada', this)">Rechazadas</button>
+    <button class="approve-all-btn" onclick="aprobarTodas()">✓ Aprobar todas las pendientes</button>
   </div>
 
   <table>
@@ -700,7 +695,7 @@ def dashboard():
 <!-- Modal edición -->
 <div class="modal-bg" id="modal-edit">
   <div class="modal">
-    <h2>✏️ Editar venta</h2>
+    <h2>✏️ Editar venta antes de aprobar</h2>
     <input type="hidden" id="edit-id">
     <div class="form-group">
       <label>Email DTE</label>
@@ -719,23 +714,21 @@ def dashboard():
     </div>
     <div class="modal-actions">
       <button class="btn btn-edit" onclick="closeModal()">Cancelar</button>
-      <button class="btn btn-green" onclick="saveEdit()">Guardar</button>
+      <button class="btn btn-edit" onclick="saveEdit()">Solo guardar</button>
+      <button class="btn btn-green" onclick="saveAndApprove()">Guardar y aprobar</button>
     </div>
   </div>
 </div>
 
 <script>
 let currentFilter = null;
-let allData = [];
 
 async function loadData() {
   const url = currentFilter ? `/bandeja?estado=${currentFilter}` : '/bandeja';
   const res = await fetch(url);
   const data = await res.json();
-  allData = data.ventas;
-  renderTable(allData);
+  renderTable(data.ventas);
 
-  // Stats siempre del total
   const all = await fetch('/bandeja').then(r => r.json());
   const ventas = all.ventas;
   document.getElementById('badge-total').textContent = ventas.length + ' ventas';
@@ -754,14 +747,13 @@ function setFilter(estado, btn) {
 
 function renderTable(ventas) {
   const tbody = document.getElementById('tabla-body');
-  if (!ventas.length) {
+  if (!ventas || !ventas.length) {
     tbody.innerHTML = '<tr><td colspan="6" class="empty">No hay ventas en esta categoría</td></tr>';
     return;
   }
-
   tbody.innerHTML = ventas.map(v => `
     <tr>
-      <td>${v.creado_en || '-'}</td>
+      <td>${v.creado_en ? new Date(v.creado_en).toLocaleString('es-CL') : '-'}</td>
       <td><strong>${v.cliente}</strong><br><small style="color:#888">${v.email}</small></td>
       <td>${v.rut || '-'}</td>
       <td><span class="tag ${v.tipo_sugerido}">${v.tipo_sugerido}</span></td>
@@ -773,7 +765,7 @@ function renderTable(ventas) {
       <td>
         <div class="actions">
           ${v.estado === 'pendiente' || v.estado === 'error' ? `
-            <button class="btn btn-edit" onclick="openEdit('${v.id}', '${v.email}', '${v.giro || ''}', '${v.tipo_sugerido}')">Editar</button>
+            <button class="btn btn-edit" onclick="openEdit('${v.id}', '${(v.email||'').replace(/'/g,"\\'")}', '${(v.giro||'').replace(/'/g,"\\'")}', '${v.tipo_sugerido}')">Editar</button>
             <button class="btn btn-green" onclick="aprobar('${v.id}')">✓ Aprobar</button>
             <button class="btn btn-red" onclick="rechazar('${v.id}')">✗</button>
           ` : v.estado === 'enviada' ? `<span style="color:#888;font-size:0.8rem">✓ Listo</span>` : '-'}
@@ -789,6 +781,23 @@ async function aprobar(id) {
   const data = await res.json();
   if (data.ok) { alert(`✅ Documento creado en Odoo (move_id: ${data.move_id})`); loadData(); }
   else alert('❌ Error: ' + (data.detail || 'desconocido'));
+}
+
+async function aprobarTodas() {
+  const res = await fetch('/bandeja?estado=pendiente');
+  const data = await res.json();
+  const pendientes = data.ventas || [];
+  if (!pendientes.length) { alert('No hay ventas pendientes'); return; }
+  if (!confirm(`¿Aprobar todas las ${pendientes.length} ventas pendientes?`)) return;
+
+  let ok = 0, errores = 0;
+  for (const v of pendientes) {
+    const r = await fetch(`/bandeja/${v.id}/aprobar`, { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) ok++; else errores++;
+  }
+  alert(`✅ Aprobadas: ${ok} | ❌ Errores: ${errores}`);
+  loadData();
 }
 
 async function rechazar(id) {
@@ -811,21 +820,25 @@ function closeModal() {
 
 async function saveEdit() {
   const id = document.getElementById('edit-id').value;
-  const payload = {
-    email: document.getElementById('edit-email').value,
-    giro: document.getElementById('edit-giro').value,
-    tipo_sugerido: document.getElementById('edit-tipo').value,
-  };
   await fetch(`/bandeja/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      email: document.getElementById('edit-email').value,
+      giro: document.getElementById('edit-giro').value,
+      tipo_sugerido: document.getElementById('edit-tipo').value,
+    }),
   });
   closeModal();
   loadData();
 }
 
-// Auto-refresh cada 30s
+async function saveAndApprove() {
+  await saveEdit();
+  const id = document.getElementById('edit-id').value;
+  setTimeout(() => aprobar(id), 300);
+}
+
 loadData();
 setInterval(loadData, 30000);
 </script>
