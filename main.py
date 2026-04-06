@@ -28,7 +28,6 @@ app = FastAPI()
 
 IVA_RATE = 1.19
 ML_DEFAULT_EMAIL = "boleta@lemulux.com"
-DEFAULT_BOLETA_ACTIVITY = "(boleta)"
 TOKEN_REFRESH_INTERVAL = 5 * 60 * 60  # 5 horas
 
 
@@ -39,8 +38,7 @@ TOKEN_REFRESH_INTERVAL = 5 * 60 * 60  # 5 horas
 def get_db():
     db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
     if not db_url:
-        raise RuntimeError("Falta DATABASE_URL o POSTGRES_URL en variables de entorno")
-    # psycopg2 necesita postgresql:// no postgres://
+        raise RuntimeError("Falta DATABASE_URL en variables de entorno")
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     return psycopg2.connect(db_url, cursor_factory=psycopg2.extras.RealDictCursor)
@@ -84,15 +82,14 @@ def save_venta(order: dict, billing: dict, tipo_sugerido: str, cliente: str, rut
             """, (oid, cliente, rut, ML_DEFAULT_EMAIL, giro, tipo_sugerido,
                   json.dumps(order), json.dumps(billing)))
         conn.commit()
-    logger.info(f"[{oid}] Guardada en bandeja como {tipo_sugerido}")
+    logger.info(f"[{oid}] Guardada en bandeja como {tipo_sugerido} — RUT: {rut or 'sin RUT'}")
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
     with get_db() as conn:
         with conn.cursor() as cur:
             if estado:
-                cur.execute(
-                    "SELECT * FROM ventas WHERE estado = %s ORDER BY creado_en DESC", (estado,))
+                cur.execute("SELECT * FROM ventas WHERE estado = %s ORDER BY creado_en DESC", (estado,))
             else:
                 cur.execute("SELECT * FROM ventas ORDER BY creado_en DESC")
             rows = cur.fetchall()
@@ -209,19 +206,40 @@ def get_ml_billing_info(order_id: str) -> dict:
 # EXTRACCIÓN DATOS ML
 # =========================
 
-def extract_rut(billing: dict) -> str:
-    for key in ["doc_number", "document_number", "vat", "rut"]:
-        val = billing.get(key) or ""
-        if val:
-            return normalize_rut(val)
+def recursive_find(data: Any, keys: list) -> str:
+    """Busca recursivamente un valor en cualquier nivel del JSON."""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in keys:
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            found = recursive_find(value, keys)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = recursive_find(item, keys)
+            if found:
+                return found
     return ""
 
 
+def extract_rut(billing: dict) -> str:
+    """
+    Busca el RUT en múltiples campos y niveles del billing_info de ML.
+    ML puede devolver el RUT en distintas claves y niveles anidados.
+    """
+    rut_keys = ["doc_number", "document_number", "vat", "rut", "identification_number"]
+    raw = recursive_find(billing, rut_keys)
+    return normalize_rut(raw) if raw else ""
+
+
 def extract_name(billing: dict, buyer: dict) -> str:
+    name_keys = ["business_name", "name", "social_reason", "razon_social", "full_name"]
+    name = recursive_find(billing, name_keys)
+    if name:
+        return name
     return (
-        billing.get("business_name") or
-        billing.get("name") or
-        billing.get("social_reason") or
         buyer.get("nickname") or
         buyer.get("first_name") or
         "Cliente ML"
@@ -229,20 +247,31 @@ def extract_name(billing: dict, buyer: dict) -> str:
 
 
 def extract_activity(billing: dict) -> str:
-    for key in ["business_activity", "activity", "giro", "economic_activity",
-                "taxpayer_activity", "activity_description", "description_of_activity"]:
-        val = billing.get(key) or ""
-        if val.strip():
-            return val.strip()
-    return ""
+    """Solo se usa para facturas."""
+    activity_keys = [
+        "business_activity", "activity", "giro", "economic_activity",
+        "taxpayer_activity", "activity_description", "description_of_activity",
+    ]
+    return recursive_find(billing, activity_keys)
 
 
 def detect_tipo_sugerido(billing: dict) -> str:
-    taxpayer = (billing.get("taxpayer_type") or billing.get("description") or "").lower()
+    """
+    Detecta si corresponde Factura o Boleta según los datos del billing.
+    - Factura: tiene nombre empresa o actividad económica y no es consumidor final
+    - Boleta: todo lo demás
+    """
+    taxpayer = recursive_find(billing, ["taxpayer_type", "tipo_contribuyente", "description"]).lower()
+
     if "consumidor final" in taxpayer or "final consumer" in taxpayer:
         return "Boleta"
-    if billing.get("business_name") or extract_activity(billing):
+
+    has_business_name = bool(recursive_find(billing, ["business_name", "social_reason", "razon_social"]))
+    has_activity = bool(extract_activity(billing))
+
+    if has_business_name or has_activity:
         return "Factura"
+
     return "Boleta"
 
 
@@ -307,6 +336,7 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
     rut_norm = normalize_rut(rut)
     if not rut_norm:
         return None
+    # Buscar con y sin guión
     variantes = [rut_norm]
     if len(rut_norm) > 1:
         variantes.append(rut_norm[:-1] + "-" + rut_norm[-1])
@@ -321,6 +351,7 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
 def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str, giro: str, es_empresa: bool) -> int:
     partner_id = find_partner_by_rut(ctx, rut)
     if partner_id:
+        # Actualizar campos DTE obligatorios si faltan
         current = odoo_exec(ctx, "res.partner", "read",
             [[partner_id], ["l10n_cl_sii_taxpayer_type", "email", "l10n_cl_dte_email", "country_id"]])
         current = current[0] if current else {}
@@ -351,13 +382,17 @@ def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str, giro:
         "is_company": es_empresa,
         "country_id": chile_id,
         "l10n_cl_sii_taxpayer_type": "1" if es_empresa else "4",
-        "x_giro": giro or DEFAULT_BOLETA_ACTIVITY,
     }
+
+    # Giro solo para facturas (empresas)
+    if es_empresa and giro:
+        vals["x_giro"] = giro
+
     if rut and rut_type_id:
         vals["l10n_latam_identification_type_id"] = rut_type_id
 
     partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
-    logger.info(f"Partner creado: id={partner_id}")
+    logger.info(f"Partner creado: id={partner_id} empresa={es_empresa}")
     return partner_id
 
 
@@ -507,9 +542,11 @@ async def webhook(request: Request):
 
         rut = extract_rut(billing)
         nombre = extract_name(billing, buyer)
-        giro = extract_activity(billing) or DEFAULT_BOLETA_ACTIVITY
         tipo = detect_tipo_sugerido(billing)
+        # Giro solo relevante para facturas
+        giro = extract_activity(billing) if tipo == "Factura" else ""
 
+        logger.info(f"[{order_id}] Detectado: tipo={tipo} rut={rut or 'sin RUT'} nombre={nombre}")
         save_venta(order, billing, tipo, nombre, rut, giro)
 
     except Exception as e:
@@ -563,7 +600,7 @@ def aprobar_venta(id: str):
             billing=billing,
             tipo=venta["tipo_sugerido"],
             email=venta["email"],
-            giro=venta["giro"],
+            giro=venta["giro"] or "",
         )
 
         from datetime import datetime
@@ -588,6 +625,26 @@ def rechazar_venta(id: str):
         raise HTTPException(status_code=404, detail="Venta no encontrada")
     update_venta(id, estado="rechazada")
     return {"ok": True}
+
+
+# =========================
+# ENDPOINT DIAGNÓSTICO BILLING
+# (útil para ver qué manda ML exactamente)
+# =========================
+
+@app.get("/debug/billing/{order_id}")
+def debug_billing(order_id: str):
+    """Ver el billing_info crudo de ML para diagnosticar campos."""
+    billing = get_ml_billing_info(order_id)
+    rut = extract_rut(billing)
+    nombre = extract_name(billing, {})
+    tipo = detect_tipo_sugerido(billing)
+    return {
+        "billing_raw": billing,
+        "rut_detectado": rut,
+        "nombre_detectado": nombre,
+        "tipo_detectado": tipo,
+    }
 
 
 # =========================
@@ -645,6 +702,7 @@ def dashboard():
   .form-group { margin-bottom: 14px; }
   .form-group label { display: block; font-size: 0.8rem; color: #666; margin-bottom: 4px; }
   .form-group input, .form-group select { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.88rem; }
+  .giro-group { display: none; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   .refresh-btn { margin-left: auto; padding: 6px 14px; background: white; border: 1px solid #ddd; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
   .approve-all-btn { padding: 6px 16px; background: #43a047; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600; }
@@ -702,15 +760,15 @@ def dashboard():
       <input type="email" id="edit-email">
     </div>
     <div class="form-group">
-      <label>Giro / Actividad</label>
-      <input type="text" id="edit-giro">
-    </div>
-    <div class="form-group">
       <label>Tipo de documento</label>
-      <select id="edit-tipo">
+      <select id="edit-tipo" onchange="toggleGiro()">
         <option value="Boleta">Boleta</option>
         <option value="Factura">Factura</option>
       </select>
+    </div>
+    <div class="form-group giro-group" id="giro-group">
+      <label>Giro / Actividad <small>(requerido para factura)</small></label>
+      <input type="text" id="edit-giro">
     </div>
     <div class="modal-actions">
       <button class="btn btn-edit" onclick="closeModal()">Cancelar</button>
@@ -722,6 +780,12 @@ def dashboard():
 
 <script>
 let currentFilter = null;
+let pendingApproveId = null;
+
+function toggleGiro() {
+  const tipo = document.getElementById('edit-tipo').value;
+  document.getElementById('giro-group').style.display = tipo === 'Factura' ? 'block' : 'none';
+}
 
 async function loadData() {
   const url = currentFilter ? `/bandeja?estado=${currentFilter}` : '/bandeja';
@@ -755,7 +819,7 @@ function renderTable(ventas) {
     <tr>
       <td>${v.creado_en ? new Date(v.creado_en).toLocaleString('es-CL') : '-'}</td>
       <td><strong>${v.cliente}</strong><br><small style="color:#888">${v.email}</small></td>
-      <td>${v.rut || '-'}</td>
+      <td>${v.rut || '<span style="color:#bbb">sin RUT</span>'}</td>
       <td><span class="tag ${v.tipo_sugerido}">${v.tipo_sugerido}</span></td>
       <td>
         <span class="tag ${v.estado}">${v.estado}</span>
@@ -807,10 +871,12 @@ async function rechazar(id) {
 }
 
 function openEdit(id, email, giro, tipo) {
+  pendingApproveId = null;
   document.getElementById('edit-id').value = id;
   document.getElementById('edit-email').value = email;
   document.getElementById('edit-giro').value = giro;
   document.getElementById('edit-tipo').value = tipo;
+  toggleGiro();
   document.getElementById('modal-edit').classList.add('open');
 }
 
@@ -820,13 +886,14 @@ function closeModal() {
 
 async function saveEdit() {
   const id = document.getElementById('edit-id').value;
+  const tipo = document.getElementById('edit-tipo').value;
   await fetch(`/bandeja/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       email: document.getElementById('edit-email').value,
-      giro: document.getElementById('edit-giro').value,
-      tipo_sugerido: document.getElementById('edit-tipo').value,
+      giro: tipo === 'Factura' ? document.getElementById('edit-giro').value : '',
+      tipo_sugerido: tipo,
     }),
   });
   closeModal();
@@ -834,9 +901,9 @@ async function saveEdit() {
 }
 
 async function saveAndApprove() {
-  await saveEdit();
   const id = document.getElementById('edit-id').value;
-  setTimeout(() => aprobar(id), 300);
+  await saveEdit();
+  setTimeout(() => aprobar(id), 400);
 }
 
 loadData();
