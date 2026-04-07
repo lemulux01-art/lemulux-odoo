@@ -1489,6 +1489,85 @@ def ver_pack(oid: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/ventas/reprocesar-todo")
+def reprocesar_todo():
+    """Reprocesa desde ML todas las ventas pendientes o con error."""
+    ventas = list_ventas("pendiente") + list_ventas("error")
+    resultados = {"ok": 0, "error": 0, "errores": []}
+    for venta in ventas:
+        try:
+            reprocesar_venta_desde_ml(str(venta["id"]))
+            resultados["ok"] += 1
+        except Exception as e:
+            resultados["error"] += 1
+            resultados["errores"].append({"id": venta["id"], "error": str(e)[:200]})
+    return resultados
+
+
+class AgruparPayload(BaseModel):
+    ids: list
+
+
+@app.post("/ventas/agrupar")
+def agrupar_ventas(payload: AgruparPayload):
+    """
+    Consolida múltiples ventas en una sola fila.
+    Toma la primera como venta principal, le agrega los items de las demás
+    y elimina (rechaza) las secundarias.
+    """
+    ids = [str(i) for i in payload.ids]
+    if len(ids) < 2:
+        raise HTTPException(status_code=400, detail="Se necesitan al menos 2 ventas para agrupar")
+
+    ventas = []
+    for oid in ids:
+        v = get_venta(oid)
+        if not v:
+            raise HTTPException(status_code=404, detail=f"Venta {oid} no encontrada")
+        if v.get("estado") == "enviado":
+            raise HTTPException(status_code=400, detail=f"La venta {oid} ya fue enviada a Odoo y no se puede agrupar")
+        ventas.append(v)
+
+    # La primera venta es la principal
+    principal = ventas[0]
+    secundarias = ventas[1:]
+
+    # Consolidar todos los order_items
+    try:
+        order_principal = json.loads(principal["order_json"])
+        billing_principal = json.loads(principal["billing_json"])
+        all_items = list(order_principal.get("order_items", []))
+
+        for v in secundarias:
+            order_sec = json.loads(v["order_json"])
+            all_items.extend(order_sec.get("order_items", []))
+
+        # Actualizar el order_json de la principal con todos los items
+        order_consolidado = {**order_principal, "order_items": all_items}
+
+        # Calcular nuevo total
+        _, item_count, total_bruto = summarize_order_items(order_consolidado)
+
+        # Guardar venta principal con items consolidados
+        update_venta(principal["id"],
+            order_json=json.dumps(order_consolidado, ensure_ascii=False),
+        )
+
+        # Rechazar las secundarias
+        for v in secundarias:
+            update_venta(v["id"], estado="rechazado", error=f"Agrupada en venta {principal['id']}")
+
+        return {
+            "ok": True,
+            "venta_principal": principal["id"],
+            "agrupadas": [v["id"] for v in secundarias],
+            "total_items": item_count,
+            "total_bruto": total_bruto,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ventas/{oid}/autorizar")
 def autorizar_venta(oid: str):
     venta = get_venta(oid)
@@ -1580,6 +1659,8 @@ def ui_bandeja():
     .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
     .pack-btn { background: #7c3aed; color: white; border: none; border-radius: 8px; padding: 9px 12px; font-size: 14px; font-weight: 600; cursor: pointer; }
     .pack-btn:hover { opacity: 0.85; }
+    .cb-row { width: 16px; height: 16px; cursor: pointer; accent-color: #7c3aed; }
+    tr.seleccionada td { background: rgba(124,58,237,0.08) !important; }
     .small { color: var(--muted); font-size: 12px; margin-top: 3px; }
     .empty { text-align: center; padding: 40px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; }
     .modal { position: fixed; inset: 0; background: rgba(2,6,23,0.8); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 100; }
@@ -1624,7 +1705,13 @@ def ui_bandeja():
       <option value=''>Todos los estados</option>
       <option value='enviado'>Enviado</option>
       <option value='error'>Error</option>
+      <option value='rechazado'>Rechazado</option>
     </select>
+    <button class='warn' onclick='reprocesarTodo()'>↺ Reprocesar todo</button>
+    <button id='btnAgrupar' class='pack-btn' style='display:none' onclick='agruparSeleccionadas()'>⛓ Agrupar seleccionadas</button>
+  </div>
+  <div id='seleccionInfo' style='display:none;margin-bottom:10px;font-size:13px;color:var(--muted);'>
+    <span id='seleccionCount'></span> — selecciona 2 o más ventas del mismo comprador para agruparlas en una sola boleta/factura.
   </div>
 
   <div id='tableWrap'><div class='empty'>Cargando...</div></div>
@@ -1766,6 +1853,7 @@ function renderTable() {
   wrap.innerHTML = `
     <table>
       <thead><tr>
+        <th style='width:32px'><input type='checkbox' class='cb-row' id='cbTodos' onchange='toggleTodos(this)'></th>
         <th>Fecha / ID ML</th>
         <th>Cliente / Razón social</th>
         <th>RUT</th>
@@ -1778,7 +1866,8 @@ function renderTable() {
       </tr></thead>
       <tbody>
         ${items.map(v => `
-          <tr>
+          <tr id='row-${v.id}'>
+            <td><input type='checkbox' class='cb-row' data-id='${String(v.id)}' onchange='onCheckboxChange()'></td>
             <td>
               ${safe(v.creado_en ? new Date(v.creado_en + 'Z').toLocaleString('es-CL', {timeZone: 'America/Santiago'}) : null)}
               <div class='small'>${safe(v.id)}</div>
@@ -1898,6 +1987,92 @@ async function saveEdit() {
   await refreshData();
   closeModal();
   return true;
+}
+
+// ========================
+// CHECKBOX Y AGRUPACIÓN
+// ========================
+
+function getSeleccionadas() {
+  return Array.from(document.querySelectorAll('.cb-row[data-id]:checked')).map(cb => cb.dataset.id);
+}
+
+function onCheckboxChange() {
+  const seleccionadas = getSeleccionadas();
+  const btn = document.getElementById('btnAgrupar');
+  const info = document.getElementById('seleccionInfo');
+  const count = document.getElementById('seleccionCount');
+
+  // Resaltar filas seleccionadas
+  document.querySelectorAll('.cb-row[data-id]').forEach(cb => {
+    const row = document.getElementById('row-' + cb.dataset.id);
+    if (row) row.classList.toggle('seleccionada', cb.checked);
+  });
+
+  if (seleccionadas.length >= 2) {
+    btn.style.display = 'inline-block';
+    info.style.display = 'block';
+    count.textContent = `${seleccionadas.length} ventas seleccionadas`;
+  } else {
+    btn.style.display = 'none';
+    info.style.display = seleccionadas.length === 1 ? 'block' : 'none';
+    count.textContent = seleccionadas.length === 1 ? '1 venta seleccionada — selecciona al menos 1 más para agrupar' : '';
+  }
+}
+
+function toggleTodos(cb) {
+  document.querySelectorAll('.cb-row[data-id]').forEach(c => c.checked = cb.checked);
+  onCheckboxChange();
+}
+
+async function agruparSeleccionadas() {
+  const ids = getSeleccionadas();
+  if (ids.length < 2) { alert('Selecciona al menos 2 ventas para agrupar'); return; }
+
+  // Mostrar resumen antes de confirmar
+  const ventasSelec = ids.map(id => ventas.find(v => String(v.id) === id)).filter(Boolean);
+  const resumen = ventasSelec.map(v => `• ${v.cliente} — ${v.id}`).join('\n');
+
+  if (!confirm(`¿Agrupar estas ${ids.length} ventas en una sola boleta/factura?\n\nLa primera será la principal y las demás quedarán como "rechazadas":\n\n${resumen}\n\nEsta acción no se puede deshacer.`)) return;
+
+  const res = await fetch('/ventas/agrupar', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  });
+  const data = await res.json().catch(() => ({}));
+
+  if (res.ok) {
+    alert(`✅ Ventas agrupadas en ${data.venta_principal}\n${data.total_items} ítems · Total bruto: ${money(data.total_bruto)}`);
+    document.getElementById('btnAgrupar').style.display = 'none';
+    document.getElementById('seleccionInfo').style.display = 'none';
+    await refreshData();
+  } else {
+    alert(`❌ Error: ${data.detail || 'desconocido'}`);
+  }
+}
+
+async function reprocesarTodo() {
+  const pendientes = ventas.filter(v => v.estado === 'pendiente' || v.estado === 'error');
+  if (!pendientes.length) { alert('No hay ventas pendientes para reprocesar'); return; }
+  if (!confirm(`¿Reprocesar las ${pendientes.length} ventas pendientes/con error desde ML?\nEsto actualizará los datos de cada venta con la información actual de Mercado Libre.`)) return;
+
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '↺ Reprocesando...';
+
+  const res = await fetch('/ventas/reprocesar-todo', { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+
+  btn.disabled = false;
+  btn.textContent = '↺ Reprocesar todo';
+
+  if (res.ok) {
+    alert(`✅ Reprocesadas: ${data.ok} | ❌ Errores: ${data.error}`);
+    await refreshData();
+  } else {
+    alert(`❌ Error: ${data.detail || 'desconocido'}`);
+  }
 }
 
 async function reprocesar(id) {
