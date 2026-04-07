@@ -125,6 +125,7 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS ciudad TEXT",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS region TEXT",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_envio TEXT DEFAULT 'paid'",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS pack_id TEXT",
             ]:
                 cur.execute(stmt)
         conn.commit()
@@ -156,8 +157,14 @@ def save_venta(
     email: str = "",
     ciudad: str = "",
     region: str = "",
+    pack_id: str = "",
+    order_items_override: list = None,
 ):
-    oid = str(order["id"])
+    # Si hay pack_id, usar ese como ID de la venta para consolidar
+    oid = str(pack_id) if pack_id else str(order["id"])
+    # Permitir pasar items consolidados de múltiples órdenes
+    if order_items_override is not None:
+        order = {**order, "order_items": order_items_override}
     email_final = (email or ML_DEFAULT_EMAIL).strip()
     rut_final = normalize_rut(rut)
     direccion_final = (direccion or "").strip()
@@ -222,11 +229,12 @@ def save_venta(
             cur.execute(
                 """
                 INSERT INTO ventas
-                    (id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, order_json, billing_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s)
+                    (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, order_json, billing_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s)
                 """,
                 (
                     oid,
+                    pack_id or None,
                     cliente_final,
                     rut_final,
                     email_final,
@@ -761,6 +769,28 @@ def get_ml_order(order_id: str) -> dict:
     return ml_get(f"https://api.mercadolibre.com/orders/{order_id}")
 
 
+def get_ml_pack(pack_id: str) -> dict:
+    """Retorna todas las órdenes de un pack."""
+    return ml_get(f"https://api.mercadolibre.com/packs/{pack_id}")
+
+
+def get_venta_by_pack(pack_id: str) -> Optional[dict]:
+    """Busca una venta existente por pack_id."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ventas WHERE pack_id = %s LIMIT 1", (str(pack_id),))
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def merge_order_items(orders: list) -> list:
+    """Consolida los items de múltiples órdenes en una sola lista."""
+    all_items = []
+    for order in orders:
+        all_items.extend(order.get("order_items", []))
+    return all_items
+
+
 def get_ml_billing_raw(order_id: str) -> dict:
     return ml_get(f"https://api.mercadolibre.com/orders/{order_id}/billing_info")
 
@@ -1107,15 +1137,68 @@ def process_webhook_order(order_id: str):
 
         ml_status = order.get("status", "")
         estado_envio = ML_ESTADO_ENVIO.get(ml_status, ml_status)
+        pack_id = str(order.get("pack_id") or "")
 
-        # Si la venta ya existe, solo actualizar el estado de envío
+        # --- CASO CON PACK: consolidar todas las órdenes del pack ---
+        if pack_id:
+            # Verificar si el pack ya existe en bandeja
+            existing_pack = get_venta_by_pack(pack_id)
+            if existing_pack:
+                update_venta(existing_pack["id"], estado_envio=estado_envio)
+                logger.info(f"[pack:{pack_id}] Estado envío actualizado: {estado_envio}")
+                return
+
+            # Solo crear si está pagado
+            if ml_status != "paid":
+                logger.info(f"[pack:{pack_id}] No pagado ({ml_status}), ignorado")
+                return
+
+            # Obtener todas las órdenes del pack
+            pack_data = get_ml_pack(pack_id)
+            pack_order_ids = [str(o["id"]) for o in (pack_data.get("orders") or [])]
+
+            if not pack_order_ids:
+                pack_order_ids = [order_id]
+
+            # Consolidar items de todas las órdenes
+            all_orders = []
+            for oid_pack in pack_order_ids:
+                o = get_ml_order(oid_pack) if oid_pack != order_id else order
+                if o:
+                    all_orders.append(o)
+
+            all_items = merge_order_items(all_orders)
+
+            # Usar el billing de la orden original
+            billing_raw = get_ml_billing_raw(order_id)
+            billing_info = get_billing_info(billing_raw)
+
+            rut = extract_rut(billing_info)
+            cliente = extract_name(billing_info, order)
+            giro = extract_activity(billing_info, order)
+            direccion = extract_direccion(order, billing_info, billing_raw)
+            ciudad = extract_ciudad_from_billing(billing_info)
+            region = extract_region_from_billing(billing_info)
+            email = extract_email(billing_info, order)
+            tipo_sugerido = detect_tipo(order, billing_info)
+
+            if tipo_sugerido == "Boleta" and not giro:
+                giro = DEFAULT_BOLETA_ACTIVITY
+
+            # Guardar con pack_id como ID y todos los items consolidados
+            save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro,
+                      direccion, email, ciudad, region,
+                      pack_id=pack_id, order_items_override=all_items)
+            logger.info(f"[pack:{pack_id}] ✅ Pack consolidado: {len(all_orders)} órdenes, {len(all_items)} items")
+            return
+
+        # --- CASO SIN PACK: orden simple ---
         existing = get_venta(order_id)
         if existing:
             update_venta(order_id, estado_envio=estado_envio)
             logger.info(f"[{order_id}] Estado envío actualizado: {estado_envio}")
             return
 
-        # Solo crear en bandeja si la orden está pagada
         if ml_status != "paid":
             logger.info(f"[{order_id}] Orden no pagada ({ml_status}), no se agrega a bandeja")
             return
@@ -1135,7 +1218,8 @@ def process_webhook_order(order_id: str):
         if tipo_sugerido == "Boleta" and not giro:
             giro = DEFAULT_BOLETA_ACTIVITY
 
-        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email, ciudad, region)
+        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro,
+                  direccion, email, ciudad, region)
         logger.info(f"[{order_id}] ✅ Guardada: {tipo_sugerido} estado={estado_envio}")
     except Exception as e:
         logger.error(f"[{order_id}] Error procesando webhook: {e}", exc_info=True)
@@ -1349,6 +1433,62 @@ def reprocesar_venta(oid: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/ventas/{oid}/pack")
+def ver_pack(oid: str):
+    """Retorna el detalle de todas las órdenes del pack asociado a esta venta."""
+    venta = get_venta(oid)
+    if not venta:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+
+    pack_id = venta.get("pack_id")
+    if not pack_id:
+        # Sin pack_id — mostrar solo la orden propia
+        try:
+            order = json.loads(venta.get("order_json") or "{}")
+            items, item_count, total = summarize_order_items(order)
+            return {
+                "pack_id": None,
+                "ordenes": [{
+                    "id": venta["id"],
+                    "cliente": venta.get("cliente"),
+                    "total": total,
+                    "items": items,
+                    "item_count": item_count,
+                }]
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Con pack_id — consultar ML para obtener todas las órdenes
+    try:
+        pack_data = get_ml_pack(pack_id)
+        order_ids = [str(o["id"]) for o in (pack_data.get("orders") or [])]
+
+        ordenes = []
+        total_pack = 0.0
+        for order_id in order_ids:
+            order = get_ml_order(order_id)
+            if not order:
+                continue
+            items, item_count, total = summarize_order_items(order)
+            total_pack += total
+            ordenes.append({
+                "id": order_id,
+                "status": order.get("status"),
+                "total": total,
+                "items": items,
+                "item_count": item_count,
+            })
+
+        return {
+            "pack_id": pack_id,
+            "total_pack": round(total_pack, 2),
+            "ordenes": ordenes,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ventas/{oid}/autorizar")
 def autorizar_venta(oid: str):
     venta = get_venta(oid)
@@ -1438,6 +1578,8 @@ def ui_bandeja():
     .badge-error { background: rgba(239,68,68,0.15); color: #f87171; }
     .badge-default { background: rgba(148,163,184,0.15); color: #cbd5e1; }
     .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .pack-btn { background: #7c3aed; color: white; border: none; border-radius: 8px; padding: 9px 12px; font-size: 14px; font-weight: 600; cursor: pointer; }
+    .pack-btn:hover { opacity: 0.85; }
     .small { color: var(--muted); font-size: 12px; margin-top: 3px; }
     .empty { text-align: center; padding: 40px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; }
     .modal { position: fixed; inset: 0; background: rgba(2,6,23,0.8); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 100; }
@@ -1665,6 +1807,7 @@ function renderTable() {
               <div class='row-actions'>
                 <button class='secondary' onclick='openEdit("${String(v.id).replace(/"/g, '&quot;')}")'>Editar</button>
                 <button class='warn' onclick='reprocesar("${String(v.id).replace(/"/g, '&quot;')}")'>Reprocesar</button>
+                ${v.pack_id ? `<button class='pack-btn' onclick='verPack("${String(v.id).replace(/"/g, '&quot;')}", "${String(v.pack_id).replace(/"/g, '&quot;')}"); return false;'>📦 Ver pack</button>` : ''}
                 ${v.estado !== 'enviado' ? `<button class='success' onclick='autorizar("${String(v.id).replace(/"/g, '&quot;')}")'>Autorizar</button>` : ''}
               </div>
             </td>
@@ -1786,6 +1929,62 @@ document.getElementById('editModal').addEventListener('click', e => {
   if (e.target.id === 'editModal') closeModal();
 });
 
+// ========================
+// MODAL PACK
+// ========================
+
+async function verPack(id, packId) {
+  document.getElementById('packModalTitle').textContent = packId ? `Pack ${packId}` : `Orden ${id}`;
+  document.getElementById('packModalBody').innerHTML = "<p style='color:var(--muted)'>Cargando órdenes del pack...</p>";
+  document.getElementById('packModal').classList.add('open');
+
+  try {
+    const res = await fetch(`/ventas/${id}/pack`);
+    const data = await res.json();
+    if (!res.ok) {
+      document.getElementById('packModalBody').innerHTML = `<p style='color:#f87171'>Error: ${data.detail || 'desconocido'}</p>`;
+      return;
+    }
+
+    const ordenes = data.ordenes || [];
+    const totalPack = data.total_pack || 0;
+
+    let html = '';
+    if (data.pack_id) {
+      html += `<div style='margin-bottom:12px;color:var(--muted);font-size:13px'>Pack ID: <strong style='color:var(--text)'>${data.pack_id}</strong> · ${ordenes.length} orden(es) consolidada(s) · Total: <strong style='color:var(--ok)'>${money(totalPack)}</strong></div>`;
+    }
+
+    for (const orden of ordenes) {
+      html += `
+        <div style='background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px;'>
+          <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>
+            <strong style='font-size:13px'>Order ID: ${orden.id}</strong>
+            <span style='font-size:12px;color:var(--muted)'>${orden.status || ''} · ${orden.item_count} ítem(s) · <strong style='color:var(--ok)'>${money(orden.total)}</strong></span>
+          </div>
+          <ul style='margin:0;padding-left:18px;'>
+            ${(orden.items || []).map(item => `<li style='font-size:13px;color:var(--muted);margin-bottom:3px;'>${item}</li>`).join('')}
+          </ul>
+        </div>`;
+    }
+
+    if (!ordenes.length) {
+      html = "<p style='color:var(--muted)'>No se encontraron órdenes en este pack.</p>";
+    }
+
+    document.getElementById('packModalBody').innerHTML = html;
+  } catch(e) {
+    document.getElementById('packModalBody').innerHTML = `<p style='color:#f87171'>Error de conexión: ${e.message}</p>`;
+  }
+}
+
+function closePackModal() {
+  document.getElementById('packModal').classList.remove('open');
+}
+
+document.getElementById('packModal').addEventListener('click', e => {
+  if (e.target.id === 'packModal') closePackModal();
+});
+
 refreshData();
 setInterval(() => {
   // No recargar si el modal de edición está abierto
@@ -1794,6 +1993,21 @@ setInterval(() => {
   }
 }, 60000);
 </script>
+
+<!-- Modal Pack -->
+<div class='modal' id='packModal'>
+  <div class='modal-card' style='max-width:680px'>
+    <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;'>
+      <div>
+        <div class='title' style='font-size:20px'>📦 Detalle del pack</div>
+        <div class='subtitle' id='packModalTitle'></div>
+      </div>
+      <button class='secondary' onclick='closePackModal()'>Cerrar</button>
+    </div>
+    <div id='packModalBody'></div>
+  </div>
+</div>
+
 </body>
 </html>
 """)
