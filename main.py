@@ -29,10 +29,10 @@ app = FastAPI(title="lemulux-odoo")
 
 IVA_RATE = 1.19
 ML_DEFAULT_EMAIL = "boleta@lemulux.com"
+DEFAULT_BOLETA_ACTIVITY = "(boleta)"
 TOKEN_REFRESH_INTERVAL = 5 * 60 * 60
 DB_RETRIES = 20
 DB_RETRY_SECONDS = 3
-
 
 # =========================
 # HELPERS GENERALES
@@ -146,7 +146,7 @@ def save_venta(
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM ventas WHERE id = %s", (oid,))
+            cur.execute("SELECT id, estado, move_id FROM ventas WHERE id = %s", (oid,))
             existing = cur.fetchone()
 
             if existing:
@@ -156,22 +156,25 @@ def save_venta(
                     SET cliente = %s,
                         rut = %s,
                         email = %s,
-                        giro = %s,
                         direccion = %s,
                         tipo_sugerido = %s,
                         order_json = %s,
-                        billing_json = %s
+                        billing_json = %s,
+                        giro = CASE
+                            WHEN (giro IS NULL OR giro = '' OR estado = 'pendiente') THEN %s
+                            ELSE giro
+                        END
                     WHERE id = %s
                     """,
                     (
                         cliente_final,
                         rut_final,
                         email_final,
-                        giro_final,
                         direccion_final,
                         tipo_sugerido,
-                        json.dumps(order),
-                        json.dumps(billing),
+                        json.dumps(order, ensure_ascii=False),
+                        json.dumps(billing, ensure_ascii=False),
+                        giro_final,
                         oid,
                     ),
                 )
@@ -193,8 +196,8 @@ def save_venta(
                     giro_final,
                     direccion_final,
                     tipo_sugerido,
-                    json.dumps(order),
-                    json.dumps(billing),
+                    json.dumps(order, ensure_ascii=False),
+                    json.dumps(billing, ensure_ascii=False),
                 ),
             )
         conn.commit()
@@ -672,7 +675,7 @@ def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
             ctx,
             "account.journal",
             "search",
-            [[["type", "=", "sale"], ["name", "=", "Facturas de cliente"]]],
+            [[["type", "=", "sale"], ["name", "=", "Facturas de cliente"], ["active", "=", True]]],
             {"limit": 1},
         )
     else:
@@ -680,7 +683,7 @@ def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
             ctx,
             "account.journal",
             "search",
-            [[["type", "=", "sale"], ["name", "ilike", "Boleta"]]],
+            [[["type", "=", "sale"], ["name", "ilike", "Boleta"], ["active", "=", True]]],
             {"limit": 1},
         )
     return ids[0] if ids else None
@@ -709,84 +712,119 @@ def get_tax_19(ctx: OdooCtx) -> Optional[int]:
 
 def get_activity_field_name(ctx: OdooCtx) -> Optional[str]:
     fields = get_partner_fields(ctx)
-    for candidate in ("l10n_cl_activity_description", "activity_description", "x_studio_giro"):
+    for candidate in (
+        "l10n_cl_activity_description",
+        "activity_description",
+        "x_studio_giro",
+        "x_giro",
+        "giro",
+    ):
         if candidate in fields:
             return candidate
     return None
+
+
+def read_partner_by_id(ctx: OdooCtx, partner_id: int) -> dict:
+    rows = odoo_exec(ctx, "res.partner", "read", [[partner_id], ["id", "name", "vat", "email", "comment"]])
+    return rows[0] if rows else {}
 
 
 def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
     rut_norm = normalize_rut(rut)
     if not rut_norm:
         return None
-    variantes = [rut_norm]
-    if len(rut_norm) > 1:
-        variantes.append(rut_norm[:-1] + "-" + rut_norm[-1])
-    for variante in variantes:
-        ids = odoo_exec(ctx, "res.partner", "search", [[["vat", "=", variante]]], {"limit": 1})
-        if ids:
-            return ids[0]
+
+    ids = odoo_exec(
+        ctx,
+        "res.partner",
+        "search",
+        [[["vat", "!=", False]]],
+        {"limit": 1000},
+    )
+    if not ids:
+        return None
+
+    rows = odoo_exec(ctx, "res.partner", "read", [ids, ["id", "vat"]])
+    for row in rows:
+        if normalize_rut(row.get("vat") or "") == rut_norm:
+            return row["id"]
     return None
 
 
-def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str, giro: str, direccion: str, es_empresa: bool) -> int:
-    taxpayer_type = "1" if es_empresa else "4"
-    chile_id = get_chile_country_id(ctx)
-    rut_type_id = get_rut_id_type(ctx)
+def find_partner_by_ml_order(ctx: OdooCtx, order_id: str) -> Optional[int]:
+    ids = odoo_exec(
+        ctx,
+        "res.partner",
+        "search",
+        [[["comment", "ilike", f"ML_ORDER:{order_id}"]]],
+        {"limit": 1},
+    )
+    return ids[0] if ids else None
+
+
+def upsert_partner(
+    ctx: OdooCtx,
+    order_id: str,
+    nombre: str,
+    rut: str,
+    email: str,
+    giro: str,
+    direccion: str,
+    es_empresa: bool,
+    tipo: str,
+) -> int:
     partner_fields = get_partner_fields(ctx)
     activity_field = get_activity_field_name(ctx)
+    chile_id = get_chile_country_id(ctx)
+    rut_type_id = get_rut_id_type(ctx)
 
-    partner_id = find_partner_by_rut(ctx, rut)
+    taxpayer_type = "1" if es_empresa else "4"
+
+    partner_id = find_partner_by_rut(ctx, rut) or find_partner_by_ml_order(ctx, order_id)
+
+    giro_a_usar = giro.strip()
+    if tipo == "Boleta" and not giro_a_usar:
+        giro_a_usar = DEFAULT_BOLETA_ACTIVITY
+
+    vals = {
+        "name": nombre,
+        "email": email,
+        "comment": f"ML_ORDER:{order_id}",
+    }
+
+    if rut:
+        vals["vat"] = rut
+    if "l10n_cl_dte_email" in partner_fields:
+        vals["l10n_cl_dte_email"] = email
+    if direccion and "street" in partner_fields:
+        vals["street"] = direccion
+    if chile_id and "country_id" in partner_fields:
+        vals["country_id"] = chile_id
+    if "company_type" in partner_fields:
+        vals["company_type"] = "company" if es_empresa else "person"
+    if "is_company" in partner_fields:
+        vals["is_company"] = es_empresa
+    if "l10n_cl_sii_taxpayer_type" in partner_fields:
+        vals["l10n_cl_sii_taxpayer_type"] = taxpayer_type
+    if rut and rut_type_id and "l10n_latam_identification_type_id" in partner_fields:
+        vals["l10n_latam_identification_type_id"] = rut_type_id
+
+    # Giro solo obligatorio / forzado para boleta.
+    # Factura requiere giro real, nunca "(boleta)".
+    if activity_field:
+        if tipo == "Factura":
+            if giro_a_usar:
+                vals[activity_field] = giro_a_usar
+        else:
+            vals[activity_field] = giro_a_usar or DEFAULT_BOLETA_ACTIVITY
 
     if partner_id:
-        safe_update = {
-            "name": nombre,
-            "email": email,
-        }
-
-        if "l10n_cl_dte_email" in partner_fields:
-            safe_update["l10n_cl_dte_email"] = email
-        if direccion:
-            safe_update["street"] = direccion
-        if rut:
-            safe_update["vat"] = rut
-        if chile_id and "country_id" in partner_fields:
-            safe_update["country_id"] = chile_id
-        if rut and rut_type_id and "l10n_latam_identification_type_id" in partner_fields:
-            safe_update["l10n_latam_identification_type_id"] = rut_type_id
-        if activity_field and es_empresa and giro:
-            safe_update[activity_field] = giro
-
-        odoo_exec(ctx, "res.partner", "write", [[partner_id], safe_update])
+        odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
         logger.info(f"Partner actualizado: id={partner_id}")
         return partner_id
 
-    base_vals = {
-        "name": nombre,
-        "vat": rut or False,
-        "email": email,
-        "customer_rank": 1,
-    }
-
-    if "l10n_cl_dte_email" in partner_fields:
-        base_vals["l10n_cl_dte_email"] = email
-    if chile_id and "country_id" in partner_fields:
-        base_vals["country_id"] = chile_id
-    if "company_type" in partner_fields:
-        base_vals["company_type"] = "company" if es_empresa else "person"
-    if "is_company" in partner_fields:
-        base_vals["is_company"] = es_empresa
-    if "l10n_cl_sii_taxpayer_type" in partner_fields:
-        base_vals["l10n_cl_sii_taxpayer_type"] = taxpayer_type
-    if direccion:
-        base_vals["street"] = direccion
-    if rut and rut_type_id and "l10n_latam_identification_type_id" in partner_fields:
-        base_vals["l10n_latam_identification_type_id"] = rut_type_id
-    if activity_field and es_empresa and giro:
-        base_vals[activity_field] = giro
-
-    partner_id = odoo_exec(ctx, "res.partner", "create", [base_vals])
-    logger.info(f"Partner creado: id={partner_id} empresa={es_empresa}")
+    partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
+    logger.info(f"Partner creado: id={partner_id} empresa={es_empresa} tipo={tipo}")
     return partner_id
 
 
@@ -831,12 +869,31 @@ def create_document(
     giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
 
+    # Estándar acordado:
+    # Factura requiere datos empresa completos.
     if tipo == "Factura" and (not nombre or not rut or not direccion or not giro):
         raise Exception("Para Factura se requiere razón social, RUT, dirección y giro")
 
-    partner_id = get_or_create_partner(ctx, nombre, rut, email, giro, direccion, es_empresa)
+    # Boleta permite giro forzado "(boleta)" si no existe.
+    if tipo == "Boleta" and not giro:
+        giro = DEFAULT_BOLETA_ACTIVITY
+
+    partner_id = upsert_partner(
+        ctx=ctx,
+        order_id=order_id,
+        nombre=nombre,
+        rut=rut,
+        email=email,
+        giro=giro,
+        direccion=direccion,
+        es_empresa=es_empresa,
+        tipo=tipo,
+    )
 
     journal_id = get_journal(ctx, tipo)
+    if not journal_id:
+        raise Exception(f"No se encontró diario Odoo para {tipo}")
+
     doc_type_id = int(get_env("ODOO_DOC_TYPE_FACTURA_ID")) if tipo == "Factura" else int(get_env("ODOO_DOC_TYPE_BOLETA_ID"))
     tax_id = get_tax_19(ctx)
 
@@ -878,9 +935,8 @@ def create_document(
         "l10n_latam_document_type_id": doc_type_id,
         "narration": "\n".join(narration_parts),
         "invoice_payment_ref": f"ML-{order_id}",
+        "journal_id": journal_id,
     }
-    if journal_id:
-        move_vals["journal_id"] = journal_id
 
     move_id = odoo_exec(ctx, "account.move", "create", [move_vals])
     odoo_exec(ctx, "account.move", "action_post", [[move_id]])
@@ -899,6 +955,8 @@ def process_webhook_order(order_id: str):
             logger.warning(f"[{order_id}] Orden no encontrada en ML")
             return
 
+        # NO enviar a Odoo automático.
+        # Solo guardar si está paid.
         if order.get("status") != "paid":
             logger.info(f"[{order_id}] Orden no pagada: {order.get('status')}")
             return
@@ -912,6 +970,10 @@ def process_webhook_order(order_id: str):
         direccion = extract_direccion(order, billing_info, billing_raw)
         email = extract_email(billing_info, order)
         tipo_sugerido = detect_tipo(order, billing_info)
+
+        # Si boleta y no hay giro, sugerir "(boleta)" en bandeja
+        if tipo_sugerido == "Boleta" and not giro:
+            giro = DEFAULT_BOLETA_ACTIVITY
 
         save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email)
         logger.info(f"[{order_id}] ✅ Guardada/actualizada: {tipo_sugerido} dirección='{direccion or 'sin dirección'}' giro='{giro or 'sin giro'}'")
@@ -933,6 +995,9 @@ def reprocesar_venta_desde_ml(order_id: str):
     direccion = extract_direccion(order, billing_info, billing_raw)
     email = extract_email(billing_info, order)
     tipo_sugerido = detect_tipo(order, billing_info)
+
+    if tipo_sugerido == "Boleta" and not giro:
+        giro = DEFAULT_BOLETA_ACTIVITY
 
     save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email)
 
@@ -1100,6 +1165,10 @@ def actualizar_venta(oid: str, payload: VentaUpdate):
     if "tipo_sugerido" in updates and updates["tipo_sugerido"] not in ["Boleta", "Factura"]:
         raise HTTPException(status_code=400, detail="tipo_sugerido debe ser Boleta o Factura")
 
+    # Si el usuario cambia a boleta y deja giro vacío, guardar sugerencia boleta.
+    if updates.get("tipo_sugerido") == "Boleta" and not updates.get("giro") and not venta.get("giro"):
+        updates["giro"] = DEFAULT_BOLETA_ACTIVITY
+
     update_venta(oid, **updates)
     return {"ok": True, "id": oid, "updated": updates}
 
@@ -1247,7 +1316,6 @@ def ui_bandeja():
       <option value='enviado'>Enviado</option>
       <option value='error'>Error</option>
     </select>
-    <button class='success' onclick='autorizarTodas()'>✓ Autorizar todas las pendientes</button>
   </div>
 
   <div id='tableWrap'><div class='empty'>Cargando...</div></div>
@@ -1428,24 +1496,6 @@ async function autorizar(id) {
   await refreshData();
 }
 
-async function autorizarTodas() {
-  const pendientes = ventas.filter(v => v.estado === 'pendiente');
-  if (!pendientes.length) {
-    alert('No hay ventas pendientes');
-    return;
-  }
-  if (!confirm(`¿Autorizar las ${pendientes.length} ventas pendientes?`)) return;
-
-  let ok = 0;
-  let err = 0;
-  for (const v of pendientes) {
-    const r = await fetch(`/ventas/${v.id}/autorizar`, { method: 'POST' });
-    if (r.ok) ok++; else err++;
-  }
-  alert(`✅ Autorizadas: ${ok} | ❌ Errores: ${err}`);
-  await refreshData();
-}
-
 function toggleGiro() {
   document.getElementById('giroGroup').style.display =
     document.getElementById('editTipo').value === 'Factura' ? 'block' : 'none';
@@ -1462,7 +1512,7 @@ function openEdit(id) {
   document.getElementById('editCliente').value = v.cliente || '';
   document.getElementById('editRut').value = v.rut || '';
   document.getElementById('editDireccion').value = v.direccion || '';
-  document.getElementById('editGiro').value = v.giro || '';
+  document.getElementById('editGiro').value = v.tipo_sugerido === 'Factura' ? (v.giro || '') : '';
   document.getElementById('editTotal').value = money(v.total_bruto);
   document.getElementById('editItemsCount').value = v.cantidad_items || 0;
   document.getElementById('editProducts').value = (v.productos || []).join('\\n');
