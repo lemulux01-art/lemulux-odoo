@@ -10,6 +10,7 @@ import xmlrpc.client
 import psycopg2
 import psycopg2.extras
 import json
+import re
 from datetime import datetime
 from typing import Optional, Any
 from dataclasses import dataclass
@@ -245,10 +246,14 @@ class VentaUpdate(BaseModel):
 # =========================
 
 def get_billing_info(billing_response: dict) -> dict:
-    if "buyer" in billing_response:
-        return billing_response["buyer"].get("billing_info", {}) or {}
-    if "billing_info" in billing_response:
-        return billing_response["billing_info"] or {}
+    buyer_billing = safe_get(billing_response, "buyer", "billing_info", default={})
+    if isinstance(buyer_billing, dict) and buyer_billing:
+        return buyer_billing
+
+    root_billing = billing_response.get("billing_info") or {}
+    if isinstance(root_billing, dict) and root_billing:
+        return root_billing
+
     return billing_response or {}
 
 
@@ -391,40 +396,119 @@ def format_address_dict(address: dict) -> str:
     return ", ".join(filter(None, parts))
 
 
-def extract_direccion(order: dict, billing_info: dict) -> str:
-    # 1) billing_info.address
-    direccion = format_address_dict(billing_info.get("address") or {})
-    if direccion:
-        return direccion
+def flatten_strings(obj) -> list[str]:
+    results = []
 
-    # 2) billing_info.additional_info
+    def walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+        elif isinstance(x, str):
+            s = " ".join(x.split()).strip()
+            if s:
+                results.append(s)
+
+    walk(obj)
+    return results
+
+
+def looks_like_chilean_address(text: str) -> bool:
+    if not text or len(text) < 10:
+        return False
+
+    t = " ".join(text.split()).strip()
+    tl = t.lower()
+
+    banned = [
+        "rut",
+        "giro",
+        "actividad",
+        "economic activity",
+        "razon social",
+        "razón social",
+        "business name",
+        "company name",
+        "boleta",
+        "factura",
+        "consumidor final",
+    ]
+    if any(b in tl for b in banned):
+        return False
+
+    has_number = bool(re.search(r"\b\d{2,5}\b", t))
+    has_street_word = bool(re.search(
+        r"\b(calle|av\.?|avenida|pasaje|camino|ruta|general|manuel|los|las|el|la|encomenderos|montt|ohiggins|vicuña|providencia|apoquindo)\b",
+        tl
+    ))
+    has_location_hint = bool(re.search(
+        r"\b(santiago|las condes|providencia|maipu|maipú|ñuñoa|nunoa|coronel|biob[ií]o|metropolitana|valparaiso|valpara[ií]so|concepcion|concepción|temuco|antofagasta)\b",
+        tl
+    ))
+
+    return has_number and (has_street_word or has_location_hint)
+
+
+def score_address_candidate(text: str) -> int:
+    t = text.lower()
+    score = 0
+
+    if re.search(r"\b\d{2,5}\b", t):
+        score += 3
+    if re.search(r"\b(of|oficina|depto|departamento|casa|piso|torre|edif|edificio)\b", t):
+        score += 3
+    if re.search(r"\b(santiago|las condes|providencia|coronel|biob[ií]o|metropolitana)\b", t):
+        score += 3
+    if re.search(r"\b(calle|av|avenida|pasaje|camino|ruta|general|manuel|encomenderos)\b", t):
+        score += 2
+
+    return score
+
+
+def extract_direccion(order: dict, billing_info: dict, billing_raw: dict | None = None) -> str:
+    # 1) ramas estructuradas
+    candidates = [
+        billing_info.get("address") or {},
+        safe_get(order, "buyer", "address", default={}),
+        safe_get(order, "buyer", "address_details", default={}),
+        safe_get(order, "shipping", "receiver_address", default={}),
+    ]
+
+    for c in candidates:
+        direccion = format_address_dict(c)
+        if direccion:
+            return direccion
+
+    # 2) additional_info con dict o string
     for item in billing_info.get("additional_info") or []:
-        item_type = (item.get("type") or "").upper()
-        if item_type in ("ADDRESS", "BILLING_ADDRESS", "BUYER_ADDRESS"):
-            value = item.get("value")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-            if isinstance(value, dict):
-                direccion = format_address_dict(value)
-                if direccion:
-                    return direccion
+        value = item.get("value")
+        if isinstance(value, dict):
+            direccion = format_address_dict(value)
+            if direccion:
+                return direccion
+        elif isinstance(value, str) and looks_like_chilean_address(value):
+            return value.strip()
 
-    # 3) buyer.address (datos del comprador)
-    buyer = order.get("buyer") or {}
-    direccion = format_address_dict(buyer.get("address") or {})
-    if direccion:
-        return direccion
+    # 3) búsqueda libre en todo el JSON
+    blobs = []
+    blobs.extend(flatten_strings(order))
+    blobs.extend(flatten_strings(billing_info))
+    if billing_raw:
+        blobs.extend(flatten_strings(billing_raw))
 
-    # 4) buyer.address_details
-    direccion = format_address_dict(buyer.get("address_details") or {})
-    if direccion:
-        return direccion
+    seen = set()
+    uniq = []
+    for s in blobs:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
 
-    # 5) shipping.receiver_address
-    shipping = order.get("shipping") or {}
-    direccion = format_address_dict(shipping.get("receiver_address") or {})
-    if direccion:
-        return direccion
+    filtered = [s for s in uniq if looks_like_chilean_address(s)]
+    if filtered:
+        filtered.sort(key=score_address_candidate, reverse=True)
+        return filtered[0].strip()
 
     return ""
 
@@ -433,18 +517,23 @@ def detect_tipo(order: dict, billing_info: dict) -> str:
     cust_type = (safe_get(billing_info, "attributes", "cust_type", default="") or "").upper()
     if cust_type == "BU":
         return "Factura"
+    if cust_type == "CO":
+        return "Boleta"
+
+    taxpayer_desc = (
+        safe_get(billing_info, "taxes", "taxpayer_type", "description", default="") or ""
+    ).strip().lower()
+
+    if taxpayer_desc and any(x in taxpayer_desc for x in [
+        "responsable", "empresa", "negocio", "iva", "jurídica", "juridica"
+    ]):
+        return "Factura"
 
     if extract_activity(billing_info, order):
         return "Factura"
 
     for key in ("business_name", "company_name", "razon_social", "social_reason", "legal_name"):
         val = billing_info.get(key)
-        if isinstance(val, str) and val.strip():
-            return "Factura"
-
-    taxes = billing_info.get("taxes") or {}
-    for key in ("business_name", "company_name", "legal_name"):
-        val = taxes.get(key)
         if isinstance(val, str) and val.strip():
             return "Factura"
 
@@ -679,7 +768,7 @@ def create_document(
     billing_info = get_billing_info(billing_raw)
     rut = normalize_rut(rut_override) if rut_override else extract_rut(billing_info)
     nombre = (cliente_override or extract_name(billing_info, order) or "Cliente ML").strip()
-    direccion = (direccion_override or extract_direccion(order, billing_info) or "").strip()
+    direccion = (direccion_override or extract_direccion(order, billing_info, billing_raw) or "").strip()
     email = (email or ML_DEFAULT_EMAIL).strip()
     giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
@@ -742,7 +831,7 @@ def process_webhook_order(order_id: str):
         rut = extract_rut(billing_info)
         cliente = extract_name(billing_info, order)
         giro = extract_activity(billing_info, order)
-        direccion = extract_direccion(order, billing_info)
+        direccion = extract_direccion(order, billing_info, billing_raw)
         email = extract_email(billing_info, order)
         tipo_sugerido = detect_tipo(order, billing_info)
 
@@ -763,7 +852,7 @@ def reprocesar_venta_desde_ml(order_id: str):
     rut = extract_rut(billing_info)
     cliente = extract_name(billing_info, order)
     giro = extract_activity(billing_info, order)
-    direccion = extract_direccion(order, billing_info)
+    direccion = extract_direccion(order, billing_info, billing_raw)
     email = extract_email(billing_info, order)
     tipo_sugerido = detect_tipo(order, billing_info)
 
@@ -811,6 +900,27 @@ def health():
         return {"status": "healthy", "db": bool(row and row.get("ok") == 1)}
     except Exception as e:
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
+
+
+@app.get("/debug/direccion/{oid}")
+def debug_direccion(oid: str):
+    order = get_ml_order(oid)
+    billing_raw = get_ml_billing_raw(oid)
+    billing_info = get_billing_info(billing_raw)
+
+    return {
+        "direccion_extraida": extract_direccion(order, billing_info, billing_raw),
+        "buyer_address": safe_get(order, "buyer", "address", default={}),
+        "buyer_address_details": safe_get(order, "buyer", "address_details", default={}),
+        "shipping_receiver_address": safe_get(order, "shipping", "receiver_address", default={}),
+        "billing_address": billing_info.get("address"),
+        "billing_additional_info": billing_info.get("additional_info"),
+        "top_candidates": sorted(
+            [s for s in list(dict.fromkeys(flatten_strings(order) + flatten_strings(billing_raw))) if looks_like_chilean_address(s)],
+            key=score_address_candidate,
+            reverse=True
+        )[:20]
+    }
 
 
 @app.post("/ml/webhook")
