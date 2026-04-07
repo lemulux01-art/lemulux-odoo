@@ -832,26 +832,32 @@ def get_activity_field_name(ctx: OdooCtx) -> Optional[str]:
     return None
 
 
+def rut_con_guion(rut_norm: str) -> str:
+    """Convierte RUT normalizado a formato con guion: 123456789 → 12345678-9"""
+    if not rut_norm or len(rut_norm) < 2:
+        return rut_norm
+    return rut_norm[:-1] + "-" + rut_norm[-1]
+
+
 def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
+    """
+    Busca partner por RUT en Odoo.
+    Los RUT en Odoo siempre tienen guion (ej: 12345678-9),
+    por lo que normalizamos el RUT entrante y buscamos con guion.
+    """
     rut_norm = normalize_rut(rut)
     if not rut_norm:
         return None
 
+    rut_odoo = rut_con_guion(rut_norm)
     ids = odoo_exec(
         ctx,
         "res.partner",
         "search",
-        [[["vat", "!=", False]]],
-        {"limit": 1000},
+        [[["vat", "=", rut_odoo]]],
+        {"limit": 1},
     )
-    if not ids:
-        return None
-
-    rows = odoo_exec(ctx, "res.partner", "read", [ids, ["id", "vat"]])
-    for row in rows:
-        if normalize_rut(row.get("vat") or "") == rut_norm:
-            return row["id"]
-    return None
+    return ids[0] if ids else None
 
 
 def find_partner_by_ml_order(ctx: OdooCtx, order_id: str) -> Optional[int]:
@@ -895,7 +901,9 @@ def upsert_partner(
 
     taxpayer_type = "1" if es_empresa else "4"
 
+    rut_odoo = rut_con_guion(normalize_rut(rut)) if rut else ""
     partner_id = find_partner_by_rut(ctx, rut) or find_partner_by_ml_order(ctx, order_id)
+    logger.info(f"upsert_partner: rut_odoo='{rut_odoo}' → partner_id={'encontrado:' + str(partner_id) if partner_id else 'no encontrado → se creará nuevo'}")
 
     giro_a_usar = giro.strip()
     if tipo == "Boleta" and not giro_a_usar:
@@ -908,7 +916,8 @@ def upsert_partner(
     }
 
     if rut:
-        vals["vat"] = rut
+        # Odoo Chile almacena RUT con guion — normalizar al guardar
+        vals["vat"] = rut_con_guion(rut)
     if "l10n_cl_dte_email" in partner_fields:
         vals["l10n_cl_dte_email"] = email
     if direccion and "street" in partner_fields:
