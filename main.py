@@ -1801,7 +1801,22 @@ function badge(estado) {
   return '<span class="badge ' + (map[estado] || 'badge-default') + '">' + safe(estado) + '</span>';
 }
 
-function safe(v) { return v == null || v === '' ? '—' : String(v); }
+function safe(v) {
+  if (v == null || v === '') return '—';
+  return String(v)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+function escAttr(v) {
+  if (v == null) return '';
+  return String(v)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
 
 function money(v) {
@@ -1829,18 +1844,18 @@ function filteredVentas() {
 }
 
 function rowHtml(v) {
-  const id = safe(v.id);
+  const id = String(v.id || '');
   const fecha = v.creado_en ? new Date(v.creado_en + 'Z').toLocaleString('es-CL', {timeZone: 'America/Santiago'}) : '—';
-  const packId = v.pack_id ? safe(v.pack_id) : '';
+  const packId = v.pack_id ? String(v.pack_id) : '';
 
   let acciones = '';
-  acciones += '<button class="secondary" data-action="edit" data-id="' + id + '">Editar</button> ';
-  acciones += '<button class="warn" data-action="reprocesar" data-id="' + id + '">Reprocesar</button> ';
+  acciones += '<button class="secondary" data-action="edit" data-id="' + escAttr(id) + '">Editar</button> ';
+  acciones += '<button class="warn" data-action="reprocesar" data-id="' + escAttr(id) + '">Reprocesar</button> ';
   if (packId) {
-    acciones += '<button class="pack-btn" data-action="verpack" data-id="' + id + '" data-pack="' + packId + '">📦 Ver pack</button> ';
+    acciones += '<button class="pack-btn" data-action="verpack" data-id="' + escAttr(id) + '" data-pack="' + escAttr(packId) + '">📦 Ver pack</button> ';
   }
   if (v.estado !== 'enviado') {
-    acciones += '<button class="success" data-action="autorizar" data-id="' + id + '">Autorizar</button>';
+    acciones += '<button class="success" data-action="autorizar" data-id="' + escAttr(id) + '">Autorizar</button>';
   }
 
   let productos = '';
@@ -1848,9 +1863,9 @@ function rowHtml(v) {
     productos = '<ul class="compact">' + v.productos.slice(0,3).map(function(p){ return '<li>' + safe(p) + '</li>'; }).join('') + '</ul>';
   }
 
-  return '<tr id="row-' + id + '">' +
-    '<td><input type="checkbox" class="cb-row" data-id="' + id + '" onchange="onCheckboxChange()"></td>' +
-    '<td>' + safe(fecha) + '<div class="small">' + id + '</div><div class="small"><a href="#" class="link" data-action="copy" data-id="' + id + '">Copiar ID</a></div></td>' +
+  return '<tr id="row-' + escAttr(id) + '">' +
+    '<td><input type="checkbox" class="cb-row" data-id="' + escAttr(id) + '" onchange="onCheckboxChange()"></td>' +
+    '<td>' + safe(fecha) + '<div class="small">' + safe(id) + '</div><div class="small"><a href="#" class="link" data-action="copy" data-id="' + escAttr(id) + '">Copiar ID</a></div></td>' +
     '<td><strong>' + safe(v.cliente) + '</strong><div class="small">' + safe(v.email) + '</div>' + (v.giro ? '<div class="small">' + safe(v.giro) + '</div>' : '') + '</td>' +
     '<td>' + safe(v.rut) + '</td>' +
     '<td>' + safe(v.direccion) + (v.ciudad ? '<div class="small">📍 ' + safe(v.ciudad) + '</div>' : '') + (v.region ? '<div class="small">' + safe(v.region) + '</div>' : '') + '</td>' +
