@@ -231,6 +231,7 @@ def save_venta(
                 INSERT INTO ventas
                     (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, order_json, billing_json)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s)
+                ON CONFLICT (id) DO NOTHING
                 """,
                 (
                     oid,
@@ -2003,10 +2004,8 @@ async function agruparSeleccionadas() {
   // Mostrar resumen antes de confirmar
   const ventasSelec = ids.map(id => ventas.find(v => String(v.id) === id)).filter(Boolean);
   const resumen = ventasSelec.map(function(v){ return '• ' + safe(v.cliente) + ' — ' + safe(v.id); }).join(String.fromCharCode(10));
-  const msg = '¿Agrupar estas ' + ids.length + ' ventas en una sola boleta/factura?' +
-    '\n\nLa primera será la principal y las demás quedarán como rechazadas:' +
-    '\n\n' + resumen +
-    '\n\nEsta acción no se puede deshacer.';
+  const nl = String.fromCharCode(10);
+  const msg = '¿Agrupar estas ' + ids.length + ' ventas en una sola boleta/factura?' + nl + nl + 'La primera sera la principal y las demas quedaran como rechazadas:' + nl + nl + resumen + nl + nl + 'Esta accion no se puede deshacer.';
   if (!confirm(msg)) return;
 
   const res = await fetch('/ventas/agrupar', {
@@ -2017,7 +2016,7 @@ async function agruparSeleccionadas() {
   const data = await res.json().catch(() => ({}));
 
   if (res.ok) {
-    alert('✅ Ventas agrupadas en ' + data.venta_principal + '\n' + data.total_items + ' ítems · Total bruto: ' + money(data.total_bruto));
+    alert('Ventas agrupadas en ' + data.venta_principal + '. Items: ' + data.total_items + '. Total: ' + money(data.total_bruto));
     document.getElementById('btnAgrupar').style.display = 'none';
     document.getElementById('seleccionInfo').style.display = 'none';
     await refreshData();
