@@ -34,8 +34,18 @@ TOKEN_REFRESH_INTERVAL = 5 * 60 * 60
 DB_RETRIES = 20
 DB_RETRY_SECONDS = 3
 
+# Confirmados en tu Odoo
 ODOO_JOURNAL_FACTURA_ID = 10
 ODOO_JOURNAL_BOLETA_ID = 21
+ODOO_DOC_TYPE_FACTURA_ID = 1   # (33) Factura Electrónica
+ODOO_DOC_TYPE_BOLETA_ID = 5    # (39) Boleta Electrónica
+ODOO_PAYMENT_TERM_CONTADO_ID = 1
+
+ODOO_STANDARD_NARRATION = (
+    '<p>Para futuras compras:&nbsp;</p>'
+    '<p><a href="https://lemulux.com/">https://lemulux.com/</a></p>'
+    '<p>ventas@lemulux.com</p>'
+)
 
 # =========================
 # HELPERS GENERALES
@@ -101,6 +111,7 @@ def init_db():
                     order_json TEXT,
                     billing_json TEXT,
                     move_id INTEGER,
+                    partner_id INTEGER,
                     error TEXT,
                     creado_en TIMESTAMP DEFAULT NOW(),
                     enviado_en TIMESTAMP
@@ -110,6 +121,7 @@ def init_db():
             for stmt in [
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS direccion TEXT",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS giro TEXT",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS partner_id INTEGER",
             ]:
                 cur.execute(stmt)
         conn.commit()
@@ -672,6 +684,11 @@ def get_partner_fields(ctx: OdooCtx) -> set[str]:
     return set(fields.keys())
 
 
+def get_move_fields(ctx: OdooCtx) -> set[str]:
+    fields = odoo_exec(ctx, "account.move", "fields_get", [], {"attributes": ["string"]})
+    return set(fields.keys())
+
+
 def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
     if tipo == "Factura":
         return ODOO_JOURNAL_FACTURA_ID
@@ -819,7 +836,7 @@ def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
         ctx,
         "account.move",
         "search",
-        [[["ref", "=", f"ML-{order_id}"], ["state", "in", ["draft", "posted", "cancel"]]]],
+        [[["ref", "=", str(order_id)], ["state", "in", ["draft", "posted", "cancel"]]]],
         {"limit": 1},
     )
     return ids[0] if ids else None
@@ -834,14 +851,14 @@ def create_document(
     cliente_override: Optional[str] = None,
     rut_override: Optional[str] = None,
     direccion_override: Optional[str] = None,
-) -> int:
+) -> tuple[int, int]:
     ctx = odoo_connect()
     order_id = str(order["id"])
 
     existing = find_existing_move(ctx, order_id)
     if existing:
         logger.info(f"[{order_id}] Documento ya existe: move_id={existing}")
-        return existing
+        return existing, 0
 
     billing_info = get_billing_info(billing_raw)
     rut = normalize_rut(rut_override) if rut_override else extract_rut(billing_info)
@@ -873,12 +890,10 @@ def create_document(
     if not journal_id:
         raise Exception(f"No se encontró diario Odoo para {tipo}")
 
-    doc_type_id = int(get_env("ODOO_DOC_TYPE_FACTURA_ID")) if tipo == "Factura" else int(get_env("ODOO_DOC_TYPE_BOLETA_ID"))
+    doc_type_id = ODOO_DOC_TYPE_FACTURA_ID if tipo == "Factura" else ODOO_DOC_TYPE_BOLETA_ID
     tax_id = get_tax_19(ctx)
 
     lines = []
-    item_lines, item_count, total_bruto = summarize_order_items(order)
-
     for item in order.get("order_items", []):
         qty = float(item.get("quantity", 0) or 0)
         unit_price_gross = float(item.get("unit_price", 0) or 0)
@@ -896,31 +911,25 @@ def create_document(
     if not lines:
         raise Exception("La orden no tiene líneas")
 
-    narration_parts = []
-    if giro:
-        narration_parts.append(f"Giro: {giro}")
-    narration_parts.append(f"Venta Mercado Libre ID: {order_id}")
-    narration_parts.append(f"Cantidad de ítems: {item_count}")
-    narration_parts.append(f"Total bruto ML: {total_bruto}")
-    if item_lines:
-        narration_parts.append("Detalle venta ML:")
-        narration_parts.extend([f"- {x}" for x in item_lines])
-
     move_vals = {
         "move_type": "out_invoice",
         "partner_id": partner_id,
-        "ref": f"ML-{order_id}",
+        "partner_shipping_id": partner_id,
+        "ref": str(order_id),
         "invoice_line_ids": lines,
         "l10n_latam_document_type_id": doc_type_id,
-        "narration": "\n".join(narration_parts),
-        "invoice_payment_ref": f"ML-{order_id}",
+        "invoice_payment_term_id": ODOO_PAYMENT_TERM_CONTADO_ID,
+        "narration": ODOO_STANDARD_NARRATION,
         "journal_id": journal_id,
     }
+
+    move_fields = get_move_fields(ctx)
+    move_vals = {k: v for k, v in move_vals.items() if k in move_fields}
 
     move_id = odoo_exec(ctx, "account.move", "create", [move_vals])
     odoo_exec(ctx, "account.move", "action_post", [[move_id]])
     logger.info(f"[{order_id}] ✅ Documento creado: move_id={move_id} tipo={tipo}")
-    return move_id
+    return move_id, partner_id
 
 
 # =========================
@@ -1176,7 +1185,7 @@ def autorizar_venta(oid: str):
         order = json.loads(venta["order_json"])
         billing = json.loads(venta["billing_json"])
 
-        move_id = create_document(
+        move_id, partner_id = create_document(
             order=order,
             billing_raw=billing,
             tipo=venta.get("tipo_sugerido") or "Boleta",
@@ -1190,10 +1199,11 @@ def autorizar_venta(oid: str):
             oid,
             estado="enviado",
             move_id=move_id,
+            partner_id=partner_id if partner_id else None,
             error=None,
             enviado_en=datetime.now(),
         )
-        return {"ok": True, "id": oid, "move_id": move_id}
+        return {"ok": True, "id": oid, "move_id": move_id, "partner_id": partner_id}
     except Exception as e:
         logger.error(f"[{oid}] Error al autorizar: {e}", exc_info=True)
         update_venta(oid, estado="error", error=str(e)[:500])
