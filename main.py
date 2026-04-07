@@ -28,7 +28,7 @@ app = FastAPI(title="lemulux-odoo")
 
 IVA_RATE = 1.19
 ML_DEFAULT_EMAIL = "boleta@lemulux.com"
-TOKEN_REFRESH_INTERVAL = 5 * 60 * 60  # 5 horas
+TOKEN_REFRESH_INTERVAL = 5 * 60 * 60
 DB_RETRIES = 20
 DB_RETRY_SECONDS = 3
 
@@ -57,8 +57,19 @@ def db_url_from_env() -> str:
     return db_url
 
 
+def safe_get(d: Any, *path, default=""):
+    cur = d
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+        if cur is None:
+            return default
+    return cur
+
+
 # =========================
-# BASE DE DATOS PostgreSQL
+# BASE DE DATOS
 # =========================
 
 def get_db():
@@ -93,6 +104,7 @@ def init_db():
                 """
             )
             cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS direccion TEXT")
+            cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS giro TEXT")
         conn.commit()
     logger.info("✅ Tabla ventas verificada en PostgreSQL")
 
@@ -106,13 +118,21 @@ def wait_for_db():
             return True
         except Exception as e:
             last_error = e
-            logger.warning(f"⏳ PostgreSQL no disponible (intento {attempt}/{DB_RETRIES}): {e}")
+            logger.warning(f"⏳ PostgreSQL no disponible ({attempt}/{DB_RETRIES}): {e}")
             time.sleep(DB_RETRY_SECONDS)
     raise RuntimeError(f"No se pudo inicializar PostgreSQL: {last_error}")
 
 
-def save_venta(order: dict, billing: dict, tipo_sugerido: str,
-               cliente: str, rut: str, giro: str, direccion: str, email: str = ""):
+def save_venta(
+    order: dict,
+    billing: dict,
+    tipo_sugerido: str,
+    cliente: str,
+    rut: str,
+    giro: str,
+    direccion: str,
+    email: str = "",
+):
     oid = str(order["id"])
     email_final = (email or ML_DEFAULT_EMAIL).strip()
     rut_final = normalize_rut(rut)
@@ -122,7 +142,7 @@ def save_venta(order: dict, billing: dict, tipo_sugerido: str,
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, estado, move_id FROM ventas WHERE id = %s", (oid,))
+            cur.execute("SELECT id FROM ventas WHERE id = %s", (oid,))
             existing = cur.fetchone()
 
             if existing:
@@ -152,7 +172,7 @@ def save_venta(order: dict, billing: dict, tipo_sugerido: str,
                     ),
                 )
                 conn.commit()
-                logger.info(f"[{oid}] Venta actualizada → dirección='{direccion_final or 'sin dirección'}'")
+                logger.info(f"[{oid}] Venta actualizada")
                 return
 
             cur.execute(
@@ -174,7 +194,7 @@ def save_venta(order: dict, billing: dict, tipo_sugerido: str,
                 ),
             )
         conn.commit()
-    logger.info(f"[{oid}] Guardada → tipo={tipo_sugerido} rut={rut_final or 'sin RUT'} cliente={cliente_final} dirección='{direccion_final or 'sin dirección'}'")
+    logger.info(f"[{oid}] Guardada → tipo={tipo_sugerido} rut={rut_final or 'sin RUT'} cliente={cliente_final}")
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
@@ -221,7 +241,7 @@ class VentaUpdate(BaseModel):
 
 
 # =========================
-# EXTRACCIÓN BILLING MLC
+# EXTRACCIÓN ML
 # =========================
 
 def get_billing_info(billing_response: dict) -> dict:
@@ -233,68 +253,115 @@ def get_billing_info(billing_response: dict) -> dict:
 
 
 def extract_rut(billing_info: dict) -> str:
-    identification = billing_info.get("identification") or {}
-    number = identification.get("number", "")
+    number = safe_get(billing_info, "identification", "number", default="")
     if number:
         return normalize_rut(str(number))
 
     for item in billing_info.get("additional_info") or []:
-        if item.get("type") in ("DOC_NUMBER", "RUT"):
+        item_type = (item.get("type") or "").upper()
+        if item_type in ("DOC_NUMBER", "RUT", "DOCUMENT_NUMBER"):
             return normalize_rut(str(item.get("value", "")))
+
+    for key in ("rut", "vat", "doc_number", "document_number"):
+        val = billing_info.get(key)
+        if val:
+            return normalize_rut(str(val))
+
     return ""
 
 
-def extract_name(billing_info: dict, buyer: dict) -> str:
-    name = billing_info.get("name", "").strip()
-    last_name = billing_info.get("last_name", "").strip()
+def extract_name(billing_info: dict, order: dict) -> str:
+    # Preferir razón social / empresa si existe
+    for key in ("business_name", "company_name", "razon_social", "social_reason", "legal_name"):
+        val = billing_info.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    taxes = billing_info.get("taxes") or {}
+    for key in ("business_name", "company_name", "legal_name"):
+        val = taxes.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    for item in billing_info.get("additional_info") or []:
+        item_type = (item.get("type") or "").upper()
+        if item_type in ("BUSINESS_NAME", "COMPANY_NAME", "RAZON_SOCIAL", "SOCIAL_REASON", "LEGAL_NAME"):
+            val = item.get("value")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+    name = (billing_info.get("name") or "").strip()
+    last_name = (billing_info.get("last_name") or "").strip()
     if name and last_name:
         return f"{name} {last_name}"
     if name:
         return name
-    return buyer.get("nickname") or buyer.get("first_name") or "Cliente ML"
+
+    buyer = order.get("buyer") or {}
+    full_name = " ".join(
+        x for x in [
+            buyer.get("first_name", "").strip(),
+            buyer.get("last_name", "").strip(),
+        ] if x
+    ).strip()
+    if full_name:
+        return full_name
+
+    return buyer.get("nickname") or "Cliente ML"
 
 
-def extract_activity(billing_info: dict) -> str:
+def extract_activity(billing_info: dict, order: dict) -> str:
     taxes = billing_info.get("taxes") or {}
-    return taxes.get("economic_activity", "").strip()
+    for key in ("economic_activity", "activity", "giro", "business_activity"):
+        val = taxes.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    for key in ("economic_activity", "activity", "giro", "business_activity"):
+        val = billing_info.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    for item in billing_info.get("additional_info") or []:
+        item_type = (item.get("type") or "").upper()
+        if item_type in ("ECONOMIC_ACTIVITY", "ACTIVITY", "GIRO", "BUSINESS_ACTIVITY"):
+            val = item.get("value")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+    # fallback desde order si viniera
+    buyer = order.get("buyer") or {}
+    for key in ("giro", "economic_activity", "activity"):
+        val = buyer.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    return ""
 
 
-def extract_email(billing_info: dict, buyer: dict) -> str:
+def extract_email(billing_info: dict, order: dict) -> str:
     email = (billing_info.get("email") or "").strip()
     if email:
         return email
-    buyer_email = (buyer.get("email") or "").strip() if isinstance(buyer, dict) else ""
+    buyer = order.get("buyer") or {}
+    buyer_email = (buyer.get("email") or "").strip()
     if buyer_email:
         return buyer_email
     return ML_DEFAULT_EMAIL
 
 
-def extract_direccion(billing_info: dict) -> str:
-    address = billing_info.get("address") or {}
-
-    if not address:
-        for item in billing_info.get("additional_info") or []:
-            item_type = (item.get("type") or "").upper()
-            if item_type in ("ADDRESS", "BILLING_ADDRESS"):
-                value = item.get("value")
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-                if isinstance(value, dict):
-                    address = value
-                    break
-
-    if not address:
+def format_address_dict(address: dict) -> str:
+    if not isinstance(address, dict) or not address:
         return ""
 
     parts = []
-    street = address.get("street_name", "")
+    street = address.get("street_name", "") or address.get("address_line", "")
     number = address.get("street_number", "")
     comment = address.get("comment", "")
-    municipality = address.get("municipality_name", "")
-    city = address.get("city_name", "")
+    municipality = address.get("municipality_name", "") or safe_get(address, "municipality", "name", default="")
+    city = address.get("city_name", "") or safe_get(address, "city", "name", default="")
+    state = address.get("state_name", "") or safe_get(address, "state", "name", default="")
     zip_code = address.get("zip_code", "")
-    state_obj = address.get("state", {})
-    state = state_obj.get("name", "") if isinstance(state_obj, dict) else ""
 
     if street:
         parts.append(f"{street} {number}".strip())
@@ -312,13 +379,59 @@ def extract_direccion(billing_info: dict) -> str:
     return ", ".join(filter(None, parts))
 
 
-def detect_tipo(billing_info: dict) -> str:
-    attributes = billing_info.get("attributes") or {}
-    cust_type = attributes.get("cust_type", "").upper()
+def extract_direccion(order: dict, billing_info: dict) -> str:
+    # 1) billing_info.address
+    direccion = format_address_dict(billing_info.get("address") or {})
+    if direccion:
+        return direccion
+
+    # 2) additional_info con address/billing address
+    for item in billing_info.get("additional_info") or []:
+        item_type = (item.get("type") or "").upper()
+        if item_type in ("ADDRESS", "BILLING_ADDRESS"):
+            value = item.get("value")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):
+                direccion = format_address_dict(value)
+                if direccion:
+                    return direccion
+
+    # 3) buyer.address
+    buyer = order.get("buyer") or {}
+    direccion = format_address_dict(buyer.get("address") or {})
+    if direccion:
+        return direccion
+
+    # 4) shipping.receiver_address
+    shipping = order.get("shipping") or {}
+    direccion = format_address_dict(shipping.get("receiver_address") or {})
+    if direccion:
+        return direccion
+
+    return ""
+
+
+def detect_tipo(order: dict, billing_info: dict) -> str:
+    cust_type = (safe_get(billing_info, "attributes", "cust_type", default="") or "").upper()
     if cust_type == "BU":
         return "Factura"
-    if extract_activity(billing_info):
+
+    if extract_activity(billing_info, order):
         return "Factura"
+
+    # heurística empresa / negocio
+    for key in ("business_name", "company_name", "razon_social", "social_reason", "legal_name"):
+        val = billing_info.get(key)
+        if isinstance(val, str) and val.strip():
+            return "Factura"
+
+    taxes = billing_info.get("taxes") or {}
+    for key in ("business_name", "company_name", "legal_name"):
+        val = taxes.get(key)
+        if isinstance(val, str) and val.strip():
+            return "Factura"
+
     return "Boleta"
 
 
@@ -431,7 +544,7 @@ def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
             ctx,
             "account.journal",
             "search",
-            [[["type", "=", "sale"], ["name", "=", "Facturas de cliente"]]],
+            [[[ "type", "=", "sale" ], [ "name", "=", "Facturas de cliente" ]]],
             {"limit": 1},
         )
     else:
@@ -439,19 +552,19 @@ def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
             ctx,
             "account.journal",
             "search",
-            [[["type", "=", "sale"], ["name", "ilike", "Boleta"]]],
+            [[[ "type", "=", "sale" ], [ "name", "ilike", "Boleta" ]]],
             {"limit": 1},
         )
     return ids[0] if ids else None
 
 
 def get_chile_country_id(ctx: OdooCtx) -> Optional[int]:
-    ids = odoo_exec(ctx, "res.country", "search", [[["code", "=", "CL"]]], {"limit": 1})
+    ids = odoo_exec(ctx, "res.country", "search", [[[ "code", "=", "CL" ]]], {"limit": 1})
     return ids[0] if ids else None
 
 
 def get_rut_id_type(ctx: OdooCtx) -> Optional[int]:
-    ids = odoo_exec(ctx, "l10n_latam.identification.type", "search", [[["name", "ilike", "RUT"]]], {"limit": 1})
+    ids = odoo_exec(ctx, "l10n_latam.identification.type", "search", [[[ "name", "ilike", "RUT" ]]], {"limit": 1})
     return ids[0] if ids else None
 
 
@@ -460,7 +573,7 @@ def get_tax_19(ctx: OdooCtx) -> Optional[int]:
         ctx,
         "account.tax",
         "search",
-        [[["type_tax_use", "=", "sale"], ["amount", "=", 19], ["active", "=", True]]],
+        [[[ "type_tax_use", "=", "sale" ], [ "amount", "=", 19 ], [ "active", "=", True ]]],
         {"limit": 1},
     )
     return ids[0] if ids else None
@@ -474,14 +587,13 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
     if len(rut_norm) > 1:
         variantes.append(rut_norm[:-1] + "-" + rut_norm[-1])
     for variante in variantes:
-        ids = odoo_exec(ctx, "res.partner", "search", [[["vat", "=", variante]]], {"limit": 1})
+        ids = odoo_exec(ctx, "res.partner", "search", [[[ "vat", "=", variante ]]], {"limit": 1})
         if ids:
             return ids[0]
     return None
 
 
-def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str,
-                          giro: str, direccion: str, es_empresa: bool) -> int:
+def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str, giro: str, direccion: str, es_empresa: bool) -> int:
     taxpayer_type = "1" if es_empresa else "4"
     chile_id = get_chile_country_id(ctx)
     rut_type_id = get_rut_id_type(ctx)
@@ -524,16 +636,22 @@ def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
         ctx,
         "account.move",
         "search",
-        [[["ref", "=", f"ML-{order_id}"], ["state", "in", ["draft", "posted", "cancel"]]]],
+        [[[ "ref", "=", f"ML-{order_id}" ], [ "state", "in", [ "draft", "posted", "cancel" ] ]]],
         {"limit": 1},
     )
     return ids[0] if ids else None
 
 
-def create_document(order: dict, billing_raw: dict, tipo: str, email: str, giro: str,
-                    cliente_override: Optional[str] = None,
-                    rut_override: Optional[str] = None,
-                    direccion_override: Optional[str] = None) -> int:
+def create_document(
+    order: dict,
+    billing_raw: dict,
+    tipo: str,
+    email: str,
+    giro: str,
+    cliente_override: Optional[str] = None,
+    rut_override: Optional[str] = None,
+    direccion_override: Optional[str] = None,
+) -> int:
     ctx = odoo_connect()
     order_id = str(order["id"])
 
@@ -544,8 +662,8 @@ def create_document(order: dict, billing_raw: dict, tipo: str, email: str, giro:
 
     billing_info = get_billing_info(billing_raw)
     rut = normalize_rut(rut_override) if rut_override else extract_rut(billing_info)
-    nombre = (cliente_override or extract_name(billing_info, order.get("buyer", {})) or "Cliente ML").strip()
-    direccion = (direccion_override or extract_direccion(billing_info) or "").strip()
+    nombre = (cliente_override or extract_name(billing_info, order) or "Cliente ML").strip()
+    direccion = (direccion_override or extract_direccion(order, billing_info) or "").strip()
     email = (email or ML_DEFAULT_EMAIL).strip()
     giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
@@ -606,15 +724,14 @@ def process_webhook_order(order_id: str):
         billing_info = get_billing_info(billing_raw)
 
         rut = extract_rut(billing_info)
-        cliente = extract_name(billing_info, order.get("buyer", {}))
-        giro = extract_activity(billing_info)
-        direccion = extract_direccion(billing_info)
-        email = extract_email(billing_info, order.get("buyer", {}))
-        tipo_sugerido = detect_tipo(billing_info)
+        cliente = extract_name(billing_info, order)
+        giro = extract_activity(billing_info, order)
+        direccion = extract_direccion(order, billing_info)
+        email = extract_email(billing_info, order)
+        tipo_sugerido = detect_tipo(order, billing_info)
 
         save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email)
-        logger.info(f"[{order_id}] ✅ Guardada/actualizada en bandeja: {tipo_sugerido} dirección='{direccion or 'sin dirección'}'")
-
+        logger.info(f"[{order_id}] ✅ Guardada/actualizada: {tipo_sugerido} dirección='{direccion or 'sin dirección'}' giro='{giro or 'sin giro'}'")
     except Exception as e:
         logger.error(f"[{order_id}] Error procesando webhook: {e}", exc_info=True)
 
@@ -628,11 +745,11 @@ def reprocesar_venta_desde_ml(order_id: str):
     billing_info = get_billing_info(billing_raw)
 
     rut = extract_rut(billing_info)
-    cliente = extract_name(billing_info, order.get("buyer", {}))
-    giro = extract_activity(billing_info)
-    direccion = extract_direccion(billing_info)
-    email = extract_email(billing_info, order.get("buyer", {}))
-    tipo_sugerido = detect_tipo(billing_info)
+    cliente = extract_name(billing_info, order)
+    giro = extract_activity(billing_info, order)
+    direccion = extract_direccion(order, billing_info)
+    email = extract_email(billing_info, order)
+    tipo_sugerido = detect_tipo(order, billing_info)
 
     save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email)
 
@@ -660,7 +777,7 @@ async def on_startup():
 
 
 # =========================
-# ENDPOINTS BASE
+# ENDPOINTS
 # =========================
 
 @app.get("/")
@@ -680,10 +797,6 @@ def health():
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
 
-# =========================
-# WEBHOOK ML
-# =========================
-
 @app.post("/ml/webhook")
 async def ml_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
@@ -693,7 +806,6 @@ async def ml_webhook(request: Request, background_tasks: BackgroundTasks):
 
     topic = body.get("topic", "")
     resource = body.get("resource", "")
-
     if topic != "orders_v2" or not resource:
         return {"ok": True, "ignored": True}
 
@@ -725,19 +837,13 @@ async def oauth_callback(request: Request):
             os.environ["ML_ACCESS_TOKEN"] = data["access_token"]
         if data.get("refresh_token"):
             os.environ["ML_REFRESH_TOKEN"] = data["refresh_token"]
-        logger.info("✅ Tokens OAuth guardados en memoria")
     return JSONResponse(status_code=res.status_code, content={"status_code": res.status_code, "response": data})
 
 
 @app.post("/ml/refresh-token")
 def manual_refresh():
-    ok = refresh_ml_token()
-    return {"ok": ok}
+    return {"ok": refresh_ml_token()}
 
-
-# =========================
-# API VENTAS
-# =========================
 
 @app.get("/ventas")
 def ventas(estado: Optional[str] = None):
@@ -773,7 +879,6 @@ def reprocesar_venta(oid: str):
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
-
     try:
         data = reprocesar_venta_desde_ml(str(oid))
         return {"ok": True, "id": oid, "data": data}
@@ -812,7 +917,6 @@ def autorizar_venta(oid: str):
             enviado_en=datetime.now(),
         )
         return {"ok": True, "id": oid, "move_id": move_id}
-
     except Exception as e:
         logger.error(f"[{oid}] Error al autorizar: {e}", exc_info=True)
         update_venta(oid, estado="error", error=str(e)[:500])
@@ -820,7 +924,7 @@ def autorizar_venta(oid: str):
 
 
 # =========================
-# DASHBOARD WEB
+# DASHBOARD
 # =========================
 
 @app.get("/ui", response_class=HTMLResponse)
@@ -850,7 +954,6 @@ def ui_bandeja():
     button.secondary { background: var(--panel2); border: 1px solid var(--border); }
     button.success { background: var(--ok); color: #052e16; }
     button.warn { background: var(--warn); color: #3b2300; }
-    button.danger { background: var(--bad); color: white; }
     .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
     .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }
     .card h3 { margin: 0 0 6px 0; font-size: 13px; color: var(--muted); font-weight: 600; }
@@ -951,7 +1054,7 @@ def ui_bandeja():
         <input id='editCliente'>
       </div>
       <div class='full'>
-        <label>Dirección de facturación</label>
+        <label>Dirección</label>
         <input id='editDireccion'>
       </div>
       <div class='full' id='giroGroup' style='display:none'>
@@ -979,9 +1082,7 @@ function badge(estado) {
 
 function safe(v) { return v == null || v === '' ? '—' : String(v); }
 
-function copyId(id) {
-  navigator.clipboard.writeText(String(id));
-}
+function copyId(id) { navigator.clipboard.writeText(String(id)); }
 
 function updateStats(items) {
   document.getElementById('cTotal').textContent = items.length;
@@ -995,7 +1096,7 @@ function filteredVentas() {
   const s = document.getElementById('statusFilter').value;
   return ventas.filter(v => {
     const okS = !s || v.estado === s;
-    const okQ = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion].filter(Boolean).join(' ').toLowerCase().includes(q);
+    const okQ = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase().includes(q);
     return okS && okQ;
   });
 }
@@ -1015,7 +1116,7 @@ function renderTable() {
         <th>Fecha / ID ML</th>
         <th>Cliente / Razón social</th>
         <th>RUT</th>
-        <th>Dirección facturación</th>
+        <th>Dirección</th>
         <th>Tipo</th>
         <th>Estado</th>
         <th>Move ID</th>
@@ -1029,7 +1130,11 @@ function renderTable() {
               <div class='small'>${safe(v.id)}</div>
               <div class='small'><a href='#' class='link' onclick='copyId("${String(v.id).replace(/"/g, '&quot;')}"); return false;'>Copiar ID</a></div>
             </td>
-            <td><strong>${safe(v.cliente)}</strong><div class='small'>${safe(v.email)}</div></td>
+            <td>
+              <strong>${safe(v.cliente)}</strong>
+              <div class='small'>${safe(v.email)}</div>
+              ${v.giro ? `<div class='small'>${safe(v.giro)}</div>` : ''}
+            </td>
             <td>${safe(v.rut)}</td>
             <td>${safe(v.direccion)}</td>
             <td>${safe(v.tipo_sugerido)}</td>
@@ -1064,11 +1169,8 @@ async function autorizar(id) {
   if (!confirm(`¿Autorizar la venta ${id} y enviarla a Odoo?`)) return;
   const res = await fetch(`/ventas/${id}/autorizar`, { method: 'POST' });
   const data = await res.json().catch(() => ({}));
-  if (res.ok) {
-    alert(`✅ Documento creado en Odoo: move_id=${data.move_id}`);
-  } else {
-    alert(`❌ Error: ${data.detail || 'desconocido'}`);
-  }
+  if (res.ok) alert(`✅ Documento creado en Odoo: move_id=${data.move_id}`);
+  else alert(`❌ Error: ${data.detail || 'desconocido'}`);
   await refreshData();
 }
 
@@ -1091,7 +1193,8 @@ async function autorizarTodas() {
 }
 
 function toggleGiro() {
-  document.getElementById('giroGroup').style.display = document.getElementById('editTipo').value === 'Factura' ? 'block' : 'none';
+  document.getElementById('giroGroup').style.display =
+    document.getElementById('editTipo').value === 'Factura' ? 'block' : 'none';
 }
 
 function openEdit(id) {
@@ -1116,7 +1219,7 @@ function closeModal() {
 }
 
 async function saveEdit() {
-  if (!currentId) return;
+  if (!currentId) return false;
   const tipo = document.getElementById('editTipo').value;
   const payload = {
     tipo_sugerido: tipo,
@@ -1153,10 +1256,7 @@ async function reprocesar(id) {
   }
   alert('✅ Venta reprocesada desde Mercado Libre');
   await refreshData();
-
-  if (currentId && String(currentId) === String(id)) {
-    openEdit(id);
-  }
+  if (currentId && String(currentId) === String(id)) openEdit(id);
 }
 
 async function reprocesarActual() {
