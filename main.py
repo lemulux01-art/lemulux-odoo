@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 import os
@@ -10,6 +10,7 @@ import xmlrpc.client
 import psycopg2
 import psycopg2.extras
 import json
+from datetime import datetime
 from typing import Optional, Any
 from dataclasses import dataclass
 
@@ -71,8 +72,7 @@ def get_db():
 def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS ventas (
                     id TEXT PRIMARY KEY,
                     cliente TEXT,
@@ -89,8 +89,7 @@ def init_db():
                     creado_en TIMESTAMP DEFAULT NOW(),
                     enviado_en TIMESTAMP
                 )
-                """
-            )
+            """)
             cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS direccion TEXT")
         conn.commit()
     logger.info("✅ Tabla ventas verificada en PostgreSQL")
@@ -105,9 +104,7 @@ def wait_for_db():
             return True
         except Exception as e:
             last_error = e
-            logger.warning(
-                f"⏳ PostgreSQL no disponible (intento {attempt}/{DB_RETRIES}): {e}"
-            )
+            logger.warning(f"⏳ PostgreSQL no disponible (intento {attempt}/{DB_RETRIES}): {e}")
             time.sleep(DB_RETRY_SECONDS)
     raise RuntimeError(f"No se pudo inicializar PostgreSQL: {last_error}")
 
@@ -121,24 +118,12 @@ def save_venta(order: dict, billing: dict, tipo_sugerido: str,
             if cur.fetchone():
                 logger.info(f"[{oid}] Venta ya existe en bandeja")
                 return
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO ventas
                     (id, cliente, rut, email, giro, direccion, tipo_sugerido, estado, order_json, billing_json)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s)
-                """,
-                (
-                    oid,
-                    cliente,
-                    rut,
-                    ML_DEFAULT_EMAIL,
-                    giro,
-                    direccion,
-                    tipo_sugerido,
-                    json.dumps(order),
-                    json.dumps(billing),
-                ),
-            )
+            """, (oid, cliente, rut, ML_DEFAULT_EMAIL, giro, direccion,
+                  tipo_sugerido, json.dumps(order), json.dumps(billing)))
         conn.commit()
     logger.info(f"[{oid}] Guardada → tipo={tipo_sugerido} rut={rut or 'sin RUT'} cliente={cliente}")
 
@@ -191,19 +176,20 @@ class VentaUpdate(BaseModel):
 # =========================
 
 def get_billing_info(billing_response: dict) -> dict:
+    """Extrae el billing_info real de la respuesta de ML Chile."""
     if "buyer" in billing_response:
         return billing_response["buyer"].get("billing_info", {}) or {}
     if "billing_info" in billing_response:
         return billing_response["billing_info"] or {}
-    return billing_response
+    return billing_response or {}
 
 
 def extract_rut(billing_info: dict) -> str:
+    """RUT viene en identification.number para MLC."""
     identification = billing_info.get("identification") or {}
     number = identification.get("number", "")
     if number:
         return normalize_rut(str(number))
-
     for item in billing_info.get("additional_info") or []:
         if item.get("type") in ("DOC_NUMBER", "RUT"):
             return normalize_rut(str(item.get("value", "")))
@@ -229,14 +215,13 @@ def extract_direccion(billing_info: dict) -> str:
     address = billing_info.get("address") or {}
     if not address:
         return ""
-
     parts = []
     street = address.get("street_name", "")
     number = address.get("street_number", "")
     comment = address.get("comment", "")
     city = address.get("city_name", "")
-    state = address.get("state", {}).get("name", "") if isinstance(address.get("state"), dict) else ""
-
+    state_obj = address.get("state", {})
+    state = state_obj.get("name", "") if isinstance(state_obj, dict) else ""
     if street:
         parts.append(f"{street} {number}".strip())
     if comment:
@@ -245,7 +230,6 @@ def extract_direccion(billing_info: dict) -> str:
         parts.append(city)
     if state:
         parts.append(state)
-
     return ", ".join(filter(None, parts))
 
 
@@ -275,7 +259,8 @@ def refresh_ml_token() -> bool:
             "client_secret": get_env("ML_CLIENT_SECRET"),
             "refresh_token": get_env("ML_REFRESH_TOKEN"),
         }
-        res = requests.post("https://api.mercadolibre.com/oauth/token", data=payload, timeout=30)
+        res = requests.post(
+            "https://api.mercadolibre.com/oauth/token", data=payload, timeout=30)
         res.raise_for_status()
         data = res.json()
         if data.get("access_token"):
@@ -298,21 +283,31 @@ def schedule_token_refresh():
 
 def ml_get(url: str) -> dict:
     for attempt in range(6):
-        res = requests.get(url, headers=ml_headers(), timeout=30)
+        try:
+            res = requests.get(url, headers=ml_headers(), timeout=30)
+        except requests.RequestException as e:
+            logger.error(f"Error de red en {url}: {e}")
+            raise
+
         if res.status_code == 401:
             logger.warning(f"401 en {url}, renovando token...")
-            refresh_ml_token()
-            res = requests.get(url, headers=ml_headers(), timeout=30)
+            if not refresh_ml_token():
+                raise Exception("Token ML inválido y no se pudo renovar")
+            continue  # reintentar con nuevo token
+
         if res.status_code == 429:
             wait = min(5 * (attempt + 1), 30)
             logger.warning(f"429 en {url}, reintento en {wait}s")
             time.sleep(wait)
             continue
+
         if res.status_code == 404:
             return {}
+
         res.raise_for_status()
         return res.json()
-    raise Exception(f"ML devolvió 429 demasiadas veces: {url}")
+
+    raise Exception(f"ML devolvió demasiados errores para {url}")
 
 
 def get_ml_order(order_id: str) -> dict:
@@ -348,17 +343,18 @@ def odoo_connect() -> OdooCtx:
     return OdooCtx(db, uid, key, models)
 
 
-def odoo_exec(ctx: OdooCtx, model: str, method: str, args: list, kwargs: dict | None = None) -> Any:
-    return ctx.models.execute_kw(ctx.db, ctx.uid, ctx.password, model, method, args, kwargs or {})
+def odoo_exec(ctx: OdooCtx, model: str, method: str, args: list, kwargs: dict = None) -> Any:
+    return ctx.models.execute_kw(
+        ctx.db, ctx.uid, ctx.password, model, method, args, kwargs or {})
 
 
 def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
     if tipo == "Factura":
-        ids = odoo_exec(ctx, "account.journal", "search", [[[
-            "type", "=", "sale"], ["name", "=", "Facturas de cliente"]]], {"limit": 1})
+        ids = odoo_exec(ctx, "account.journal", "search",
+            [[["type", "=", "sale"], ["name", "=", "Facturas de cliente"]]], {"limit": 1})
     else:
-        ids = odoo_exec(ctx, "account.journal", "search", [[[
-            "type", "=", "sale"], ["name", "ilike", "Boleta"]]], {"limit": 1})
+        ids = odoo_exec(ctx, "account.journal", "search",
+            [[["type", "=", "sale"], ["name", "ilike", "Boleta"]]], {"limit": 1})
     return ids[0] if ids else None
 
 
@@ -368,18 +364,15 @@ def get_chile_country_id(ctx: OdooCtx) -> Optional[int]:
 
 
 def get_rut_id_type(ctx: OdooCtx) -> Optional[int]:
-    ids = odoo_exec(ctx, "l10n_latam.identification.type", "search", [[["name", "ilike", "RUT"]]], {"limit": 1})
+    ids = odoo_exec(ctx, "l10n_latam.identification.type", "search",
+        [[["name", "ilike", "RUT"]]], {"limit": 1})
     return ids[0] if ids else None
 
 
 def get_tax_19(ctx: OdooCtx) -> Optional[int]:
-    ids = odoo_exec(
-        ctx,
-        "account.tax",
-        "search",
+    ids = odoo_exec(ctx, "account.tax", "search",
         [[["type_tax_use", "=", "sale"], ["amount", "=", 19], ["active", "=", True]]],
-        {"limit": 1},
-    )
+        {"limit": 1})
     return ids[0] if ids else None
 
 
@@ -391,88 +384,44 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
     if len(rut_norm) > 1:
         variantes.append(rut_norm[:-1] + "-" + rut_norm[-1])
     for variante in variantes:
-        ids = odoo_exec(ctx, "res.partner", "search", [[["vat", "=", variante]]], {"limit": 1})
+        ids = odoo_exec(ctx, "res.partner", "search",
+            [[["vat", "=", variante]]], {"limit": 1})
         if ids:
             return ids[0]
     return None
 
 
 def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str,
-                          giro: str, direccion: str, es_empresa: bool) -> int:
-    partner_id = find_partner_by_rut(ctx, rut)
+                           giro: str, direccion: str, es_empresa: bool) -> int:
     taxpayer_type = "1" if es_empresa else "4"
-
-    if partner_id:
-        vals = {
-            "name": nombre,
-            "vat": rut or False,
-            "email": email,
-            "l10n_cl_dte_email": email,
-            "country_id": get_chile_country_id(ctx),
-            "l10n_cl_sii_taxpayer_type": taxpayer_type,
-            "company_type": "company" if es_empresa else "person",
-            "is_company": es_empresa,
-        }
-        if direccion:
-            vals["street"] = direccion
-        if es_empresa and giro:
-            vals["x_giro"] = giro
-        rut_type_id = get_rut_id_type(ctx)
-        if rut and rut_type_id:
-            vals["l10n_latam_identification_type_id"] = rut_type_id
-        odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
-        logger.info(f"Partner actualizado: id={partner_id} empresa={es_empresa}")
-        return partner_id
-
     chile_id = get_chile_country_id(ctx)
     rut_type_id = get_rut_id_type(ctx)
 
-    vals = {
+    base_vals = {
         "name": nombre,
         "vat": rut or False,
         "email": email,
         "l10n_cl_dte_email": email,
-        "customer_rank": 1,
-        "company_type": "company" if es_empresa else "person",
-        "is_company": es_empresa,
         "country_id": chile_id,
         "l10n_cl_sii_taxpayer_type": taxpayer_type,
-    }
-
-    if direccion:
-        vals["street"] = direccion
-    if es_empresa and giro:
-        vals["x_giro"] = giro
-    if rut and rut_type_id:
-        vals["l10n_latam_identification_type_id"] = rut_type_id
-
-    partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
-    logger.info(f"Partner creado: id={partner_id} empresa={es_empresa}")
-    return partner_id
-
-    chile_id = get_chile_country_id(ctx)
-    rut_type_id = get_rut_id_type(ctx)
-
-    vals = {
-        "name": nombre,
-        "vat": rut or False,
-        "email": email,
-        "l10n_cl_dte_email": email,
-        "customer_rank": 1,
         "company_type": "company" if es_empresa else "person",
         "is_company": es_empresa,
-        "country_id": chile_id,
-        "l10n_cl_sii_taxpayer_type": "1" if es_empresa else "4",
     }
-
     if direccion:
-        vals["street"] = direccion
+        base_vals["street"] = direccion
     if es_empresa and giro:
-        vals["x_giro"] = giro
+        base_vals["x_giro"] = giro
     if rut and rut_type_id:
-        vals["l10n_latam_identification_type_id"] = rut_type_id
+        base_vals["l10n_latam_identification_type_id"] = rut_type_id
 
-    partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
+    partner_id = find_partner_by_rut(ctx, rut)
+    if partner_id:
+        odoo_exec(ctx, "res.partner", "write", [[partner_id], base_vals])
+        logger.info(f"Partner actualizado: id={partner_id}")
+        return partner_id
+
+    base_vals["customer_rank"] = 1
+    partner_id = odoo_exec(ctx, "res.partner", "create", [base_vals])
     logger.info(f"Partner creado: id={partner_id} empresa={es_empresa}")
     return partner_id
 
@@ -482,13 +431,10 @@ def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str,
 # =========================
 
 def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
-    ids = odoo_exec(
-        ctx,
-        "account.move",
-        "search",
-        [[["ref", "=", f"ML-{order_id}"], ["state", "in", ["draft", "posted", "cancel"]]]],
-        {"limit": 1},
-    )
+    ids = odoo_exec(ctx, "account.move", "search",
+        [[["ref", "=", f"ML-{order_id}"],
+          ["state", "in", ["draft", "posted", "cancel"]]]],
+        {"limit": 1})
     return ids[0] if ids else None
 
 
@@ -512,10 +458,14 @@ def create_document(order: dict, billing_raw: dict, tipo: str, email: str, giro:
     giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
 
-    partner_id = get_or_create_partner(ctx, nombre, rut, email, giro, direccion, es_empresa)
+    partner_id = get_or_create_partner(
+        ctx, nombre, rut, email, giro, direccion, es_empresa)
 
     journal_id = get_journal(ctx, tipo)
-    doc_type_id = int(get_env("ODOO_DOC_TYPE_FACTURA_ID")) if tipo == "Factura" else int(get_env("ODOO_DOC_TYPE_BOLETA_ID"))
+    doc_type_id = (
+        int(get_env("ODOO_DOC_TYPE_FACTURA_ID")) if tipo == "Factura"
+        else int(get_env("ODOO_DOC_TYPE_BOLETA_ID"))
+    )
     tax_id = get_tax_19(ctx)
 
     lines = []
@@ -547,6 +497,38 @@ def create_document(order: dict, billing_raw: dict, tipo: str, email: str, giro:
     odoo_exec(ctx, "account.move", "action_post", [[move_id]])
     logger.info(f"[{order_id}] ✅ Documento creado: move_id={move_id} tipo={tipo}")
     return move_id
+
+
+# =========================
+# PROCESAMIENTO WEBHOOK (background)
+# =========================
+
+def process_webhook_order(order_id: str):
+    """Corre en background para no bloquear la respuesta al webhook de ML."""
+    try:
+        order = get_ml_order(order_id)
+        if not order:
+            logger.warning(f"[{order_id}] Orden no encontrada en ML")
+            return
+
+        if order.get("status") != "paid":
+            logger.info(f"[{order_id}] Orden no pagada: {order.get('status')}")
+            return
+
+        billing_raw = get_ml_billing_raw(order_id)
+        billing_info = get_billing_info(billing_raw)
+
+        rut = extract_rut(billing_info)
+        cliente = extract_name(billing_info, order.get("buyer", {}))
+        giro = extract_activity(billing_info)
+        direccion = extract_direccion(billing_info)
+        tipo_sugerido = detect_tipo(billing_info)
+
+        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion)
+        logger.info(f"[{order_id}] ✅ Guardada en bandeja: {tipo_sugerido}")
+
+    except Exception as e:
+        logger.error(f"[{order_id}] Error procesando webhook: {e}", exc_info=True)
 
 
 # =========================
@@ -582,6 +564,76 @@ def health():
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
 
+# =========================
+# WEBHOOK ML
+# =========================
+
+@app.post("/ml/webhook")
+async def ml_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Responde 200 inmediatamente y procesa en background.
+    Esto evita que ML reintente por timeout y evita 429 por procesamiento síncrono.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Body inválido"})
+
+    topic = body.get("topic", "")
+    resource = body.get("resource", "")
+
+    if topic != "orders_v2" or not resource:
+        return {"ok": True, "ignored": True}
+
+    order_id = resource.strip("/").split("/")[-1]
+    if not order_id:
+        return {"ok": True}
+
+    # Responde 200 de inmediato — procesa en background
+    background_tasks.add_task(process_webhook_order, order_id)
+    return {"ok": True, "order_id": order_id}
+
+
+# =========================
+# OAUTH ML
+# =========================
+
+@app.get("/ml/oauth/callback")
+async def oauth_callback(request: Request):
+    code = request.query_params.get("code")
+    if not code:
+        raise HTTPException(status_code=400, detail="No se recibió code")
+
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": get_env("ML_CLIENT_ID"),
+        "client_secret": get_env("ML_CLIENT_SECRET"),
+        "code": code,
+        "redirect_uri": get_env("ML_REDIRECT_URI"),
+    }
+    res = requests.post("https://api.mercadolibre.com/oauth/token", data=payload, timeout=30)
+    data = res.json()
+    if res.status_code == 200:
+        if data.get("access_token"):
+            os.environ["ML_ACCESS_TOKEN"] = data["access_token"]
+        if data.get("refresh_token"):
+            os.environ["ML_REFRESH_TOKEN"] = data["refresh_token"]
+        logger.info("✅ Tokens OAuth guardados en memoria")
+    return JSONResponse(
+        status_code=res.status_code,
+        content={"status_code": res.status_code, "response": data})
+
+
+@app.post("/ml/refresh-token")
+def manual_refresh():
+    ok = refresh_ml_token()
+    return {"ok": ok}
+
+
+# =========================
+# API VENTAS (bandeja)
+# =========================
+
 @app.get("/ventas")
 def ventas(estado: Optional[str] = None):
     return {"items": list_ventas(estado)}
@@ -600,12 +652,11 @@ def actualizar_venta(oid: str, payload: VentaUpdate):
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
-
     updates = {k: v for k, v in payload.dict().items() if v is not None}
     if "rut" in updates:
         updates["rut"] = normalize_rut(updates["rut"])
     if "tipo_sugerido" in updates and updates["tipo_sugerido"] not in ["Boleta", "Factura"]:
-        raise HTTPException(status_code=400, detail="tipo_sugerido inválido")
+        raise HTTPException(status_code=400, detail="tipo_sugerido debe ser Boleta o Factura")
     update_venta(oid, **updates)
     return {"ok": True, "id": oid, "updated": updates}
 
@@ -616,546 +667,336 @@ def autorizar_venta(oid: str):
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
 
-    if venta.get("move_id"):
-        return {"ok": True, "id": oid, "move_id": venta["move_id"], "message": "Documento ya existía"}
+    if venta.get("move_id") and venta.get("estado") == "enviado":
+        return {"ok": True, "id": oid, "move_id": venta["move_id"], "message": "Ya enviada"}
 
     try:
         order = json.loads(venta["order_json"])
         billing = json.loads(venta["billing_json"])
-        tipo = venta.get("tipo_sugerido") or "Boleta"
-        email = venta.get("email") or ML_DEFAULT_EMAIL
-        giro = venta.get("giro") or ""
-        cliente = venta.get("cliente") or "Cliente ML"
-        rut = venta.get("rut") or ""
-        direccion = venta.get("direccion") or ""
 
         move_id = create_document(
-            order,
-            billing,
-            tipo,
-            email,
-            giro,
-            cliente_override=cliente,
-            rut_override=rut,
-            direccion_override=direccion,
+            order=order,
+            billing_raw=billing,
+            tipo=venta.get("tipo_sugerido") or "Boleta",
+            email=venta.get("email") or ML_DEFAULT_EMAIL,
+            giro=venta.get("giro") or "",
+            cliente_override=venta.get("cliente"),
+            rut_override=venta.get("rut"),
+            direccion_override=venta.get("direccion"),
         )
-        update_venta(oid, estado="enviado", move_id=move_id, error=None, enviado_en="NOW()")
+        update_venta(oid,
+            estado="enviado",
+            move_id=move_id,
+            error=None,
+            enviado_en=datetime.now(),
+        )
         return {"ok": True, "id": oid, "move_id": move_id}
+
     except Exception as e:
-        update_venta(oid, estado="error", error=str(e))
+        logger.error(f"[{oid}] Error al autorizar: {e}", exc_info=True)
+        update_venta(oid, estado="error", error=str(e)[:500])
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/ml/oauth/callback")
-async def oauth_callback(request: Request):
-    code = request.query_params.get("code")
-    if not code:
-        raise HTTPException(status_code=400, detail="No se recibió code")
-
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": get_env("ML_CLIENT_ID"),
-        "client_secret": get_env("ML_CLIENT_SECRET"),
-        "code": code,
-        "redirect_uri": get_env("ML_REDIRECT_URI"),
-    }
-
-    try:
-        res = requests.post("https://api.mercadolibre.com/oauth/token", data=payload, timeout=30)
-        res.raise_for_status()
-        data = res.json()
-        return HTMLResponse(f"<pre>{json.dumps(data, indent=2, ensure_ascii=False)}</pre>")
-    except requests.HTTPError:
-        detail = res.text if 'res' in locals() else 'Error desconocido'
-        raise HTTPException(status_code=400, detail=detail)
-
-
-@app.post("/ml/webhook")
-async def ml_webhook(request: Request):
-    body = await request.json()
-    logger.info(f"Webhook recibido: {body}")
-
-    resource = body.get("resource", "")
-    topic = body.get("topic", "")
-
-    if topic != "orders_v2" or not resource:
-        return {"ok": True, "ignored": True}
-
-    order_id = resource.strip("/").split("/")[-1]
-
-    try:
-        order = get_ml_order(order_id)
-        if not order:
-            return {"ok": False, "message": "Orden no encontrada en ML"}
-
-        billing_raw = get_ml_billing_raw(order_id)
-        billing_info = get_billing_info(billing_raw)
-
-        rut = extract_rut(billing_info)
-        cliente = extract_name(billing_info, order.get("buyer", {}))
-        giro = extract_activity(billing_info)
-        direccion = extract_direccion(billing_info)
-        tipo_sugerido = detect_tipo(billing_info)
-
-        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion)
-        return {"ok": True, "order_id": order_id, "tipo_sugerido": tipo_sugerido}
-    except Exception as e:
-        logger.exception(f"Error procesando webhook order_id={order_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+# =========================
+# DASHBOARD WEB
+# =========================
 
 @app.get("/ui", response_class=HTMLResponse)
 def ui_bandeja():
-    return """
-    <!doctype html>
-    <html lang='es'>
-    <head>
-      <meta charset='utf-8'>
-      <meta name='viewport' content='width=device-width, initial-scale=1'>
-      <title>Lemulux Odoo | Bandeja</title>
-      <style>
-        :root {
-          --bg: #0f172a;
-          --panel: #111827;
-          --panel-2: #1f2937;
-          --border: #334155;
-          --text: #e5e7eb;
-          --muted: #94a3b8;
-          --ok: #22c55e;
-          --warn: #f59e0b;
-          --bad: #ef4444;
-          --blue: #3b82f6;
-        }
-        * { box-sizing: border-box; }
-        body {
-          margin: 0;
-          font-family: Arial, sans-serif;
-          background: var(--bg);
-          color: var(--text);
-        }
-        .wrap {
-          max-width: 1280px;
-          margin: 0 auto;
-          padding: 24px;
-        }
-        .topbar {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          gap: 16px;
-          margin-bottom: 20px;
-          flex-wrap: wrap;
-        }
-        .title { font-size: 28px; font-weight: 700; }
-        .subtitle { color: var(--muted); margin-top: 6px; }
-        .actions { display: flex; gap: 10px; flex-wrap: wrap; }
-        button, select, input {
-          border-radius: 10px;
-          border: 1px solid var(--border);
-          background: var(--panel);
-          color: var(--text);
-          padding: 10px 12px;
-          font-size: 14px;
-        }
-        button {
-          cursor: pointer;
-          background: var(--blue);
-          border: none;
-          font-weight: 600;
-        }
-        button.secondary { background: var(--panel-2); border: 1px solid var(--border); }
-        button.success { background: var(--ok); color: #052e16; }
-        button.warn { background: var(--warn); color: #3b2300; }
-        button.danger { background: var(--bad); color: white; }
-        .grid {
-          display: grid;
-          grid-template-columns: repeat(4, minmax(0, 1fr));
-          gap: 14px;
-          margin-bottom: 18px;
-        }
-        .card {
-          background: var(--panel);
-          border: 1px solid var(--border);
-          border-radius: 16px;
-          padding: 16px;
-        }
-        .card h3 { margin: 0 0 8px 0; font-size: 14px; color: var(--muted); font-weight: 600; }
-        .card .value { font-size: 28px; font-weight: 700; }
-        .toolbar {
-          display: flex;
-          gap: 10px;
-          margin-bottom: 18px;
-          flex-wrap: wrap;
-        }
-        .toolbar input { min-width: 260px; }
-        table {
-          width: 100%;
-          border-collapse: collapse;
-          background: var(--panel);
-          border: 1px solid var(--border);
-          border-radius: 16px;
-          overflow: hidden;
-        }
-        th, td {
-          padding: 12px;
-          border-bottom: 1px solid var(--border);
-          text-align: left;
-          vertical-align: top;
-          font-size: 14px;
-        }
-        th {
-          background: #0b1220;
-          color: var(--muted);
-          font-weight: 700;
-        }
-        tr:hover td { background: rgba(255,255,255,0.02); }
-        .badge {
-          display: inline-block;
-          padding: 5px 10px;
-          border-radius: 999px;
-          font-size: 12px;
-          font-weight: 700;
-        }
-        .badge-pendiente { background: rgba(245,158,11,0.15); color: #fbbf24; }
-        .badge-enviado { background: rgba(34,197,94,0.15); color: #4ade80; }
-        .badge-error { background: rgba(239,68,68,0.15); color: #f87171; }
-        .badge-default { background: rgba(148,163,184,0.15); color: #cbd5e1; }
-        .row-actions {
-          display: flex;
-          gap: 8px;
-          flex-wrap: wrap;
-        }
-        .small { color: var(--muted); font-size: 12px; }
-        .empty {
-          text-align: center;
-          padding: 36px;
-          color: var(--muted);
-          background: var(--panel);
-          border: 1px solid var(--border);
-          border-radius: 16px;
-        }
-        .modal {
-          position: fixed;
-          inset: 0;
-          background: rgba(2,6,23,0.78);
-          display: none;
-          align-items: center;
-          justify-content: center;
-          padding: 20px;
-        }
-        .modal.open { display: flex; }
-        .modal-card {
-          width: min(680px, 100%);
-          background: var(--panel);
-          border: 1px solid var(--border);
-          border-radius: 18px;
-          padding: 20px;
-        }
-        .modal-grid {
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 12px;
-        }
-        .modal-grid .full { grid-column: 1 / -1; }
-        label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
-        .muted-link { color: #93c5fd; text-decoration: none; }
-        .footer-note { margin-top: 16px; color: var(--muted); font-size: 12px; }
-        @media (max-width: 980px) {
-          .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-          .modal-grid { grid-template-columns: 1fr; }
-        }
-        @media (max-width: 640px) {
-          .grid { grid-template-columns: 1fr; }
-          table, thead, tbody, th, td, tr { display: block; }
-          thead { display: none; }
-          tr { border-bottom: 1px solid var(--border); }
-          td { padding: 10px 12px; }
-          td::before {
-            content: attr(data-label);
-            display: block;
-            color: var(--muted);
-            font-size: 12px;
-            margin-bottom: 4px;
-          }
-        }
-      </style>
-    </head>
-    <body>
-      <div class='wrap'>
-        <div class='topbar'>
-          <div>
-            <div class='title'>Bandeja de ventas ML → Odoo</div>
-            <div class='subtitle'>Control manual de ventas antes de crear factura o boleta en Odoo.</div>
-          </div>
-          <div class='actions'>
-            <button class='secondary' onclick='refreshData()'>Actualizar</button>
-            <a class='muted-link' href='/health' target='_blank' rel='noreferrer'>Ver health</a>
-            <a class='muted-link' href='/ventas' target='_blank' rel='noreferrer'>Ver API</a>
-          </div>
-        </div>
-
-        <div class='grid'>
-          <div class='card'><h3>Total</h3><div class='value' id='totalCount'>0</div></div>
-          <div class='card'><h3>Pendientes</h3><div class='value' id='pendCount'>0</div></div>
-          <div class='card'><h3>Enviadas</h3><div class='value' id='sentCount'>0</div></div>
-          <div class='card'><h3>Con error</h3><div class='value' id='errorCount'>0</div></div>
-        </div>
-
-        <div class='toolbar'>
-          <input id='searchInput' placeholder='Buscar por ID, cliente, RUT, email o tipo' oninput='renderTable()' />
-          <select id='statusFilter' onchange='renderTable()'>
-            <option value=''>Todos los estados</option>
-            <option value='pendiente'>Pendiente</option>
-            <option value='enviado'>Enviado</option>
-            <option value='error'>Error</option>
-          </select>
-        </div>
-
-        <div id='tableWrap'></div>
-
-        <div class='footer-note'>Panel embebido en FastAPI. Si no ves datos, revisa que el webhook esté poblando la tabla <strong>ventas</strong>.</div>
-      </div>
-
-      <div class='modal' id='editModal'>
-        <div class='modal-card'>
-          <div class='topbar' style='margin-bottom:14px;'>
-            <div>
-              <div class='title' style='font-size:22px;'>Editar venta</div>
-              <div class='subtitle' id='modalSubtitle'></div>
-            </div>
-            <button class='secondary' onclick='closeModal()'>Cerrar</button>
-          </div>
-          <div class='modal-grid'>
-            <div>
-              <label>Tipo documento</label>
-              <select id='editTipo' onchange='toggleFacturaFields()'>
-                <option value='Boleta'>Boleta</option>
-                <option value='Factura'>Factura</option>
-              </select>
-            </div>
-            <div>
-              <label>Email DTE / correo</label>
-              <input id='editEmail' />
-            </div>
-            <div class='full'>
-              <label>Nombre cliente / razón social</label>
-              <input id='editCliente' />
-            </div>
-            <div>
-              <label>RUT</label>
-              <input id='editRut' />
-            </div>
-            <div>
-              <label>Dirección</label>
-              <input id='editDireccion' />
-            </div>
-            <div class='full' id='facturaFields'>
-              <label>Giro (solo factura)</label>
-              <input id='editGiro' />
-            </div>
-          </div>
-          <div class='row-actions' style='margin-top:16px;'>
-            <button onclick='saveEdit()'>Guardar cambios</button>
-            <button class='success' onclick='saveAndAuthorize()'>Guardar y autorizar</button>
-          </div>
-        </div>
-      </div>
-
-      <script>
-        let ventas = [];
-        let currentEditId = null;
-
-        function badgeClass(status) {
-          if (status === 'pendiente') return 'badge badge-pendiente';
-          if (status === 'enviado') return 'badge badge-enviado';
-          if (status === 'error') return 'badge badge-error';
-          return 'badge badge-default';
-        }
-
-        function safe(v) {
-          return v === null || v === undefined || v === '' ? '—' : String(v);
-        }
-
-        function copyId(id) {
-          try {
-            navigator.clipboard.writeText(id);
-            alert('ID copiado: ' + id);
-          } catch (e) {
-            const temp = document.createElement('input');
-            temp.value = id;
-            document.body.appendChild(temp);
-            temp.select();
-            document.execCommand('copy');
-            document.body.removeChild(temp);
-            alert('ID copiado: ' + id);
-          }
-        }
-
-        function updateStats(items) {
-          document.getElementById('totalCount').textContent = items.length;
-          document.getElementById('pendCount').textContent = items.filter(v => v.estado === 'pendiente').length;
-          document.getElementById('sentCount').textContent = items.filter(v => v.estado === 'enviado').length;
-          document.getElementById('errorCount').textContent = items.filter(v => v.estado === 'error').length;
-        }
-
-        function filteredVentas() {
-          const q = document.getElementById('searchInput').value.trim().toLowerCase();
-          const status = document.getElementById('statusFilter').value;
-          return ventas.filter(v => {
-            const hayStatus = !status || (v.estado || '') === status;
-            const hayTexto = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.giro]
-              .filter(Boolean)
-              .join(' ')
-              .toLowerCase()
-              .includes(q);
-            return hayStatus && hayTexto;
-          });
-        }
-
-        function renderTable() {
-          const items = filteredVentas();
-          updateStats(ventas);
-          const wrap = document.getElementById('tableWrap');
-          if (!items.length) {
-            wrap.innerHTML = `<div class='empty'>No hay ventas para mostrar.</div>`;
-            return;
-          }
-
-          wrap.innerHTML = `
-            <table>
-              <thead>
-                <tr>
-                  <th>ID</th>
-                  <th>Cliente / Razón social</th>
-                  <th>RUT</th>
-                  <th>Dirección</th>
-                  <th>Tipo</th>
-                  <th>Estado</th>
-                  <th>Correo</th>
-                  <th>Giro</th>
-                  <th>Move ID</th>
-                  <th>Acciones</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${items.map(v => `
-                  <tr>
-                    <td data-label='ID'>
-  <div style="display:flex; align-items:center; gap:8px;">
-    <strong style="font-size:15px;">${safe(v.id)}</strong>
-    <button class="secondary" style="padding:4px 8px; font-size:12px;" onclick="copyId('${safe(v.id)}')">Copiar</button>
+    return HTMLResponse(content="""
+<!doctype html>
+<html lang='es'>
+<head>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>Lemulux | Bandeja de ventas</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel: #111827; --panel2: #1f2937;
+      --border: #334155; --text: #e5e7eb; --muted: #94a3b8;
+      --ok: #22c55e; --warn: #f59e0b; --bad: #ef4444; --blue: #3b82f6;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, sans-serif; background: var(--bg); color: var(--text); }
+    .wrap { max-width: 1300px; margin: 0 auto; padding: 24px; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+    .title { font-size: 26px; font-weight: 700; }
+    .subtitle { color: var(--muted); margin-top: 4px; font-size: 14px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    button, select, input { border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); padding: 9px 12px; font-size: 14px; }
+    button { cursor: pointer; background: var(--blue); border: none; font-weight: 600; }
+    button.secondary { background: var(--panel2); border: 1px solid var(--border); }
+    button.success { background: var(--ok); color: #052e16; }
+    button.danger { background: var(--bad); color: white; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }
+    .card h3 { margin: 0 0 6px 0; font-size: 13px; color: var(--muted); font-weight: 600; }
+    .card .value { font-size: 26px; font-weight: 700; }
+    .toolbar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+    .toolbar input { flex: 1; min-width: 220px; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
+    th, td { padding: 11px 13px; border-bottom: 1px solid var(--border); text-align: left; font-size: 13px; vertical-align: top; }
+    th { background: #0b1220; color: var(--muted); font-weight: 700; font-size: 12px; text-transform: uppercase; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255,255,255,0.02); }
+    .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+    .badge-pendiente { background: rgba(245,158,11,0.15); color: #fbbf24; }
+    .badge-enviado { background: rgba(34,197,94,0.15); color: #4ade80; }
+    .badge-error { background: rgba(239,68,68,0.15); color: #f87171; }
+    .badge-default { background: rgba(148,163,184,0.15); color: #cbd5e1; }
+    .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .small { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .empty { text-align: center; padding: 40px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; }
+    .modal { position: fixed; inset: 0; background: rgba(2,6,23,0.8); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 100; }
+    .modal.open { display: flex; }
+    .modal-card { width: min(620px, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
+    .modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+    .modal-grid .full { grid-column: 1 / -1; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; font-weight: 600; }
+    .modal-actions { display: flex; gap: 8px; margin-top: 18px; justify-content: flex-end; }
+    a.link { color: #93c5fd; text-decoration: none; font-size: 13px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } .modal-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<div class='wrap'>
+  <div class='topbar'>
+    <div>
+      <div class='title'>🛒 Bandeja de ventas ML → Odoo</div>
+      <div class='subtitle'>Revisa, edita y autoriza cada venta antes de crear el documento en Odoo.</div>
+    </div>
+    <div class='actions'>
+      <button class='secondary' onclick='refreshData()'>↻ Actualizar</button>
+      <a class='link' href='/health' target='_blank'>Health</a>
+      <a class='link' href='/ventas' target='_blank'>API</a>
+    </div>
   </div>
-  <div class='small'>${safe(v.creado_en)}</div>
-</td>
-                    <td data-label='Cliente / Razón social'>${safe(v.cliente)}</td>
-                    <td data-label='RUT'>${safe(v.rut)}</td>
-                    <td data-label='Dirección'>${safe(v.direccion)}</td>
-                    <td data-label='Tipo'>${safe(v.tipo_sugerido)}</td>
-                    <td data-label='Estado'><span class='${badgeClass(v.estado)}'>${safe(v.estado)}</span>${v.error ? `<div class='small' style='margin-top:6px;color:#fca5a5;'>${safe(v.error)}</div>` : ''}</td>
-                    <td data-label='Correo'>${safe(v.email)}</td>
-                    <td data-label='Giro'>${safe(v.giro)}</td>
-                    <td data-label='Move ID'>${safe(v.move_id)}</td>
-                    <td data-label='Acciones'>
-                      <div class='row-actions'>
-                        <button class='secondary' onclick='openEdit(${JSON.stringify(String(v.id)).replace(/"/g, '&quot;')})'>Editar</button>
-                        ${v.estado !== 'enviado' ? `<button class='success' onclick='authorizeVenta(${JSON.stringify(String(v.id)).replace(/"/g, '&quot;')})'>Autorizar</button>` : ''}
-                      </div>
-                    </td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
-          `;
-        }
 
-        async function refreshData() {
-          const wrap = document.getElementById('tableWrap');
-          wrap.innerHTML = `<div class='empty'>Cargando ventas...</div>`;
-          try {
-            const res = await fetch('/ventas');
-            const data = await res.json();
-            ventas = Array.isArray(data.items) ? data.items : [];
-            renderTable();
-          } catch (err) {
-            wrap.innerHTML = `<div class='empty'>No se pudo cargar la bandeja. Revisa <a class='muted-link' href='/health' target='_blank'>/health</a>.</div>`;
-          }
-        }
+  <div class='grid'>
+    <div class='card'><h3>Total</h3><div class='value' id='cTotal'>—</div></div>
+    <div class='card'><h3>Pendientes</h3><div class='value' id='cPend'>—</div></div>
+    <div class='card'><h3>Enviadas</h3><div class='value' id='cEnv'>—</div></div>
+    <div class='card'><h3>Con error</h3><div class='value' id='cErr'>—</div></div>
+  </div>
 
-        function toggleFacturaFields() {
-          const tipo = document.getElementById('editTipo').value;
-          document.getElementById('facturaFields').style.display = tipo === 'Factura' ? 'block' : 'none';
-        }
+  <div class='toolbar'>
+    <input id='searchInput' placeholder='Buscar por ID, cliente, RUT, email...' oninput='renderTable()'>
+    <select id='statusFilter' onchange='renderTable()'>
+      <option value=''>Todos los estados</option>
+      <option value='pendiente'>Pendiente</option>
+      <option value='enviado'>Enviado</option>
+      <option value='error'>Error</option>
+    </select>
+    <button class='success' onclick='autorizarTodas()'>✓ Autorizar todas las pendientes</button>
+  </div>
 
-        function openEdit(id) {
-          const venta = ventas.find(v => String(v.id) === String(id));
-          if (!venta) return;
-          currentEditId = String(id);
-          document.getElementById('modalSubtitle').textContent = `Venta ${venta.id} · ${venta.cliente || 'Sin cliente'}`;
-          document.getElementById('editTipo').value = venta.tipo_sugerido || 'Boleta';
-          document.getElementById('editEmail').value = venta.email || '';
-          document.getElementById('editCliente').value = venta.cliente || '';
-          document.getElementById('editRut').value = venta.rut || '';
-          document.getElementById('editDireccion').value = venta.direccion || '';
-          document.getElementById('editGiro').value = venta.giro || '';
-          toggleFacturaFields();
-          document.getElementById('editModal').classList.add('open');
-        }
+  <div id='tableWrap'><div class='empty'>Cargando...</div></div>
+</div>
 
-        function closeModal() {
-          currentEditId = null;
-          document.getElementById('editModal').classList.remove('open');
-        }
+<!-- Modal edición -->
+<div class='modal' id='editModal'>
+  <div class='modal-card'>
+    <div class='topbar' style='margin-bottom:0'>
+      <div>
+        <div class='title' style='font-size:20px'>✏️ Editar venta</div>
+        <div class='subtitle' id='modalSub'></div>
+      </div>
+      <button class='secondary' onclick='closeModal()'>Cerrar</button>
+    </div>
+    <div class='modal-grid'>
+      <div>
+        <label>Tipo documento</label>
+        <select id='editTipo' onchange='toggleGiro()'>
+          <option value='Boleta'>Boleta</option>
+          <option value='Factura'>Factura</option>
+        </select>
+      </div>
+      <div>
+        <label>Email DTE</label>
+        <input id='editEmail'>
+      </div>
+      <div class='full'>
+        <label>Nombre cliente / razón social</label>
+        <input id='editCliente'>
+      </div>
+      <div>
+        <label>RUT</label>
+        <input id='editRut'>
+      </div>
+      <div>
+        <label>Dirección</label>
+        <input id='editDireccion'>
+      </div>
+      <div class='full' id='giroGroup' style='display:none'>
+        <label>Giro (solo factura)</label>
+        <input id='editGiro'>
+      </div>
+    </div>
+    <div class='modal-actions'>
+      <button class='secondary' onclick='closeModal()'>Cancelar</button>
+      <button onclick='saveEdit()'>Guardar</button>
+      <button class='success' onclick='saveAndAuthorize()'>Guardar y autorizar</button>
+    </div>
+  </div>
+</div>
 
-        async function saveEdit() {
-          if (!currentEditId) return;
-          const payload = {
-            tipo_sugerido: document.getElementById('editTipo').value,
-            email: document.getElementById('editEmail').value,
-            cliente: document.getElementById('editCliente').value,
-            rut: document.getElementById('editRut').value,
-            direccion: document.getElementById('editDireccion').value,
-            giro: document.getElementById('editGiro').value,
-          };
-          const res = await fetch(`/ventas/${currentEditId}`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          });
-          if (!res.ok) {
-            alert('No se pudo guardar la venta.');
-            return;
-          }
-          closeModal();
-          await refreshData();
-        }
+<script>
+let ventas = [];
+let currentId = null;
 
-        async function authorizeVenta(id) {
-          if (!confirm(`¿Autorizar la venta ${id} y enviarla a Odoo?`)) return;
-          const res = await fetch(`/ventas/${id}/autorizar`, { method: 'POST' });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok) {
-            alert(data.detail || 'No se pudo autorizar la venta.');
-            await refreshData();
-            return;
-          }
-          alert(`Venta ${id} autorizada correctamente.`);
-          await refreshData();
-        }
+function badge(estado) {
+  const map = { pendiente: 'badge-pendiente', enviado: 'badge-enviado', error: 'badge-error' };
+  return `<span class="badge ${map[estado] || 'badge-default'}">${estado}</span>`;
+}
 
-        async function saveAndAuthorize() {
-          if (!currentEditId) return;
-          await saveEdit();
-          if (currentEditId) return;
-          const lastId = document.getElementById('modalSubtitle').textContent.split(' ')[1];
-          if (lastId) await authorizeVenta(lastId);
-        }
+function safe(v) { return v == null || v === '' ? '—' : String(v); }
 
-        document.getElementById('editModal').addEventListener('click', (e) => {
-          if (e.target.id === 'editModal') closeModal();
-        });
+function updateStats(items) {
+  document.getElementById('cTotal').textContent = items.length;
+  document.getElementById('cPend').textContent = items.filter(v => v.estado === 'pendiente').length;
+  document.getElementById('cEnv').textContent = items.filter(v => v.estado === 'enviado').length;
+  document.getElementById('cErr').textContent = items.filter(v => v.estado === 'error').length;
+}
 
-        refreshData();
-      </script>
-    </body>
-    </html>
-    """
+function filteredVentas() {
+  const q = document.getElementById('searchInput').value.trim().toLowerCase();
+  const s = document.getElementById('statusFilter').value;
+  return ventas.filter(v => {
+    const okS = !s || v.estado === s;
+    const okQ = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido].filter(Boolean).join(' ').toLowerCase().includes(q);
+    return okS && okQ;
+  });
+}
+
+function renderTable() {
+  const items = filteredVentas();
+  updateStats(ventas);
+  const wrap = document.getElementById('tableWrap');
+  if (!items.length) { wrap.innerHTML = "<div class='empty'>No hay ventas para mostrar.</div>"; return; }
+  wrap.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Fecha</th><th>Cliente</th><th>RUT</th><th>Dirección</th>
+        <th>Tipo</th><th>Estado</th><th>Move ID</th><th>Acciones</th>
+      </tr></thead>
+      <tbody>
+        ${items.map(v => `
+          <tr>
+            <td>${safe(v.creado_en ? new Date(v.creado_en).toLocaleString('es-CL') : null)}<div class='small'>${safe(v.id)}</div></td>
+            <td><strong>${safe(v.cliente)}</strong><div class='small'>${safe(v.email)}</div></td>
+            <td>${safe(v.rut)}</td>
+            <td>${safe(v.direccion)}</td>
+            <td>${safe(v.tipo_sugerido)}</td>
+            <td>${badge(v.estado)}${v.error ? `<div class='small' style='color:#f87171;margin-top:4px'>${safe(v.error).substring(0,80)}</div>` : ''}</td>
+            <td>${safe(v.move_id)}</td>
+            <td>
+              <div class='row-actions'>
+                <button class='secondary' onclick='openEdit("${v.id}")'>Editar</button>
+                ${v.estado !== 'enviado' ? `<button class='success' onclick='autorizar("${v.id}")'>Autorizar</button>` : ''}
+              </div>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function refreshData() {
+  document.getElementById('tableWrap').innerHTML = "<div class='empty'>Cargando...</div>";
+  try {
+    const res = await fetch('/ventas');
+    const data = await res.json();
+    ventas = Array.isArray(data.items) ? data.items : [];
+    renderTable();
+  } catch(e) {
+    document.getElementById('tableWrap').innerHTML = "<div class='empty'>Error cargando datos. Revisa /health</div>";
+  }
+}
+
+async function autorizar(id) {
+  if (!confirm(`¿Autorizar la venta ${id} y enviarla a Odoo?`)) return;
+  const res = await fetch(`/ventas/${id}/autorizar`, { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) { alert(`✅ Documento creado en Odoo: move_id=${data.move_id}`); }
+  else { alert(`❌ Error: ${data.detail || 'desconocido'}`); }
+  refreshData();
+}
+
+async function autorizarTodas() {
+  const pendientes = ventas.filter(v => v.estado === 'pendiente');
+  if (!pendientes.length) { alert('No hay ventas pendientes'); return; }
+  if (!confirm(`¿Autorizar las ${pendientes.length} ventas pendientes?`)) return;
+  let ok = 0, err = 0;
+  for (const v of pendientes) {
+    const r = await fetch(`/ventas/${v.id}/autorizar`, { method: 'POST' });
+    if (r.ok) ok++; else err++;
+  }
+  alert(`✅ Autorizadas: ${ok} | ❌ Errores: ${err}`);
+  refreshData();
+}
+
+function toggleGiro() {
+  document.getElementById('giroGroup').style.display =
+    document.getElementById('editTipo').value === 'Factura' ? 'block' : 'none';
+}
+
+function openEdit(id) {
+  const v = ventas.find(x => String(x.id) === String(id));
+  if (!v) return;
+  currentId = String(id);
+  document.getElementById('modalSub').textContent = `Venta ${v.id}`;
+  document.getElementById('editTipo').value = v.tipo_sugerido || 'Boleta';
+  document.getElementById('editEmail').value = v.email || '';
+  document.getElementById('editCliente').value = v.cliente || '';
+  document.getElementById('editRut').value = v.rut || '';
+  document.getElementById('editDireccion').value = v.direccion || '';
+  document.getElementById('editGiro').value = v.giro || '';
+  toggleGiro();
+  document.getElementById('editModal').classList.add('open');
+}
+
+function closeModal() {
+  currentId = null;
+  document.getElementById('editModal').classList.remove('open');
+}
+
+async function saveEdit() {
+  if (!currentId) return;
+  const tipo = document.getElementById('editTipo').value;
+  const payload = {
+    tipo_sugerido: tipo,
+    email: document.getElementById('editEmail').value,
+    cliente: document.getElementById('editCliente').value,
+    rut: document.getElementById('editRut').value,
+    direccion: document.getElementById('editDireccion').value,
+    giro: tipo === 'Factura' ? document.getElementById('editGiro').value : '',
+  };
+  const res = await fetch(`/ventas/${currentId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) { alert('No se pudo guardar'); return; }
+  closeModal();
+  refreshData();
+}
+
+async function saveAndAuthorize() {
+  if (!currentId) return;
+  const id = currentId;
+  await saveEdit();
+  if (id) await autorizar(id);
+}
+
+document.getElementById('editModal').addEventListener('click', e => {
+  if (e.target.id === 'editModal') closeModal();
+});
+
+refreshData();
+setInterval(refreshData, 30000);
+</script>
+</body>
+</html>
+""")
