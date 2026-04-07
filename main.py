@@ -104,8 +104,11 @@ def init_db():
                 )
                 """
             )
-            cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS direccion TEXT")
-            cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS giro TEXT")
+            for stmt in [
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS direccion TEXT",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS giro TEXT",
+            ]:
+                cur.execute(stmt)
         conn.commit()
     logger.info("✅ Tabla ventas verificada en PostgreSQL")
 
@@ -468,7 +471,6 @@ def score_address_candidate(text: str) -> int:
 
 
 def extract_direccion(order: dict, billing_info: dict, billing_raw: dict | None = None) -> str:
-    # 1) ramas estructuradas
     candidates = [
         billing_info.get("address") or {},
         safe_get(order, "buyer", "address", default={}),
@@ -481,7 +483,6 @@ def extract_direccion(order: dict, billing_info: dict, billing_raw: dict | None 
         if direccion:
             return direccion
 
-    # 2) additional_info con dict o string
     for item in billing_info.get("additional_info") or []:
         value = item.get("value")
         if isinstance(value, dict):
@@ -491,7 +492,6 @@ def extract_direccion(order: dict, billing_info: dict, billing_raw: dict | None 
         elif isinstance(value, str) and looks_like_chilean_address(value):
             return value.strip()
 
-    # 3) búsqueda libre en todo el JSON
     blobs = []
     blobs.extend(flatten_strings(order))
     blobs.extend(flatten_strings(billing_info))
@@ -538,6 +538,24 @@ def detect_tipo(order: dict, billing_info: dict) -> str:
             return "Factura"
 
     return "Boleta"
+
+
+def summarize_order_items(order: dict) -> tuple[list[str], int, float]:
+    items_summary = []
+    item_count = 0
+    total_bruto = 0.0
+
+    for item in order.get("order_items", []):
+        qty = float(item.get("quantity", 0) or 0)
+        title = safe_get(item, "item", "title", default="Producto ML")
+        unit_price = float(item.get("unit_price", 0) or 0)
+        subtotal = qty * unit_price
+
+        item_count += int(qty)
+        total_bruto += subtotal
+        items_summary.append(f"{title} x{int(qty)}")
+
+    return items_summary, item_count, round(total_bruto, 2)
 
 
 # =========================
@@ -643,6 +661,11 @@ def odoo_exec(ctx: OdooCtx, model: str, method: str, args: list, kwargs: dict = 
     return ctx.models.execute_kw(ctx.db, ctx.uid, ctx.password, model, method, args, kwargs or {})
 
 
+def get_partner_fields(ctx: OdooCtx) -> set[str]:
+    fields = odoo_exec(ctx, "res.partner", "fields_get", [], {"attributes": ["string"]})
+    return set(fields.keys())
+
+
 def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
     if tipo == "Factura":
         ids = odoo_exec(
@@ -684,6 +707,14 @@ def get_tax_19(ctx: OdooCtx) -> Optional[int]:
     return ids[0] if ids else None
 
 
+def get_activity_field_name(ctx: OdooCtx) -> Optional[str]:
+    fields = get_partner_fields(ctx)
+    for candidate in ("l10n_cl_activity_description", "activity_description", "x_studio_giro"):
+        if candidate in fields:
+            return candidate
+    return None
+
+
 def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
     rut_norm = normalize_rut(rut)
     if not rut_norm:
@@ -702,31 +733,58 @@ def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str, giro:
     taxpayer_type = "1" if es_empresa else "4"
     chile_id = get_chile_country_id(ctx)
     rut_type_id = get_rut_id_type(ctx)
+    partner_fields = get_partner_fields(ctx)
+    activity_field = get_activity_field_name(ctx)
+
+    partner_id = find_partner_by_rut(ctx, rut)
+
+    if partner_id:
+        safe_update = {
+            "name": nombre,
+            "email": email,
+        }
+
+        if "l10n_cl_dte_email" in partner_fields:
+            safe_update["l10n_cl_dte_email"] = email
+        if direccion:
+            safe_update["street"] = direccion
+        if rut:
+            safe_update["vat"] = rut
+        if chile_id and "country_id" in partner_fields:
+            safe_update["country_id"] = chile_id
+        if rut and rut_type_id and "l10n_latam_identification_type_id" in partner_fields:
+            safe_update["l10n_latam_identification_type_id"] = rut_type_id
+        if activity_field and es_empresa and giro:
+            safe_update[activity_field] = giro
+
+        odoo_exec(ctx, "res.partner", "write", [[partner_id], safe_update])
+        logger.info(f"Partner actualizado: id={partner_id}")
+        return partner_id
 
     base_vals = {
         "name": nombre,
         "vat": rut or False,
         "email": email,
-        "l10n_cl_dte_email": email,
-        "country_id": chile_id,
-        "l10n_cl_sii_taxpayer_type": taxpayer_type,
-        "company_type": "company" if es_empresa else "person",
-        "is_company": es_empresa,
+        "customer_rank": 1,
     }
+
+    if "l10n_cl_dte_email" in partner_fields:
+        base_vals["l10n_cl_dte_email"] = email
+    if chile_id and "country_id" in partner_fields:
+        base_vals["country_id"] = chile_id
+    if "company_type" in partner_fields:
+        base_vals["company_type"] = "company" if es_empresa else "person"
+    if "is_company" in partner_fields:
+        base_vals["is_company"] = es_empresa
+    if "l10n_cl_sii_taxpayer_type" in partner_fields:
+        base_vals["l10n_cl_sii_taxpayer_type"] = taxpayer_type
     if direccion:
         base_vals["street"] = direccion
-    if es_empresa and giro:
-        base_vals["x_giro"] = giro
-    if rut and rut_type_id:
+    if rut and rut_type_id and "l10n_latam_identification_type_id" in partner_fields:
         base_vals["l10n_latam_identification_type_id"] = rut_type_id
+    if activity_field and es_empresa and giro:
+        base_vals[activity_field] = giro
 
-    partner_id = find_partner_by_rut(ctx, rut)
-    if partner_id:
-        odoo_exec(ctx, "res.partner", "write", [[partner_id], base_vals])
-        logger.info(f"Partner actualizado: id={partner_id}")
-        return partner_id
-
-    base_vals["customer_rank"] = 1
     partner_id = odoo_exec(ctx, "res.partner", "create", [base_vals])
     logger.info(f"Partner creado: id={partner_id} empresa={es_empresa}")
     return partner_id
@@ -773,6 +831,9 @@ def create_document(
     giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
 
+    if tipo == "Factura" and (not nombre or not rut or not direccion or not giro):
+        raise Exception("Para Factura se requiere razón social, RUT, dirección y giro")
+
     partner_id = get_or_create_partner(ctx, nombre, rut, email, giro, direccion, es_empresa)
 
     journal_id = get_journal(ctx, tipo)
@@ -780,11 +841,16 @@ def create_document(
     tax_id = get_tax_19(ctx)
 
     lines = []
+    item_lines, item_count, total_bruto = summarize_order_items(order)
+
     for item in order.get("order_items", []):
-        price = round(float(item["unit_price"]) / IVA_RATE, 2)
+        qty = float(item.get("quantity", 0) or 0)
+        unit_price_gross = float(item.get("unit_price", 0) or 0)
+        price = round(unit_price_gross / IVA_RATE, 2)
+
         line_vals = {
-            "name": item["item"]["title"],
-            "quantity": item["quantity"],
+            "name": safe_get(item, "item", "title", default="Producto ML"),
+            "quantity": qty,
             "price_unit": price,
         }
         if tax_id:
@@ -794,12 +860,24 @@ def create_document(
     if not lines:
         raise Exception("La orden no tiene líneas")
 
+    narration_parts = []
+    if giro:
+        narration_parts.append(f"Giro: {giro}")
+    narration_parts.append(f"Venta Mercado Libre ID: {order_id}")
+    narration_parts.append(f"Cantidad de ítems: {item_count}")
+    narration_parts.append(f"Total bruto ML: {total_bruto}")
+    if item_lines:
+        narration_parts.append("Detalle venta ML:")
+        narration_parts.extend([f"- {x}" for x in item_lines])
+
     move_vals = {
         "move_type": "out_invoice",
         "partner_id": partner_id,
         "ref": f"ML-{order_id}",
         "invoice_line_ids": lines,
         "l10n_latam_document_type_id": doc_type_id,
+        "narration": "\n".join(narration_parts),
+        "invoice_payment_ref": f"ML-{order_id}",
     }
     if journal_id:
         move_vals["journal_id"] = journal_id
@@ -858,6 +936,8 @@ def reprocesar_venta_desde_ml(order_id: str):
 
     save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email)
 
+    items, item_count, total_bruto = summarize_order_items(order)
+
     return {
         "id": str(order["id"]),
         "cliente": cliente,
@@ -866,6 +946,9 @@ def reprocesar_venta_desde_ml(order_id: str):
         "giro": giro,
         "direccion": direccion,
         "tipo_sugerido": tipo_sugerido,
+        "items": items,
+        "item_count": item_count,
+        "total_bruto": total_bruto,
     }
 
 
@@ -973,7 +1056,22 @@ def manual_refresh():
 
 @app.get("/ventas")
 def ventas(estado: Optional[str] = None):
-    return {"items": list_ventas(estado)}
+    items = list_ventas(estado)
+    enriched = []
+    for v in items:
+        try:
+            order = json.loads(v.get("order_json") or "{}")
+            products, item_count, total_bruto = summarize_order_items(order)
+        except Exception:
+            products, item_count, total_bruto = [], 0, 0.0
+
+        enriched.append({
+            **v,
+            "productos": products,
+            "cantidad_items": item_count,
+            "total_bruto": total_bruto,
+        })
+    return {"items": enriched}
 
 
 @app.get("/ventas/{oid}")
@@ -981,6 +1079,12 @@ def venta_detalle(oid: str):
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
+
+    order = json.loads(venta.get("order_json") or "{}")
+    products, item_count, total_bruto = summarize_order_items(order)
+    venta["productos"] = products
+    venta["cantidad_items"] = item_count
+    venta["total_bruto"] = total_bruto
     return venta
 
 
@@ -1070,12 +1174,13 @@ def ui_bandeja():
     }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: Arial, sans-serif; background: var(--bg); color: var(--text); }
-    .wrap { max-width: 1300px; margin: 0 auto; padding: 24px; }
+    .wrap { max-width: 1400px; margin: 0 auto; padding: 24px; }
     .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
     .title { font-size: 26px; font-weight: 700; }
     .subtitle { color: var(--muted); margin-top: 4px; font-size: 14px; }
     .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-    button, select, input { border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); padding: 9px 12px; font-size: 14px; }
+    button, select, input, textarea { border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); padding: 9px 12px; font-size: 14px; }
+    textarea { width: 100%; min-height: 100px; resize: vertical; }
     button { cursor: pointer; background: var(--blue); border: none; font-weight: 600; }
     button.secondary { background: var(--panel2); border: 1px solid var(--border); }
     button.success { background: var(--ok); color: #052e16; }
@@ -1101,12 +1206,14 @@ def ui_bandeja():
     .empty { text-align: center; padding: 40px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; }
     .modal { position: fixed; inset: 0; background: rgba(2,6,23,0.8); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 100; }
     .modal.open { display: flex; }
-    .modal-card { width: min(760px, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
+    .modal-card { width: min(900px, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
     .modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
     .modal-grid .full { grid-column: 1 / -1; }
     label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; font-weight: 600; }
     .modal-actions { display: flex; gap: 8px; margin-top: 18px; justify-content: flex-end; flex-wrap: wrap; }
     a.link { color: #93c5fd; text-decoration: none; font-size: 13px; }
+    ul.compact { margin: 6px 0 0 16px; padding: 0; }
+    ul.compact li { margin: 2px 0; }
     @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } .modal-grid { grid-template-columns: 1fr; } }
     @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
   </style>
@@ -1187,6 +1294,18 @@ def ui_bandeja():
         <label>Giro (solo factura)</label>
         <input id='editGiro'>
       </div>
+      <div>
+        <label>Total bruto ML</label>
+        <input id='editTotal' disabled>
+      </div>
+      <div>
+        <label>Cantidad de ítems</label>
+        <input id='editItemsCount' disabled>
+      </div>
+      <div class='full'>
+        <label>Productos vendidos</label>
+        <textarea id='editProducts' disabled></textarea>
+      </div>
     </div>
     <div class='modal-actions'>
       <button class='secondary' onclick='closeModal()'>Cancelar</button>
@@ -1208,6 +1327,11 @@ function badge(estado) {
 
 function safe(v) { return v == null || v === '' ? '—' : String(v); }
 
+function money(v) {
+  const n = Number(v || 0);
+  return new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 }).format(n);
+}
+
 function copyId(id) { navigator.clipboard.writeText(String(id)); }
 
 function updateStats(items) {
@@ -1222,7 +1346,7 @@ function filteredVentas() {
   const s = document.getElementById('statusFilter').value;
   return ventas.filter(v => {
     const okS = !s || v.estado === s;
-    const okQ = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase().includes(q);
+    const okQ = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro, ...(v.productos || [])].filter(Boolean).join(' ').toLowerCase().includes(q);
     return okS && okQ;
   });
 }
@@ -1243,9 +1367,9 @@ function renderTable() {
         <th>Cliente / Razón social</th>
         <th>RUT</th>
         <th>Dirección</th>
+        <th>Total / Ítems</th>
         <th>Tipo</th>
         <th>Estado</th>
-        <th>Move ID</th>
         <th>Acciones</th>
       </tr></thead>
       <tbody>
@@ -1263,9 +1387,13 @@ function renderTable() {
             </td>
             <td>${safe(v.rut)}</td>
             <td>${safe(v.direccion)}</td>
+            <td>
+              <strong>${money(v.total_bruto)}</strong>
+              <div class='small'>${safe(v.cantidad_items)} ítems</div>
+              ${(v.productos || []).length ? `<ul class='compact'>${v.productos.slice(0,3).map(p => `<li>${safe(p)}</li>`).join('')}</ul>` : ''}
+            </td>
             <td>${safe(v.tipo_sugerido)}</td>
             <td>${badge(v.estado)}${v.error ? `<div class='small' style='color:#f87171;margin-top:4px'>${safe(v.error).substring(0,80)}</div>` : ''}</td>
-            <td>${safe(v.move_id)}</td>
             <td>
               <div class='row-actions'>
                 <button class='secondary' onclick='openEdit("${String(v.id).replace(/"/g, '&quot;')}")'>Editar</button>
@@ -1335,6 +1463,9 @@ function openEdit(id) {
   document.getElementById('editRut').value = v.rut || '';
   document.getElementById('editDireccion').value = v.direccion || '';
   document.getElementById('editGiro').value = v.giro || '';
+  document.getElementById('editTotal').value = money(v.total_bruto);
+  document.getElementById('editItemsCount').value = v.cantidad_items || 0;
+  document.getElementById('editProducts').value = (v.productos || []).join('\\n');
   toggleGiro();
   document.getElementById('editModal').classList.add('open');
 }
