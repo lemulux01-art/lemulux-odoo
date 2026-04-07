@@ -113,7 +113,7 @@ def init_db():
                     move_id INTEGER,
                     partner_id INTEGER,
                     error TEXT,
-                    creado_en TIMESTAMP DEFAULT NOW(),
+                    creado_en TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'America/Santiago'),
                     enviado_en TIMESTAMP
                 )
                 """
@@ -124,6 +124,7 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS partner_id INTEGER",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS ciudad TEXT",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS region TEXT",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_envio TEXT DEFAULT 'paid'",
             ]:
                 cur.execute(stmt)
         conn.commit()
@@ -171,47 +172,58 @@ def save_venta(
             existing = cur.fetchone()
 
             if existing:
-                cur.execute(
-                    """
-                    UPDATE ventas
-                    SET cliente = %s,
-                        rut = %s,
-                        email = %s,
-                        direccion = %s,
-                        ciudad = %s,
-                        region = %s,
-                        tipo_sugerido = %s,
-                        order_json = %s,
-                        billing_json = %s,
-                        giro = CASE
-                            WHEN (giro IS NULL OR giro = '' OR estado = 'pendiente') THEN %s
-                            ELSE giro
-                        END
-                    WHERE id = %s
-                    """,
-                    (
-                        cliente_final,
-                        rut_final,
-                        email_final,
-                        direccion_final,
-                        ciudad_final,
-                        region_final,
-                        tipo_sugerido,
-                        json.dumps(order, ensure_ascii=False),
-                        json.dumps(billing, ensure_ascii=False),
-                        giro_final,
-                        oid,
-                    ),
-                )
+                # Solo actualizar datos del webhook si la venta está pendiente
+                # Si ya fue enviada o tiene datos editados, solo actualizar el JSON de la orden
+                if existing["estado"] in ("enviado", "error"):
+                    # Solo actualizar el JSON por si acaso, sin tocar datos editados
+                    cur.execute(
+                        "UPDATE ventas SET order_json = %s, billing_json = %s WHERE id = %s",
+                        (json.dumps(order, ensure_ascii=False),
+                         json.dumps(billing, ensure_ascii=False), oid),
+                    )
+                else:
+                    # Pendiente: actualizar datos pero respetar ediciones manuales
+                    cur.execute(
+                        """
+                        UPDATE ventas
+                        SET cliente = COALESCE(NULLIF(cliente, 'Cliente ML'), %s, cliente),
+                            rut = CASE WHEN (rut IS NULL OR rut = '') THEN %s ELSE rut END,
+                            email = CASE WHEN (email IS NULL OR email = '') THEN %s ELSE email END,
+                            direccion = CASE WHEN (direccion IS NULL OR direccion = '') THEN %s ELSE direccion END,
+                            ciudad = CASE WHEN (ciudad IS NULL OR ciudad = '') THEN %s ELSE ciudad END,
+                            region = CASE WHEN (region IS NULL OR region = '') THEN %s ELSE region END,
+                            tipo_sugerido = %s,
+                            order_json = %s,
+                            billing_json = %s,
+                            giro = CASE
+                                WHEN (giro IS NULL OR giro = '' OR giro = '(boleta)') THEN %s
+                                ELSE giro
+                            END
+                        WHERE id = %s
+                        """,
+                        (
+                            cliente_final,
+                            rut_final,
+                            email_final,
+                            direccion_final,
+                            ciudad_final,
+                            region_final,
+                            tipo_sugerido,
+                            json.dumps(order, ensure_ascii=False),
+                            json.dumps(billing, ensure_ascii=False),
+                            giro_final,
+                            oid,
+                        ),
+                    )
                 conn.commit()
-                logger.info(f"[{oid}] Venta actualizada")
+                logger.info(f"[{oid}] Venta actualizada (estado={existing['estado']})")
                 return
 
             cur.execute(
                 """
                 INSERT INTO ventas
-                    (id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, order_json, billing_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s)
+                    (id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, order_json, billing_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s)
                 """,
                 (
                     oid,
@@ -223,6 +235,7 @@ def save_venta(
                     ciudad_final,
                     region_final,
                     tipo_sugerido,
+                    order.get("status", "paid"),
                     json.dumps(order, ensure_ascii=False),
                     json.dumps(billing, ensure_ascii=False),
                 ),
@@ -1073,6 +1086,18 @@ def create_document(
 # PROCESAMIENTO WEBHOOK
 # =========================
 
+ML_ESTADO_ENVIO = {
+    "payment_required": "⏳ Pendiente de pago",
+    "payment_in_process": "⏳ Pago en proceso",
+    "paid":              "✅ Pagado",
+    "ready_to_ship":     "📦 Listo para envío",
+    "shipped":           "🚚 En camino",
+    "delivered":         "🏠 Entregado",
+    "cancelled":         "❌ Cancelado",
+    "invalid":           "⚠️ Inválido",
+}
+
+
 def process_webhook_order(order_id: str):
     try:
         order = get_ml_order(order_id)
@@ -1080,8 +1105,19 @@ def process_webhook_order(order_id: str):
             logger.warning(f"[{order_id}] Orden no encontrada en ML")
             return
 
-        if order.get("status") != "paid":
-            logger.info(f"[{order_id}] Orden no pagada: {order.get('status')}")
+        ml_status = order.get("status", "")
+        estado_envio = ML_ESTADO_ENVIO.get(ml_status, ml_status)
+
+        # Si la venta ya existe, solo actualizar el estado de envío
+        existing = get_venta(order_id)
+        if existing:
+            update_venta(order_id, estado_envio=estado_envio)
+            logger.info(f"[{order_id}] Estado envío actualizado: {estado_envio}")
+            return
+
+        # Solo crear en bandeja si la orden está pagada
+        if ml_status != "paid":
+            logger.info(f"[{order_id}] Orden no pagada ({ml_status}), no se agrega a bandeja")
             return
 
         billing_raw = get_ml_billing_raw(order_id)
@@ -1100,7 +1136,7 @@ def process_webhook_order(order_id: str):
             giro = DEFAULT_BOLETA_ACTIVITY
 
         save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email, ciudad, region)
-        logger.info(f"[{order_id}] ✅ Guardada: {tipo_sugerido} dir='{direccion}' ciudad='{ciudad}' region='{region}'")
+        logger.info(f"[{order_id}] ✅ Guardada: {tipo_sugerido} estado={estado_envio}")
     except Exception as e:
         logger.error(f"[{order_id}] Error procesando webhook: {e}", exc_info=True)
 
@@ -1442,8 +1478,8 @@ def ui_bandeja():
   <div class='toolbar'>
     <input id='searchInput' placeholder='Buscar por ID, cliente, RUT, email...' oninput='renderTable()'>
     <select id='statusFilter' onchange='renderTable()'>
-      <option value=''>Todos los estados</option>
       <option value='pendiente'>Pendiente</option>
+      <option value=''>Todos los estados</option>
       <option value='enviado'>Enviado</option>
       <option value='error'>Error</option>
     </select>
@@ -1594,14 +1630,15 @@ function renderTable() {
         <th>Dirección / Ciudad / Región</th>
         <th>Total / Ítems</th>
         <th>Tipo</th>
-        <th>Estado</th>
+        <th>Estado doc.</th>
+        <th>Estado envío ML</th>
         <th>Acciones</th>
       </tr></thead>
       <tbody>
         ${items.map(v => `
           <tr>
             <td>
-              ${safe(v.creado_en ? new Date(v.creado_en).toLocaleString('es-CL') : null)}
+              ${safe(v.creado_en ? new Date(v.creado_en + 'Z').toLocaleString('es-CL', {timeZone: 'America/Santiago'}) : null)}
               <div class='small'>${safe(v.id)}</div>
               <div class='small'><a href='#' class='link' onclick='copyId("${String(v.id).replace(/"/g, '&quot;')}"); return false;'>Copiar ID</a></div>
             </td>
@@ -1623,6 +1660,7 @@ function renderTable() {
             </td>
             <td>${safe(v.tipo_sugerido)}</td>
             <td>${badge(v.estado)}${v.error ? `<div class='small' style='color:#f87171;margin-top:4px'>${safe(v.error).substring(0,80)}</div>` : ''}</td>
+            <td><span style='font-size:13px'>${safe(v.estado_envio || '✅ Pagado')}</span></td>
             <td>
               <div class='row-actions'>
                 <button class='secondary' onclick='openEdit("${String(v.id).replace(/"/g, '&quot;')}")'>Editar</button>
@@ -1749,7 +1787,12 @@ document.getElementById('editModal').addEventListener('click', e => {
 });
 
 refreshData();
-setInterval(refreshData, 30000);
+setInterval(() => {
+  // No recargar si el modal de edición está abierto
+  if (!document.getElementById('editModal').classList.contains('open')) {
+    refreshData();
+  }
+}, 60000);
 </script>
 </body>
 </html>
