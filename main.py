@@ -253,12 +253,14 @@ def save_venta(
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
+    # Excluir order_json y billing_json del listado — son grandes y solo se necesitan al autorizar
+    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, pack_id, move_id, partner_id, error, creado_en, enviado_en"
     with get_db() as conn:
         with conn.cursor() as cur:
             if estado:
-                cur.execute("SELECT * FROM ventas WHERE estado = %s ORDER BY creado_en DESC", (estado,))
+                cur.execute(f"SELECT {cols} FROM ventas WHERE estado = %s ORDER BY creado_en DESC", (estado,))
             else:
-                cur.execute("SELECT * FROM ventas ORDER BY creado_en DESC")
+                cur.execute(f"SELECT {cols} FROM ventas ORDER BY creado_en DESC")
             rows = cur.fetchall()
     return [dict(r) for r in rows]
 
@@ -1368,19 +1370,15 @@ def manual_refresh():
 @app.get("/ventas")
 def ventas(estado: Optional[str] = None):
     items = list_ventas(estado)
+    # order_json no viene en list_ventas para ahorrar ancho de banda
+    # Los productos/totales se muestran como placeholders hasta que se edite/reprocese
     enriched = []
     for v in items:
-        try:
-            order = json.loads(v.get("order_json") or "{}")
-            products, item_count, total_bruto = summarize_order_items(order)
-        except Exception:
-            products, item_count, total_bruto = [], 0, 0.0
-
         enriched.append({
             **v,
-            "productos": products,
-            "cantidad_items": item_count,
-            "total_bruto": total_bruto,
+            "productos": [],
+            "cantidad_items": "—",
+            "total_bruto": 0,
         })
     return {"items": enriched}
 
@@ -1924,11 +1922,11 @@ function toggleGiro() {
     document.getElementById('editTipo').value === 'Factura' ? 'block' : 'none';
 }
 
-function openEdit(id) {
+async function openEdit(id) {
   const v = ventas.find(x => String(x.id) === String(id));
   if (!v) return;
   currentId = String(id);
-  document.getElementById('modalSub').textContent = `Venta ${v.id}`;
+  document.getElementById('modalSub').textContent = 'Venta ' + String(v.id);
   document.getElementById('editId').value = v.id || '';
   document.getElementById('editTipo').value = v.tipo_sugerido || 'Boleta';
   document.getElementById('editEmail').value = v.email || '';
@@ -1938,11 +1936,22 @@ function openEdit(id) {
   document.getElementById('editCiudad').value = v.ciudad || '';
   document.getElementById('editRegion').value = v.region || '';
   document.getElementById('editGiro').value = v.tipo_sugerido === 'Factura' ? (v.giro || '') : '';
-  document.getElementById('editTotal').value = money(v.total_bruto);
-  document.getElementById('editItemsCount').value = v.cantidad_items || 0;
-  document.getElementById('editProducts').value = (v.productos || []).join('\\n');
+  document.getElementById('editTotal').value = '...';
+  document.getElementById('editItemsCount').value = '...';
+  document.getElementById('editProducts').value = 'Cargando...';
   toggleGiro();
   document.getElementById('editModal').classList.add('open');
+
+  // Cargar detalle completo (con productos y total) en background
+  try {
+    const res = await fetch('/ventas/' + id);
+    const det = await res.json();
+    document.getElementById('editTotal').value = money(det.total_bruto);
+    document.getElementById('editItemsCount').value = det.cantidad_items || 0;
+    document.getElementById('editProducts').value = (det.productos || []).join('\n');
+  } catch(e) {
+    document.getElementById('editProducts').value = 'Error cargando productos';
+  }
 }
 
 function closeModal() {
