@@ -1963,7 +1963,7 @@ async function openEdit(id) {
     const det = await res.json();
     document.getElementById('editTotal').value = money(det.total_bruto);
     document.getElementById('editItemsCount').value = det.cantidad_items || 0;
-    document.getElementById('editProducts').value = (det.productos || []).join('\x0A');
+    document.getElementById('editProducts').value = (det.productos || []).join(String.fromCharCode(10));
   } catch(e) {
     document.getElementById('editProducts').value = 'Error cargando productos';
   }
@@ -2047,7 +2047,7 @@ async function agruparSeleccionadas() {
 
   // Mostrar resumen antes de confirmar
   const ventasSelec = ids.map(id => ventas.find(v => String(v.id) === id)).filter(Boolean);
-  const resumen = ventasSelec.map(function(v){ return '• ' + safe(v.cliente) + ' — ' + safe(v.id); }).join('\x0A');
+  const resumen = ventasSelec.map(function(v){ return '• ' + safe(v.cliente) + ' — ' + safe(v.id); }).join(String.fromCharCode(10));
   const msg = '¿Agrupar estas ' + ids.length + ' ventas en una sola boleta/factura?' +
     '\n\nLa primera será la principal y las demás quedarán como rechazadas:' +
     '\n\n' + resumen +
