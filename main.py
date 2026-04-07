@@ -1598,201 +1598,156 @@ def autorizar_venta(oid: str):
 # DASHBOARD
 # =========================
 
-@app.get("/ui", response_class=HTMLResponse)
-def ui_bandeja():
-    return HTMLResponse(content="""
-<!doctype html>
-<html lang='es'>
+UI_HTML = """<!doctype html>
+<html lang="es">
 <head>
-  <meta charset='utf-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Lemulux | Bandeja de ventas</title>
   <style>
-    :root {
-      --bg: #0f172a; --panel: #111827; --panel2: #1f2937;
-      --border: #334155; --text: #e5e7eb; --muted: #94a3b8;
-      --ok: #22c55e; --warn: #f59e0b; --bad: #ef4444; --blue: #3b82f6;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; font-family: Arial, sans-serif; background: var(--bg); color: var(--text); }
-    .wrap { max-width: 1400px; margin: 0 auto; padding: 24px; }
-    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
-    .title { font-size: 26px; font-weight: 700; }
-    .subtitle { color: var(--muted); margin-top: 4px; font-size: 14px; }
-    .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-    button, select, input, textarea { border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); padding: 9px 12px; font-size: 14px; }
-    textarea { width: 100%; min-height: 100px; resize: vertical; }
-    button { cursor: pointer; background: var(--blue); border: none; font-weight: 600; }
-    button.secondary { background: var(--panel2); border: 1px solid var(--border); }
-    button.success { background: var(--ok); color: #052e16; }
-    button.warn { background: var(--warn); color: #3b2300; }
-    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
-    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }
-    .card h3 { margin: 0 0 6px 0; font-size: 13px; color: var(--muted); font-weight: 600; }
-    .card .value { font-size: 26px; font-weight: 700; }
-    .toolbar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
-    .toolbar input { flex: 1; min-width: 220px; }
-    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
-    th, td { padding: 11px 13px; border-bottom: 1px solid var(--border); text-align: left; font-size: 13px; vertical-align: top; }
-    th { background: #0b1220; color: var(--muted); font-weight: 700; font-size: 12px; text-transform: uppercase; }
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: rgba(255,255,255,0.02); }
-    .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }
-    .badge-pendiente { background: rgba(245,158,11,0.15); color: #fbbf24; }
-    .badge-enviado { background: rgba(34,197,94,0.15); color: #4ade80; }
-    .badge-error { background: rgba(239,68,68,0.15); color: #f87171; }
-    .badge-default { background: rgba(148,163,184,0.15); color: #cbd5e1; }
-    .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-    .pack-btn { background: #7c3aed; color: white; border: none; border-radius: 8px; padding: 9px 12px; font-size: 14px; font-weight: 600; cursor: pointer; }
-    .pack-btn:hover { opacity: 0.85; }
-    .cb-row { width: 16px; height: 16px; cursor: pointer; accent-color: #7c3aed; }
-    tr.seleccionada td { background: rgba(124,58,237,0.08) !important; }
-    .small { color: var(--muted); font-size: 12px; margin-top: 3px; }
-    .empty { text-align: center; padding: 40px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; }
-    .modal { position: fixed; inset: 0; background: rgba(2,6,23,0.8); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 100; }
-    .modal.open { display: flex; }
-    .modal-card { width: min(900px, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
-    .modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
-    .modal-grid .full { grid-column: 1 / -1; }
-    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; font-weight: 600; }
-    .modal-actions { display: flex; gap: 8px; margin-top: 18px; justify-content: flex-end; flex-wrap: wrap; }
-    a.link { color: #93c5fd; text-decoration: none; font-size: 13px; }
-    ul.compact { margin: 6px 0 0 16px; padding: 0; }
-    ul.compact li { margin: 2px 0; }
-    @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } .modal-grid { grid-template-columns: 1fr; } }
-    @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+    :root{--bg:#0f172a;--panel:#111827;--panel2:#1f2937;--border:#334155;--text:#e5e7eb;--muted:#94a3b8;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--blue:#3b82f6;}
+    *{box-sizing:border-box;}
+    body{margin:0;font-family:Arial,sans-serif;background:var(--bg);color:var(--text);}
+    .wrap{max-width:1400px;margin:0 auto;padding:24px;}
+    .topbar{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:20px;flex-wrap:wrap;}
+    .title{font-size:26px;font-weight:700;}
+    .subtitle{color:var(--muted);margin-top:4px;font-size:14px;}
+    .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+    button,select,input,textarea{border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);padding:9px 12px;font-size:14px;}
+    textarea{width:100%;min-height:100px;resize:vertical;}
+    button{cursor:pointer;background:var(--blue);border:none;font-weight:600;}
+    button.secondary{background:var(--panel2);border:1px solid var(--border);}
+    button.success{background:var(--ok);color:#052e16;}
+    button.warn{background:var(--warn);color:#3b2300;}
+    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;}
+    .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;}
+    .card h3{margin:0 0 6px 0;font-size:13px;color:var(--muted);font-weight:600;}
+    .card .value{font-size:26px;font-weight:700;}
+    .toolbar{display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap;}
+    .toolbar input{flex:1;min-width:220px;}
+    table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;}
+    th,td{padding:11px 13px;border-bottom:1px solid var(--border);text-align:left;font-size:13px;vertical-align:top;}
+    th{background:#0b1220;color:var(--muted);font-weight:700;font-size:12px;text-transform:uppercase;}
+    tr:last-child td{border-bottom:none;}
+    tr:hover td{background:rgba(255,255,255,0.02);}
+    tr.seleccionada td{background:rgba(124,58,237,0.08)!important;}
+    .badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;}
+    .badge-pendiente{background:rgba(245,158,11,0.15);color:#fbbf24;}
+    .badge-enviado{background:rgba(34,197,94,0.15);color:#4ade80;}
+    .badge-error{background:rgba(239,68,68,0.15);color:#f87171;}
+    .badge-default{background:rgba(148,163,184,0.15);color:#cbd5e1;}
+    .row-actions{display:flex;gap:6px;flex-wrap:wrap;}
+    .pack-btn{background:#7c3aed;color:white;border:none;border-radius:8px;padding:9px 12px;font-size:14px;font-weight:600;cursor:pointer;}
+    .cb-row{width:16px;height:16px;cursor:pointer;accent-color:#7c3aed;}
+    .small{color:var(--muted);font-size:12px;margin-top:3px;}
+    .empty{text-align:center;padding:40px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:14px;}
+    .modal{position:fixed;inset:0;background:rgba(2,6,23,0.8);display:none;align-items:center;justify-content:center;padding:20px;z-index:100;}
+    .modal.open{display:flex;}
+    .modal-card{width:min(900px,100%);background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:24px;max-height:90vh;overflow-y:auto;}
+    .modal-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px;}
+    .modal-grid .full{grid-column:1/-1;}
+    label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;font-weight:600;}
+    .modal-actions{display:flex;gap:8px;margin-top:18px;justify-content:flex-end;flex-wrap:wrap;}
+    a.link{color:#93c5fd;text-decoration:none;font-size:13px;}
+    ul.compact{margin:6px 0 0 16px;padding:0;}
+    ul.compact li{margin:2px 0;}
   </style>
 </head>
 <body>
-<div class='wrap'>
-  <div class='topbar'>
+<div class="wrap">
+  <div class="topbar">
     <div>
-      <div class='title'>🛒 Bandeja de ventas ML → Odoo</div>
-      <div class='subtitle'>Revisa, edita, reprocesa y autoriza cada venta antes de crear el documento en Odoo.</div>
+      <div class="title">&#x1F6D2; Bandeja de ventas ML &rarr; Odoo</div>
+      <div class="subtitle">Revisa, edita, reprocesa y autoriza cada venta antes de crear el documento en Odoo.</div>
     </div>
-    <div class='actions'>
-      <button class='secondary' onclick='refreshData()'>↻ Actualizar</button>
-      <a class='link' href='/health' target='_blank'>Health</a>
-      <a class='link' href='/ventas' target='_blank'>API</a>
+    <div class="actions">
+      <button class="secondary" onclick="refreshData()">&#8635; Actualizar</button>
+      <a class="link" href="/health" target="_blank">Health</a>
+      <a class="link" href="/ventas" target="_blank">API</a>
     </div>
   </div>
-
-  <div class='grid'>
-    <div class='card'><h3>Total</h3><div class='value' id='cTotal'>—</div></div>
-    <div class='card'><h3>Pendientes</h3><div class='value' id='cPend'>—</div></div>
-    <div class='card'><h3>Enviadas</h3><div class='value' id='cEnv'>—</div></div>
-    <div class='card'><h3>Con error</h3><div class='value' id='cErr'>—</div></div>
+  <div class="grid">
+    <div class="card"><h3>Total</h3><div class="value" id="cTotal">&mdash;</div></div>
+    <div class="card"><h3>Pendientes</h3><div class="value" id="cPend">&mdash;</div></div>
+    <div class="card"><h3>Enviadas</h3><div class="value" id="cEnv">&mdash;</div></div>
+    <div class="card"><h3>Con error</h3><div class="value" id="cErr">&mdash;</div></div>
   </div>
-
-  <div class='toolbar'>
-    <input id='searchInput' placeholder='Buscar por ID, cliente, RUT, email...' oninput='renderTable()'>
-    <select id='statusFilter' onchange='renderTable()'>
-      <option value='pendiente'>Pendiente</option>
-      <option value=''>Todos los estados</option>
-      <option value='enviado'>Enviado</option>
-      <option value='error'>Error</option>
-      <option value='rechazado'>Rechazado</option>
+  <div class="toolbar">
+    <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="renderTable()">
+    <select id="statusFilter" onchange="renderTable()">
+      <option value="pendiente">Pendiente</option>
+      <option value="">Todos los estados</option>
+      <option value="enviado">Enviado</option>
+      <option value="error">Error</option>
+      <option value="rechazado">Rechazado</option>
     </select>
-    <button class='warn' onclick='reprocesarTodo()'>↺ Reprocesar todo</button>
-    <button id='btnAgrupar' class='pack-btn' style='display:none' onclick='agruparSeleccionadas()'>⛓ Agrupar seleccionadas</button>
+    <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
+    <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
-  <div id='seleccionInfo' style='display:none;margin-bottom:10px;font-size:13px;color:var(--muted);'>
-    <span id='seleccionCount'></span> — selecciona 2 o más ventas del mismo comprador para agruparlas en una sola boleta/factura.
-  </div>
-
-  <div id='tableWrap'><div class='empty'>Cargando...</div></div>
+  <div id="selInfo" style="display:none;margin-bottom:10px;font-size:13px;color:var(--muted)"><span id="selCount"></span></div>
+  <div id="tableWrap"><div class="empty">Cargando...</div></div>
 </div>
-
-<div class='modal' id='editModal'>
-  <div class='modal-card'>
-    <div class='topbar' style='margin-bottom:0'>
-      <div>
-        <div class='title' style='font-size:20px'>✏️ Editar venta</div>
-        <div class='subtitle' id='modalSub'></div>
-      </div>
-      <button class='secondary' onclick='closeModal()'>Cerrar</button>
+<div class="modal" id="editModal">
+  <div class="modal-card">
+    <div class="topbar" style="margin-bottom:0">
+      <div><div class="title" style="font-size:20px">&#9999;&#65039; Editar venta</div><div class="subtitle" id="modalSub"></div></div>
+      <button class="secondary" onclick="closeModal()">Cerrar</button>
     </div>
-    <div class='modal-grid'>
-      <div>
-        <label>ID venta ML</label>
-        <input id='editId' disabled>
-      </div>
-      <div>
-        <label>Tipo documento</label>
-        <select id='editTipo' onchange='toggleGiro()'>
-          <option value='Boleta'>Boleta</option>
-          <option value='Factura'>Factura</option>
-        </select>
-      </div>
-      <div>
-        <label>Email DTE</label>
-        <input id='editEmail'>
-      </div>
-      <div>
-        <label>RUT</label>
-        <input id='editRut'>
-      </div>
-      <div class='full'>
-        <label>Nombre cliente / razón social</label>
-        <input id='editCliente'>
-      </div>
-      <div class='full'>
-        <label>Dirección (calle y número)</label>
-        <input id='editDireccion'>
-      </div>
-      <div>
-        <label>Ciudad / Comuna</label>
-        <input id='editCiudad'>
-      </div>
-      <div>
-        <label>Región</label>
-        <select id='editRegion'>
-          <option value=''>-- Seleccionar --</option>
-          <option value='Metropolitana'>Metropolitana (RM)</option>
-          <option value='Valparaíso'>Valparaíso</option>
-          <option value='del BíoBio'>del BíoBio</option>
-          <option value='de la Araucania'>de la Araucanía</option>
-          <option value='Antofagasta'>Antofagasta</option>
-          <option value='Coquimbo'>Coquimbo</option>
-          <option value='del Libertador Gral. Bernardo O&apos;Higgins'>O&apos;Higgins</option>
-          <option value='del Maule'>del Maule</option>
-          <option value='de los Lagos'>de los Lagos</option>
-          <option value='Tarapacá'>Tarapacá</option>
-          <option value='Atacama'>Atacama</option>
-          <option value='Arica y Parinacota'>Arica y Parinacota</option>
-          <option value='Aysén del Gral. Carlos Ibáñez del Campo'>Aysén</option>
-          <option value='Magallanes'>Magallanes</option>
-          <option value='Los Ríos'>Los Ríos</option>
-          <option value='del Ñuble'>del Ñuble</option>
-        </select>
-      </div>
-      <div class='full' id='giroGroup' style='display:none'>
-        <label>Giro (solo factura)</label>
-        <input id='editGiro'>
-      </div>
-      <div>
-        <label>Total bruto ML</label>
-        <input id='editTotal' disabled>
-      </div>
-      <div>
-        <label>Cantidad de ítems</label>
-        <input id='editItemsCount' disabled>
-      </div>
-      <div class='full'>
-        <label>Productos vendidos</label>
-        <textarea id='editProducts' disabled></textarea>
-      </div>
+    <div class="modal-grid">
+      <div><label>ID venta ML</label><input id="editId" disabled></div>
+      <div><label>Tipo documento</label><select id="editTipo" onchange="toggleGiro()"><option value="Boleta">Boleta</option><option value="Factura">Factura</option></select></div>
+      <div><label>Email DTE</label><input id="editEmail"></div>
+      <div><label>RUT</label><input id="editRut"></div>
+      <div class="full"><label>Nombre cliente</label><input id="editCliente"></div>
+      <div class="full"><label>Direccion</label><input id="editDireccion"></div>
+      <div><label>Ciudad / Comuna</label><input id="editCiudad"></div>
+      <div><label>Region</label><select id="editRegion">
+        <option value="">-- Seleccionar --</option>
+        <option value="Metropolitana">Metropolitana (RM)</option>
+        <option value="Valparaiso">Valparaiso</option>
+        <option value="del BioBio">del BioBio</option>
+        <option value="de la Araucania">de la Araucania</option>
+        <option value="Antofagasta">Antofagasta</option>
+        <option value="Coquimbo">Coquimbo</option>
+        <option value="del Libertador Gral. Bernardo O'Higgins">O'Higgins</option>
+        <option value="del Maule">del Maule</option>
+        <option value="de los Lagos">de los Lagos</option>
+        <option value="Tarapaca">Tarapaca</option>
+        <option value="Atacama">Atacama</option>
+        <option value="Arica y Parinacota">Arica y Parinacota</option>
+        <option value="Aysen del Gral. Carlos Ibanez del Campo">Aysen</option>
+        <option value="Magallanes">Magallanes</option>
+        <option value="Los Rios">Los Rios</option>
+        <option value="del Nuble">del Nuble</option>
+      </select></div>
+      <div class="full" id="giroGroup" style="display:none"><label>Giro (solo factura)</label><input id="editGiro"></div>
+      <div><label>Total bruto ML</label><input id="editTotal" disabled></div>
+      <div><label>Cantidad items</label><input id="editItemsCount" disabled></div>
+      <div class="full"><label>Productos vendidos</label><textarea id="editProducts" disabled></textarea></div>
     </div>
-    <div class='modal-actions'>
-      <button class='secondary' onclick='closeModal()'>Cancelar</button>
-      <button class='warn' onclick='reprocesarActual()'>Reprocesar desde ML</button>
-      <button onclick='saveEdit()'>Guardar</button>
-      <button class='success' onclick='saveAndAuthorize()'>Guardar y autorizar</button>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeModal()">Cancelar</button>
+      <button class="warn" onclick="reprocesarActual()">Reprocesar desde ML</button>
+      <button onclick="saveEdit()">Guardar</button>
+      <button class="success" onclick="saveAndAuthorize()">Guardar y autorizar</button>
     </div>
   </div>
 </div>
+<div class="modal" id="packModal">
+  <div class="modal-card" style="max-width:680px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div><div class="title" style="font-size:20px">Pack</div><div class="subtitle" id="packModalTitle"></div></div>
+      <button class="secondary" onclick="closePackModal()">Cerrar</button>
+    </div>
+    <div id="packModalBody"></div>
+  </div>
+</div>
+<script src="/ui/app.js"></script>
+</body>
+</html>
+"""
 
-<script>
+UI_JS = '''
 let ventas = [];
 let currentId = null;
 
@@ -2183,22 +2138,15 @@ setInterval(() => {
     refreshData();
   }
 }, 60000);
-</script>
+'''
 
-<!-- Modal Pack -->
-<div class='modal' id='packModal'>
-  <div class='modal-card' style='max-width:680px'>
-    <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;'>
-      <div>
-        <div class='title' style='font-size:20px'>📦 Detalle del pack</div>
-        <div class='subtitle' id='packModalTitle'></div>
-      </div>
-      <button class='secondary' onclick='closePackModal()'>Cerrar</button>
-    </div>
-    <div id='packModalBody'></div>
-  </div>
-</div>
 
-</body>
-</html>
-""")
+@app.get("/ui/app.js")
+def ui_js():
+    from fastapi.responses import Response
+    return Response(content=UI_JS, media_type="application/javascript; charset=utf-8")
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui_bandeja():
+    return HTMLResponse(content=UI_HTML)
