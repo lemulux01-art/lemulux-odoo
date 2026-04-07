@@ -1800,7 +1800,7 @@ let currentId = null;
 
 function badge(estado) {
   const map = { pendiente: 'badge-pendiente', enviado: 'badge-enviado', error: 'badge-error' };
-  return '<span class="badge ' + (map[estado] || 'badge-default') + '">' + safe(estado) + '</span>';
+  return `<span class="badge ${map[estado] || 'badge-default'}">${estado}</span>`;
 }
 
 function safe(v) { return v == null || v === '' ? '—' : String(v); }
@@ -2023,12 +2023,9 @@ async function agruparSeleccionadas() {
 
   // Mostrar resumen antes de confirmar
   const ventasSelec = ids.map(id => ventas.find(v => String(v.id) === id)).filter(Boolean);
-  const resumen = ventasSelec.map(function(v){ return '• ' + safe(v.cliente) + ' — ' + safe(v.id); }).join('\n');
-  const msg = '¿Agrupar estas ' + ids.length + ' ventas en una sola boleta/factura?' +
-    '\n\nLa primera será la principal y las demás quedarán como rechazadas:' +
-    '\n\n' + resumen +
-    '\n\nEsta acción no se puede deshacer.';
-  if (!confirm(msg)) return;
+  const resumen = ventasSelec.map(v => `• ${v.cliente} — ${v.id}`).join('\n');
+
+  if (!confirm(`¿Agrupar estas ${ids.length} ventas en una sola boleta/factura?\n\nLa primera será la principal y las demás quedarán como "rechazadas":\n\n${resumen}\n\nEsta acción no se puede deshacer.`)) return;
 
   const res = await fetch('/ventas/agrupar', {
     method: 'POST',
@@ -2050,7 +2047,7 @@ async function agruparSeleccionadas() {
 async function reprocesarTodo() {
   const pendientes = ventas.filter(v => v.estado === 'pendiente' || v.estado === 'error');
   if (!pendientes.length) { alert('No hay ventas pendientes para reprocesar'); return; }
-  if (!confirm('¿Reprocesar las ' + pendientes.length + ' ventas pendientes/con error desde ML?\nEsto actualizará los datos de cada venta con la información actual de Mercado Libre.')) return;
+  if (!confirm(`¿Reprocesar las ${pendientes.length} ventas pendientes/con error desde ML?\nEsto actualizará los datos de cada venta con la información actual de Mercado Libre.`)) return;
 
   const btn = event.target;
   btn.disabled = true;
