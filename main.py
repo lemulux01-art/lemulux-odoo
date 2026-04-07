@@ -1385,6 +1385,73 @@ def ventas(estado: Optional[str] = None):
     return {"items": enriched}
 
 
+@app.post("/ventas/reprocesar-todo")
+def reprocesar_todo():
+    """Reprocesa desde ML todas las ventas pendientes o con error."""
+    todas = list_ventas("pendiente") + list_ventas("error")
+    resultados = {"ok": 0, "error": 0, "errores": []}
+    for venta in todas:
+        try:
+            reprocesar_venta_desde_ml(str(venta["id"]))
+            resultados["ok"] += 1
+        except Exception as e:
+            resultados["error"] += 1
+            resultados["errores"].append({"id": venta["id"], "error": str(e)[:200]})
+    return resultados
+
+
+class AgruparPayload(BaseModel):
+    ids: list
+
+
+@app.post("/ventas/agrupar")
+def agrupar_ventas(payload: AgruparPayload):
+    """Consolida múltiples ventas en una sola fila."""
+    ids = [str(i) for i in payload.ids]
+    if len(ids) < 2:
+        raise HTTPException(status_code=400, detail="Se necesitan al menos 2 ventas para agrupar")
+
+    ventas_list = []
+    for oid in ids:
+        v = get_venta(oid)
+        if not v:
+            raise HTTPException(status_code=404, detail=f"Venta {oid} no encontrada")
+        if v.get("estado") == "enviado":
+            raise HTTPException(status_code=400, detail=f"La venta {oid} ya fue enviada a Odoo y no se puede agrupar")
+        ventas_list.append(v)
+
+    principal = ventas_list[0]
+    secundarias = ventas_list[1:]
+
+    try:
+        order_principal = json.loads(principal["order_json"])
+        all_items = list(order_principal.get("order_items", []))
+
+        for v in secundarias:
+            order_sec = json.loads(v["order_json"])
+            all_items.extend(order_sec.get("order_items", []))
+
+        order_consolidado = {**order_principal, "order_items": all_items}
+        _, item_count, total_bruto = summarize_order_items(order_consolidado)
+
+        update_venta(principal["id"],
+            order_json=json.dumps(order_consolidado, ensure_ascii=False))
+
+        for v in secundarias:
+            update_venta(v["id"], estado="rechazado",
+                error=f"Agrupada en venta {principal['id']}")
+
+        return {
+            "ok": True,
+            "venta_principal": principal["id"],
+            "agrupadas": [v["id"] for v in secundarias],
+            "total_items": item_count,
+            "total_bruto": total_bruto,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/ventas/{oid}")
 def venta_detalle(oid: str):
     venta = get_venta(oid)
@@ -1484,85 +1551,6 @@ def ver_pack(oid: str):
             "pack_id": pack_id,
             "total_pack": round(total_pack, 2),
             "ordenes": ordenes,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/ventas/reprocesar-todo")
-def reprocesar_todo():
-    """Reprocesa desde ML todas las ventas pendientes o con error."""
-    ventas = list_ventas("pendiente") + list_ventas("error")
-    resultados = {"ok": 0, "error": 0, "errores": []}
-    for venta in ventas:
-        try:
-            reprocesar_venta_desde_ml(str(venta["id"]))
-            resultados["ok"] += 1
-        except Exception as e:
-            resultados["error"] += 1
-            resultados["errores"].append({"id": venta["id"], "error": str(e)[:200]})
-    return resultados
-
-
-class AgruparPayload(BaseModel):
-    ids: list
-
-
-@app.post("/ventas/agrupar")
-def agrupar_ventas(payload: AgruparPayload):
-    """
-    Consolida múltiples ventas en una sola fila.
-    Toma la primera como venta principal, le agrega los items de las demás
-    y elimina (rechaza) las secundarias.
-    """
-    ids = [str(i) for i in payload.ids]
-    if len(ids) < 2:
-        raise HTTPException(status_code=400, detail="Se necesitan al menos 2 ventas para agrupar")
-
-    ventas = []
-    for oid in ids:
-        v = get_venta(oid)
-        if not v:
-            raise HTTPException(status_code=404, detail=f"Venta {oid} no encontrada")
-        if v.get("estado") == "enviado":
-            raise HTTPException(status_code=400, detail=f"La venta {oid} ya fue enviada a Odoo y no se puede agrupar")
-        ventas.append(v)
-
-    # La primera venta es la principal
-    principal = ventas[0]
-    secundarias = ventas[1:]
-
-    # Consolidar todos los order_items
-    try:
-        order_principal = json.loads(principal["order_json"])
-        billing_principal = json.loads(principal["billing_json"])
-        all_items = list(order_principal.get("order_items", []))
-
-        for v in secundarias:
-            order_sec = json.loads(v["order_json"])
-            all_items.extend(order_sec.get("order_items", []))
-
-        # Actualizar el order_json de la principal con todos los items
-        order_consolidado = {**order_principal, "order_items": all_items}
-
-        # Calcular nuevo total
-        _, item_count, total_bruto = summarize_order_items(order_consolidado)
-
-        # Guardar venta principal con items consolidados
-        update_venta(principal["id"],
-            order_json=json.dumps(order_consolidado, ensure_ascii=False),
-        )
-
-        # Rechazar las secundarias
-        for v in secundarias:
-            update_venta(v["id"], estado="rechazado", error=f"Agrupada en venta {principal['id']}")
-
-        return {
-            "ok": True,
-            "venta_principal": principal["id"],
-            "agrupadas": [v["id"] for v in secundarias],
-            "total_items": item_count,
-            "total_bruto": total_bruto,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
