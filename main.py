@@ -271,7 +271,6 @@ def extract_rut(billing_info: dict) -> str:
 
 
 def extract_name(billing_info: dict, order: dict) -> str:
-    # Preferir razón social / empresa si existe
     for key in ("business_name", "company_name", "razon_social", "social_reason", "legal_name"):
         val = billing_info.get(key)
         if isinstance(val, str) and val.strip():
@@ -329,7 +328,6 @@ def extract_activity(billing_info: dict, order: dict) -> str:
             if isinstance(val, str) and val.strip():
                 return val.strip()
 
-    # fallback desde order si viniera
     buyer = order.get("buyer") or {}
     for key in ("giro", "economic_activity", "activity"):
         val = buyer.get(key)
@@ -355,13 +353,27 @@ def format_address_dict(address: dict) -> str:
         return ""
 
     parts = []
-    street = address.get("street_name", "") or address.get("address_line", "")
-    number = address.get("street_number", "")
-    comment = address.get("comment", "")
-    municipality = address.get("municipality_name", "") or safe_get(address, "municipality", "name", default="")
-    city = address.get("city_name", "") or safe_get(address, "city", "name", default="")
-    state = address.get("state_name", "") or safe_get(address, "state", "name", default="")
-    zip_code = address.get("zip_code", "")
+    street = (
+        address.get("street_name")
+        or address.get("address_line")
+        or address.get("line")
+        or ""
+    )
+    number = address.get("street_number") or address.get("number") or ""
+    comment = address.get("comment") or address.get("reference") or ""
+    municipality = (
+        address.get("municipality_name")
+        or safe_get(address, "municipality", "name", default="")
+    )
+    city = (
+        address.get("city_name")
+        or safe_get(address, "city", "name", default="")
+    )
+    state = (
+        address.get("state_name")
+        or safe_get(address, "state", "name", default="")
+    )
+    zip_code = address.get("zip_code") or address.get("zipcode") or ""
 
     if street:
         parts.append(f"{street} {number}".strip())
@@ -385,10 +397,10 @@ def extract_direccion(order: dict, billing_info: dict) -> str:
     if direccion:
         return direccion
 
-    # 2) additional_info con address/billing address
+    # 2) billing_info.additional_info
     for item in billing_info.get("additional_info") or []:
         item_type = (item.get("type") or "").upper()
-        if item_type in ("ADDRESS", "BILLING_ADDRESS"):
+        if item_type in ("ADDRESS", "BILLING_ADDRESS", "BUYER_ADDRESS"):
             value = item.get("value")
             if isinstance(value, str) and value.strip():
                 return value.strip()
@@ -397,13 +409,18 @@ def extract_direccion(order: dict, billing_info: dict) -> str:
                 if direccion:
                     return direccion
 
-    # 3) buyer.address
+    # 3) buyer.address (datos del comprador)
     buyer = order.get("buyer") or {}
     direccion = format_address_dict(buyer.get("address") or {})
     if direccion:
         return direccion
 
-    # 4) shipping.receiver_address
+    # 4) buyer.address_details
+    direccion = format_address_dict(buyer.get("address_details") or {})
+    if direccion:
+        return direccion
+
+    # 5) shipping.receiver_address
     shipping = order.get("shipping") or {}
     direccion = format_address_dict(shipping.get("receiver_address") or {})
     if direccion:
@@ -420,7 +437,6 @@ def detect_tipo(order: dict, billing_info: dict) -> str:
     if extract_activity(billing_info, order):
         return "Factura"
 
-    # heurística empresa / negocio
     for key in ("business_name", "company_name", "razon_social", "social_reason", "legal_name"):
         val = billing_info.get(key)
         if isinstance(val, str) and val.strip():
@@ -544,7 +560,7 @@ def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
             ctx,
             "account.journal",
             "search",
-            [[[ "type", "=", "sale" ], [ "name", "=", "Facturas de cliente" ]]],
+            [[["type", "=", "sale"], ["name", "=", "Facturas de cliente"]]],
             {"limit": 1},
         )
     else:
@@ -552,19 +568,19 @@ def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
             ctx,
             "account.journal",
             "search",
-            [[[ "type", "=", "sale" ], [ "name", "ilike", "Boleta" ]]],
+            [[["type", "=", "sale"], ["name", "ilike", "Boleta"]]],
             {"limit": 1},
         )
     return ids[0] if ids else None
 
 
 def get_chile_country_id(ctx: OdooCtx) -> Optional[int]:
-    ids = odoo_exec(ctx, "res.country", "search", [[[ "code", "=", "CL" ]]], {"limit": 1})
+    ids = odoo_exec(ctx, "res.country", "search", [[["code", "=", "CL"]]], {"limit": 1})
     return ids[0] if ids else None
 
 
 def get_rut_id_type(ctx: OdooCtx) -> Optional[int]:
-    ids = odoo_exec(ctx, "l10n_latam.identification.type", "search", [[[ "name", "ilike", "RUT" ]]], {"limit": 1})
+    ids = odoo_exec(ctx, "l10n_latam.identification.type", "search", [[["name", "ilike", "RUT"]]], {"limit": 1})
     return ids[0] if ids else None
 
 
@@ -573,7 +589,7 @@ def get_tax_19(ctx: OdooCtx) -> Optional[int]:
         ctx,
         "account.tax",
         "search",
-        [[[ "type_tax_use", "=", "sale" ], [ "amount", "=", 19 ], [ "active", "=", True ]]],
+        [[["type_tax_use", "=", "sale"], ["amount", "=", 19], ["active", "=", True]]],
         {"limit": 1},
     )
     return ids[0] if ids else None
@@ -587,7 +603,7 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
     if len(rut_norm) > 1:
         variantes.append(rut_norm[:-1] + "-" + rut_norm[-1])
     for variante in variantes:
-        ids = odoo_exec(ctx, "res.partner", "search", [[[ "vat", "=", variante ]]], {"limit": 1})
+        ids = odoo_exec(ctx, "res.partner", "search", [[["vat", "=", variante]]], {"limit": 1})
         if ids:
             return ids[0]
     return None
@@ -636,7 +652,7 @@ def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
         ctx,
         "account.move",
         "search",
-        [[[ "ref", "=", f"ML-{order_id}" ], [ "state", "in", [ "draft", "posted", "cancel" ] ]]],
+        [[["ref", "=", f"ML-{order_id}"], ["state", "in", ["draft", "posted", "cancel"]]]],
         {"limit": 1},
     )
     return ids[0] if ids else None
