@@ -122,6 +122,8 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS direccion TEXT",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS giro TEXT",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS partner_id INTEGER",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS ciudad TEXT",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS region TEXT",
             ]:
                 cur.execute(stmt)
         conn.commit()
@@ -151,6 +153,8 @@ def save_venta(
     giro: str,
     direccion: str,
     email: str = "",
+    ciudad: str = "",
+    region: str = "",
 ):
     oid = str(order["id"])
     email_final = (email or ML_DEFAULT_EMAIL).strip()
@@ -158,6 +162,8 @@ def save_venta(
     direccion_final = (direccion or "").strip()
     cliente_final = (cliente or "Cliente ML").strip()
     giro_final = (giro or "").strip()
+    ciudad_final = (ciudad or "").strip()
+    region_final = (region or "").strip()
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -172,6 +178,8 @@ def save_venta(
                         rut = %s,
                         email = %s,
                         direccion = %s,
+                        ciudad = %s,
+                        region = %s,
                         tipo_sugerido = %s,
                         order_json = %s,
                         billing_json = %s,
@@ -186,6 +194,8 @@ def save_venta(
                         rut_final,
                         email_final,
                         direccion_final,
+                        ciudad_final,
+                        region_final,
                         tipo_sugerido,
                         json.dumps(order, ensure_ascii=False),
                         json.dumps(billing, ensure_ascii=False),
@@ -200,8 +210,8 @@ def save_venta(
             cur.execute(
                 """
                 INSERT INTO ventas
-                    (id, cliente, rut, email, giro, direccion, tipo_sugerido, estado, order_json, billing_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s)
+                    (id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, order_json, billing_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s)
                 """,
                 (
                     oid,
@@ -210,6 +220,8 @@ def save_venta(
                     email_final,
                     giro_final,
                     direccion_final,
+                    ciudad_final,
+                    region_final,
                     tipo_sugerido,
                     json.dumps(order, ensure_ascii=False),
                     json.dumps(billing, ensure_ascii=False),
@@ -259,6 +271,8 @@ class VentaUpdate(BaseModel):
     email: Optional[str] = None
     giro: Optional[str] = None
     direccion: Optional[str] = None
+    ciudad: Optional[str] = None
+    region: Optional[str] = None
     tipo_sugerido: Optional[str] = None
 
 
@@ -488,28 +502,116 @@ def score_address_candidate(text: str) -> int:
     return score
 
 
+# Mapeo STATE_CODE ML → nombre región Odoo Chile
+ML_STATE_CODE_TO_REGION = {
+    "CL-AI": "Aysén del Gral. Carlos Ibáñez del Campo",
+    "CL-AN": "Antofagasta",
+    "CL-AP": "Arica y Parinacota",
+    "CL-AR": "de la Araucania",
+    "CL-AT": "Atacama",
+    "CL-BI": "del BíoBio",
+    "CL-CO": "Coquimbo",
+    "CL-LI": "del Libertador Gral. Bernardo O'Higgins",
+    "CL-LL": "de los Lagos",
+    "CL-LR": "Los Ríos",
+    "CL-MA": "Magallanes",
+    "CL-ML": "del Maule",
+    "CL-NB": "del Ñuble",
+    "CL-RM": "Metropolitana",
+    "CL-TA": "Tarapacá",
+    "CL-VS": "Valparaíso",
+}
+
+
+def extract_from_additional_info(billing_info: dict) -> dict:
+    """
+    Extrae campos clave desde additional_info de MLC.
+    Retorna dict con: street, number, neighborhood, city, state_name, state_code, zip_code
+    """
+    fields = {}
+    for item in billing_info.get("additional_info") or []:
+        t = (item.get("type") or "").upper()
+        v = item.get("value")
+        if isinstance(v, str) and v.strip():
+            fields[t] = v.strip()
+    return fields
+
+
+def extract_direccion_from_additional_info(billing_info: dict) -> str:
+    """
+    Construye la dirección desde additional_info de MLC.
+    Estructura real MLC: STREET_NAME, STREET_NUMBER, CITY_NAME, STATE_NAME, NEIGHBORHOOD
+    """
+    fields = extract_from_additional_info(billing_info)
+    if not fields:
+        return ""
+
+    parts = []
+    street = fields.get("STREET_NAME", "")
+    number = fields.get("STREET_NUMBER", "")
+    neighborhood = fields.get("NEIGHBORHOOD", "")
+    city = fields.get("CITY_NAME", "")
+    state = fields.get("STATE_NAME", "")
+
+    if street:
+        parts.append(f"{street} {number}".strip())
+    if neighborhood and neighborhood.lower() != city.lower():
+        parts.append(neighborhood)
+    if city:
+        parts.append(city)
+    if state:
+        parts.append(state)
+
+    return ", ".join(filter(None, parts))
+
+
+def extract_ciudad_from_billing(billing_info: dict) -> str:
+    """Extrae la ciudad/comuna desde billing_info."""
+    fields = extract_from_additional_info(billing_info)
+    return (
+        fields.get("CITY_NAME")
+        or fields.get("NEIGHBORHOOD")
+        or safe_get(billing_info, "address", "city_name", default="")
+        or ""
+    )
+
+
+def extract_region_from_billing(billing_info: dict) -> str:
+    """Extrae la región desde billing_info, mapeando STATE_CODE al nombre Odoo."""
+    fields = extract_from_additional_info(billing_info)
+
+    # Preferir mapeo por código (más preciso)
+    state_code = fields.get("STATE_CODE", "").upper()
+    if state_code and state_code in ML_STATE_CODE_TO_REGION:
+        return ML_STATE_CODE_TO_REGION[state_code]
+
+    # Fallback al nombre de estado
+    return (
+        fields.get("STATE_NAME")
+        or safe_get(billing_info, "address", "state_name", default="")
+        or ""
+    )
+
+
 def extract_direccion(order: dict, billing_info: dict, billing_raw: dict | None = None) -> str:
+    # 1. Primero desde additional_info (estructura real MLC)
+    direccion = extract_direccion_from_additional_info(billing_info)
+    if direccion:
+        return direccion
+
+    # 2. Desde address como objeto dict
     candidates = [
         billing_info.get("address") or {},
         safe_get(order, "buyer", "address", default={}),
         safe_get(order, "buyer", "address_details", default={}),
         safe_get(order, "shipping", "receiver_address", default={}),
     ]
-
     for c in candidates:
         direccion = format_address_dict(c)
         if direccion:
             return direccion
 
-    for item in billing_info.get("additional_info") or []:
-        value = item.get("value")
-        if isinstance(value, dict):
-            direccion = format_address_dict(value)
-            if direccion:
-                return direccion
-        elif isinstance(value, str) and looks_like_chilean_address(value):
-            return value.strip()
-
+    # 3. Fallback: buscar strings que parezcan dirección
     blobs = []
     blobs.extend(flatten_strings(order))
     blobs.extend(flatten_strings(billing_info))
@@ -763,6 +865,16 @@ def find_partner_by_ml_order(ctx: OdooCtx, order_id: str) -> Optional[int]:
     return ids[0] if ids else None
 
 
+def get_state_id(ctx: OdooCtx, region_name: str) -> Optional[int]:
+    """Busca el state_id de Odoo por nombre de región chilena."""
+    if not region_name:
+        return None
+    ids = odoo_exec(ctx, "res.country.state", "search",
+        [[["name", "ilike", region_name], ["country_id.code", "=", "CL"]]],
+        {"limit": 1})
+    return ids[0] if ids else None
+
+
 def upsert_partner(
     ctx: OdooCtx,
     order_id: str,
@@ -773,6 +885,8 @@ def upsert_partner(
     direccion: str,
     es_empresa: bool,
     tipo: str,
+    ciudad: str = "",
+    region: str = "",
 ) -> int:
     partner_fields = get_partner_fields(ctx)
     activity_field = get_activity_field_name(ctx)
@@ -799,6 +913,14 @@ def upsert_partner(
         vals["l10n_cl_dte_email"] = email
     if direccion and "street" in partner_fields:
         vals["street"] = direccion
+    # Ciudad/comuna → campo "city" en Odoo
+    if ciudad and "city" in partner_fields:
+        vals["city"] = ciudad
+    # Región → state_id en Odoo
+    if region and "state_id" in partner_fields:
+        state_id = get_state_id(ctx, region)
+        if state_id:
+            vals["state_id"] = state_id
     if chile_id and "country_id" in partner_fields:
         vals["country_id"] = chile_id
     if "company_type" in partner_fields:
@@ -819,11 +941,11 @@ def upsert_partner(
 
     if partner_id:
         odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
-        logger.info(f"Partner actualizado: id={partner_id}")
+        logger.info(f"Partner actualizado: id={partner_id} ciudad={ciudad} region={region}")
         return partner_id
 
     partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
-    logger.info(f"Partner creado: id={partner_id} empresa={es_empresa} tipo={tipo}")
+    logger.info(f"Partner creado: id={partner_id} empresa={es_empresa} ciudad={ciudad}")
     return partner_id
 
 
@@ -851,6 +973,8 @@ def create_document(
     cliente_override: Optional[str] = None,
     rut_override: Optional[str] = None,
     direccion_override: Optional[str] = None,
+    ciudad_override: Optional[str] = None,
+    region_override: Optional[str] = None,
 ) -> tuple[int, int]:
     ctx = odoo_connect()
     order_id = str(order["id"])
@@ -864,6 +988,8 @@ def create_document(
     rut = normalize_rut(rut_override) if rut_override else extract_rut(billing_info)
     nombre = (cliente_override or extract_name(billing_info, order) or "Cliente ML").strip()
     direccion = (direccion_override or extract_direccion(order, billing_info, billing_raw) or "").strip()
+    ciudad = (ciudad_override or extract_ciudad_from_billing(billing_info) or "").strip()
+    region = (region_override or extract_region_from_billing(billing_info) or "").strip()
     email = (email or ML_DEFAULT_EMAIL).strip()
     giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
@@ -884,6 +1010,8 @@ def create_document(
         direccion=direccion,
         es_empresa=es_empresa,
         tipo=tipo,
+        ciudad=ciudad,
+        region=region,
     )
 
     journal_id = get_journal(ctx, tipo)
@@ -954,14 +1082,16 @@ def process_webhook_order(order_id: str):
         cliente = extract_name(billing_info, order)
         giro = extract_activity(billing_info, order)
         direccion = extract_direccion(order, billing_info, billing_raw)
+        ciudad = extract_ciudad_from_billing(billing_info)
+        region = extract_region_from_billing(billing_info)
         email = extract_email(billing_info, order)
         tipo_sugerido = detect_tipo(order, billing_info)
 
         if tipo_sugerido == "Boleta" and not giro:
             giro = DEFAULT_BOLETA_ACTIVITY
 
-        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email)
-        logger.info(f"[{order_id}] ✅ Guardada/actualizada: {tipo_sugerido} dirección='{direccion or 'sin dirección'}' giro='{giro or 'sin giro'}'")
+        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email, ciudad, region)
+        logger.info(f"[{order_id}] ✅ Guardada: {tipo_sugerido} dir='{direccion}' ciudad='{ciudad}' region='{region}'")
     except Exception as e:
         logger.error(f"[{order_id}] Error procesando webhook: {e}", exc_info=True)
 
@@ -978,13 +1108,15 @@ def reprocesar_venta_desde_ml(order_id: str):
     cliente = extract_name(billing_info, order)
     giro = extract_activity(billing_info, order)
     direccion = extract_direccion(order, billing_info, billing_raw)
+    ciudad = extract_ciudad_from_billing(billing_info)
+    region = extract_region_from_billing(billing_info)
     email = extract_email(billing_info, order)
     tipo_sugerido = detect_tipo(order, billing_info)
 
     if tipo_sugerido == "Boleta" and not giro:
         giro = DEFAULT_BOLETA_ACTIVITY
 
-    save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email)
+    save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email, ciudad, region)
 
     items, item_count, total_bruto = summarize_order_items(order)
 
@@ -1194,6 +1326,8 @@ def autorizar_venta(oid: str):
             cliente_override=venta.get("cliente"),
             rut_override=venta.get("rut"),
             direccion_override=venta.get("direccion"),
+            ciudad_override=venta.get("ciudad"),
+            region_override=venta.get("region"),
         )
         update_venta(
             oid,
@@ -1343,8 +1477,34 @@ def ui_bandeja():
         <input id='editCliente'>
       </div>
       <div class='full'>
-        <label>Dirección</label>
+        <label>Dirección (calle y número)</label>
         <input id='editDireccion'>
+      </div>
+      <div>
+        <label>Ciudad / Comuna</label>
+        <input id='editCiudad'>
+      </div>
+      <div>
+        <label>Región</label>
+        <select id='editRegion'>
+          <option value=''>-- Seleccionar --</option>
+          <option value='Metropolitana'>Metropolitana (RM)</option>
+          <option value='Valparaíso'>Valparaíso</option>
+          <option value='del BíoBio'>del BíoBio</option>
+          <option value='de la Araucania'>de la Araucanía</option>
+          <option value='Antofagasta'>Antofagasta</option>
+          <option value='Coquimbo'>Coquimbo</option>
+          <option value='del Libertador Gral. Bernardo O&apos;Higgins'>O&apos;Higgins</option>
+          <option value='del Maule'>del Maule</option>
+          <option value='de los Lagos'>de los Lagos</option>
+          <option value='Tarapacá'>Tarapacá</option>
+          <option value='Atacama'>Atacama</option>
+          <option value='Arica y Parinacota'>Arica y Parinacota</option>
+          <option value='Aysén del Gral. Carlos Ibáñez del Campo'>Aysén</option>
+          <option value='Magallanes'>Magallanes</option>
+          <option value='Los Ríos'>Los Ríos</option>
+          <option value='del Ñuble'>del Ñuble</option>
+        </select>
       </div>
       <div class='full' id='giroGroup' style='display:none'>
         <label>Giro (solo factura)</label>
@@ -1422,7 +1582,7 @@ function renderTable() {
         <th>Fecha / ID ML</th>
         <th>Cliente / Razón social</th>
         <th>RUT</th>
-        <th>Dirección</th>
+        <th>Dirección / Ciudad / Región</th>
         <th>Total / Ítems</th>
         <th>Tipo</th>
         <th>Estado</th>
@@ -1442,7 +1602,11 @@ function renderTable() {
               ${v.giro ? `<div class='small'>${safe(v.giro)}</div>` : ''}
             </td>
             <td>${safe(v.rut)}</td>
-            <td>${safe(v.direccion)}</td>
+            <td>
+              ${safe(v.direccion)}
+              ${v.ciudad ? `<div class='small'>📍 ${safe(v.ciudad)}</div>` : ''}
+              ${v.region ? `<div class='small'>${safe(v.region)}</div>` : ''}
+            </td>
             <td>
               <strong>${money(v.total_bruto)}</strong>
               <div class='small'>${safe(v.cantidad_items)} ítems</div>
@@ -1500,6 +1664,8 @@ function openEdit(id) {
   document.getElementById('editCliente').value = v.cliente || '';
   document.getElementById('editRut').value = v.rut || '';
   document.getElementById('editDireccion').value = v.direccion || '';
+  document.getElementById('editCiudad').value = v.ciudad || '';
+  document.getElementById('editRegion').value = v.region || '';
   document.getElementById('editGiro').value = v.tipo_sugerido === 'Factura' ? (v.giro || '') : '';
   document.getElementById('editTotal').value = money(v.total_bruto);
   document.getElementById('editItemsCount').value = v.cantidad_items || 0;
@@ -1522,6 +1688,8 @@ async function saveEdit() {
     cliente: document.getElementById('editCliente').value,
     rut: document.getElementById('editRut').value,
     direccion: document.getElementById('editDireccion').value,
+    ciudad: document.getElementById('editCiudad').value,
+    region: document.getElementById('editRegion').value,
     giro: tipo === 'Factura' ? document.getElementById('editGiro').value : '',
   };
 
