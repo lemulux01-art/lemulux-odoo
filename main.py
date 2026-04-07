@@ -72,7 +72,8 @@ def get_db():
 def init_db():
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS ventas (
                     id TEXT PRIMARY KEY,
                     cliente TEXT,
@@ -89,7 +90,8 @@ def init_db():
                     creado_en TIMESTAMP DEFAULT NOW(),
                     enviado_en TIMESTAMP
                 )
-            """)
+                """
+            )
             cur.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS direccion TEXT")
         conn.commit()
     logger.info("✅ Tabla ventas verificada en PostgreSQL")
@@ -110,22 +112,69 @@ def wait_for_db():
 
 
 def save_venta(order: dict, billing: dict, tipo_sugerido: str,
-               cliente: str, rut: str, giro: str, direccion: str):
+               cliente: str, rut: str, giro: str, direccion: str, email: str = ""):
     oid = str(order["id"])
+    email_final = (email or ML_DEFAULT_EMAIL).strip()
+    rut_final = normalize_rut(rut)
+    direccion_final = (direccion or "").strip()
+    cliente_final = (cliente or "Cliente ML").strip()
+    giro_final = (giro or "").strip()
+
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM ventas WHERE id = %s", (oid,))
-            if cur.fetchone():
-                logger.info(f"[{oid}] Venta ya existe en bandeja")
+            cur.execute("SELECT id, estado, move_id FROM ventas WHERE id = %s", (oid,))
+            existing = cur.fetchone()
+
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE ventas
+                    SET cliente = %s,
+                        rut = %s,
+                        email = %s,
+                        giro = %s,
+                        direccion = %s,
+                        tipo_sugerido = %s,
+                        order_json = %s,
+                        billing_json = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        cliente_final,
+                        rut_final,
+                        email_final,
+                        giro_final,
+                        direccion_final,
+                        tipo_sugerido,
+                        json.dumps(order),
+                        json.dumps(billing),
+                        oid,
+                    ),
+                )
+                conn.commit()
+                logger.info(f"[{oid}] Venta actualizada → dirección='{direccion_final or 'sin dirección'}'")
                 return
-            cur.execute("""
+
+            cur.execute(
+                """
                 INSERT INTO ventas
                     (id, cliente, rut, email, giro, direccion, tipo_sugerido, estado, order_json, billing_json)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s)
-            """, (oid, cliente, rut, ML_DEFAULT_EMAIL, giro, direccion,
-                  tipo_sugerido, json.dumps(order), json.dumps(billing)))
+                """,
+                (
+                    oid,
+                    cliente_final,
+                    rut_final,
+                    email_final,
+                    giro_final,
+                    direccion_final,
+                    tipo_sugerido,
+                    json.dumps(order),
+                    json.dumps(billing),
+                ),
+            )
         conn.commit()
-    logger.info(f"[{oid}] Guardada → tipo={tipo_sugerido} rut={rut or 'sin RUT'} cliente={cliente}")
+    logger.info(f"[{oid}] Guardada → tipo={tipo_sugerido} rut={rut_final or 'sin RUT'} cliente={cliente_final} dirección='{direccion_final or 'sin dirección'}'")
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
@@ -176,7 +225,6 @@ class VentaUpdate(BaseModel):
 # =========================
 
 def get_billing_info(billing_response: dict) -> dict:
-    """Extrae el billing_info real de la respuesta de ML Chile."""
     if "buyer" in billing_response:
         return billing_response["buyer"].get("billing_info", {}) or {}
     if "billing_info" in billing_response:
@@ -185,11 +233,11 @@ def get_billing_info(billing_response: dict) -> dict:
 
 
 def extract_rut(billing_info: dict) -> str:
-    """RUT viene en identification.number para MLC."""
     identification = billing_info.get("identification") or {}
     number = identification.get("number", "")
     if number:
         return normalize_rut(str(number))
+
     for item in billing_info.get("additional_info") or []:
         if item.get("type") in ("DOC_NUMBER", "RUT"):
             return normalize_rut(str(item.get("value", "")))
@@ -211,25 +259,56 @@ def extract_activity(billing_info: dict) -> str:
     return taxes.get("economic_activity", "").strip()
 
 
+def extract_email(billing_info: dict, buyer: dict) -> str:
+    email = (billing_info.get("email") or "").strip()
+    if email:
+        return email
+    buyer_email = (buyer.get("email") or "").strip() if isinstance(buyer, dict) else ""
+    if buyer_email:
+        return buyer_email
+    return ML_DEFAULT_EMAIL
+
+
 def extract_direccion(billing_info: dict) -> str:
     address = billing_info.get("address") or {}
+
+    if not address:
+        for item in billing_info.get("additional_info") or []:
+            item_type = (item.get("type") or "").upper()
+            if item_type in ("ADDRESS", "BILLING_ADDRESS"):
+                value = item.get("value")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, dict):
+                    address = value
+                    break
+
     if not address:
         return ""
+
     parts = []
     street = address.get("street_name", "")
     number = address.get("street_number", "")
     comment = address.get("comment", "")
+    municipality = address.get("municipality_name", "")
     city = address.get("city_name", "")
+    zip_code = address.get("zip_code", "")
     state_obj = address.get("state", {})
     state = state_obj.get("name", "") if isinstance(state_obj, dict) else ""
+
     if street:
         parts.append(f"{street} {number}".strip())
     if comment:
         parts.append(comment)
+    if municipality:
+        parts.append(municipality)
     if city:
         parts.append(city)
     if state:
         parts.append(state)
+    if zip_code:
+        parts.append(zip_code)
+
     return ", ".join(filter(None, parts))
 
 
@@ -259,8 +338,7 @@ def refresh_ml_token() -> bool:
             "client_secret": get_env("ML_CLIENT_SECRET"),
             "refresh_token": get_env("ML_REFRESH_TOKEN"),
         }
-        res = requests.post(
-            "https://api.mercadolibre.com/oauth/token", data=payload, timeout=30)
+        res = requests.post("https://api.mercadolibre.com/oauth/token", data=payload, timeout=30)
         res.raise_for_status()
         data = res.json()
         if data.get("access_token"):
@@ -293,7 +371,7 @@ def ml_get(url: str) -> dict:
             logger.warning(f"401 en {url}, renovando token...")
             if not refresh_ml_token():
                 raise Exception("Token ML inválido y no se pudo renovar")
-            continue  # reintentar con nuevo token
+            continue
 
         if res.status_code == 429:
             wait = min(5 * (attempt + 1), 30)
@@ -344,17 +422,26 @@ def odoo_connect() -> OdooCtx:
 
 
 def odoo_exec(ctx: OdooCtx, model: str, method: str, args: list, kwargs: dict = None) -> Any:
-    return ctx.models.execute_kw(
-        ctx.db, ctx.uid, ctx.password, model, method, args, kwargs or {})
+    return ctx.models.execute_kw(ctx.db, ctx.uid, ctx.password, model, method, args, kwargs or {})
 
 
 def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
     if tipo == "Factura":
-        ids = odoo_exec(ctx, "account.journal", "search",
-            [[["type", "=", "sale"], ["name", "=", "Facturas de cliente"]]], {"limit": 1})
+        ids = odoo_exec(
+            ctx,
+            "account.journal",
+            "search",
+            [[["type", "=", "sale"], ["name", "=", "Facturas de cliente"]]],
+            {"limit": 1},
+        )
     else:
-        ids = odoo_exec(ctx, "account.journal", "search",
-            [[["type", "=", "sale"], ["name", "ilike", "Boleta"]]], {"limit": 1})
+        ids = odoo_exec(
+            ctx,
+            "account.journal",
+            "search",
+            [[["type", "=", "sale"], ["name", "ilike", "Boleta"]]],
+            {"limit": 1},
+        )
     return ids[0] if ids else None
 
 
@@ -364,15 +451,18 @@ def get_chile_country_id(ctx: OdooCtx) -> Optional[int]:
 
 
 def get_rut_id_type(ctx: OdooCtx) -> Optional[int]:
-    ids = odoo_exec(ctx, "l10n_latam.identification.type", "search",
-        [[["name", "ilike", "RUT"]]], {"limit": 1})
+    ids = odoo_exec(ctx, "l10n_latam.identification.type", "search", [[["name", "ilike", "RUT"]]], {"limit": 1})
     return ids[0] if ids else None
 
 
 def get_tax_19(ctx: OdooCtx) -> Optional[int]:
-    ids = odoo_exec(ctx, "account.tax", "search",
+    ids = odoo_exec(
+        ctx,
+        "account.tax",
+        "search",
         [[["type_tax_use", "=", "sale"], ["amount", "=", 19], ["active", "=", True]]],
-        {"limit": 1})
+        {"limit": 1},
+    )
     return ids[0] if ids else None
 
 
@@ -384,15 +474,14 @@ def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
     if len(rut_norm) > 1:
         variantes.append(rut_norm[:-1] + "-" + rut_norm[-1])
     for variante in variantes:
-        ids = odoo_exec(ctx, "res.partner", "search",
-            [[["vat", "=", variante]]], {"limit": 1})
+        ids = odoo_exec(ctx, "res.partner", "search", [[["vat", "=", variante]]], {"limit": 1})
         if ids:
             return ids[0]
     return None
 
 
 def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str,
-                           giro: str, direccion: str, es_empresa: bool) -> int:
+                          giro: str, direccion: str, es_empresa: bool) -> int:
     taxpayer_type = "1" if es_empresa else "4"
     chile_id = get_chile_country_id(ctx)
     rut_type_id = get_rut_id_type(ctx)
@@ -431,10 +520,13 @@ def get_or_create_partner(ctx: OdooCtx, nombre: str, rut: str, email: str,
 # =========================
 
 def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
-    ids = odoo_exec(ctx, "account.move", "search",
-        [[["ref", "=", f"ML-{order_id}"],
-          ["state", "in", ["draft", "posted", "cancel"]]]],
-        {"limit": 1})
+    ids = odoo_exec(
+        ctx,
+        "account.move",
+        "search",
+        [[["ref", "=", f"ML-{order_id}"], ["state", "in", ["draft", "posted", "cancel"]]]],
+        {"limit": 1},
+    )
     return ids[0] if ids else None
 
 
@@ -458,14 +550,10 @@ def create_document(order: dict, billing_raw: dict, tipo: str, email: str, giro:
     giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
 
-    partner_id = get_or_create_partner(
-        ctx, nombre, rut, email, giro, direccion, es_empresa)
+    partner_id = get_or_create_partner(ctx, nombre, rut, email, giro, direccion, es_empresa)
 
     journal_id = get_journal(ctx, tipo)
-    doc_type_id = (
-        int(get_env("ODOO_DOC_TYPE_FACTURA_ID")) if tipo == "Factura"
-        else int(get_env("ODOO_DOC_TYPE_BOLETA_ID"))
-    )
+    doc_type_id = int(get_env("ODOO_DOC_TYPE_FACTURA_ID")) if tipo == "Factura" else int(get_env("ODOO_DOC_TYPE_BOLETA_ID"))
     tax_id = get_tax_19(ctx)
 
     lines = []
@@ -500,11 +588,10 @@ def create_document(order: dict, billing_raw: dict, tipo: str, email: str, giro:
 
 
 # =========================
-# PROCESAMIENTO WEBHOOK (background)
+# PROCESAMIENTO WEBHOOK
 # =========================
 
 def process_webhook_order(order_id: str):
-    """Corre en background para no bloquear la respuesta al webhook de ML."""
     try:
         order = get_ml_order(order_id)
         if not order:
@@ -522,13 +609,42 @@ def process_webhook_order(order_id: str):
         cliente = extract_name(billing_info, order.get("buyer", {}))
         giro = extract_activity(billing_info)
         direccion = extract_direccion(billing_info)
+        email = extract_email(billing_info, order.get("buyer", {}))
         tipo_sugerido = detect_tipo(billing_info)
 
-        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion)
-        logger.info(f"[{order_id}] ✅ Guardada en bandeja: {tipo_sugerido}")
+        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email)
+        logger.info(f"[{order_id}] ✅ Guardada/actualizada en bandeja: {tipo_sugerido} dirección='{direccion or 'sin dirección'}'")
 
     except Exception as e:
         logger.error(f"[{order_id}] Error procesando webhook: {e}", exc_info=True)
+
+
+def reprocesar_venta_desde_ml(order_id: str):
+    order = get_ml_order(order_id)
+    if not order:
+        raise Exception("Orden no encontrada en ML")
+
+    billing_raw = get_ml_billing_raw(order_id)
+    billing_info = get_billing_info(billing_raw)
+
+    rut = extract_rut(billing_info)
+    cliente = extract_name(billing_info, order.get("buyer", {}))
+    giro = extract_activity(billing_info)
+    direccion = extract_direccion(billing_info)
+    email = extract_email(billing_info, order.get("buyer", {}))
+    tipo_sugerido = detect_tipo(billing_info)
+
+    save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email)
+
+    return {
+        "id": str(order["id"]),
+        "cliente": cliente,
+        "rut": rut,
+        "email": email,
+        "giro": giro,
+        "direccion": direccion,
+        "tipo_sugerido": tipo_sugerido,
+    }
 
 
 # =========================
@@ -570,10 +686,6 @@ def health():
 
 @app.post("/ml/webhook")
 async def ml_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    Responde 200 inmediatamente y procesa en background.
-    Esto evita que ML reintente por timeout y evita 429 por procesamiento síncrono.
-    """
     try:
         body = await request.json()
     except Exception:
@@ -589,14 +701,9 @@ async def ml_webhook(request: Request, background_tasks: BackgroundTasks):
     if not order_id:
         return {"ok": True}
 
-    # Responde 200 de inmediato — procesa en background
     background_tasks.add_task(process_webhook_order, order_id)
     return {"ok": True, "order_id": order_id}
 
-
-# =========================
-# OAUTH ML
-# =========================
 
 @app.get("/ml/oauth/callback")
 async def oauth_callback(request: Request):
@@ -619,9 +726,7 @@ async def oauth_callback(request: Request):
         if data.get("refresh_token"):
             os.environ["ML_REFRESH_TOKEN"] = data["refresh_token"]
         logger.info("✅ Tokens OAuth guardados en memoria")
-    return JSONResponse(
-        status_code=res.status_code,
-        content={"status_code": res.status_code, "response": data})
+    return JSONResponse(status_code=res.status_code, content={"status_code": res.status_code, "response": data})
 
 
 @app.post("/ml/refresh-token")
@@ -631,7 +736,7 @@ def manual_refresh():
 
 
 # =========================
-# API VENTAS (bandeja)
+# API VENTAS
 # =========================
 
 @app.get("/ventas")
@@ -652,13 +757,28 @@ def actualizar_venta(oid: str, payload: VentaUpdate):
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
+
     updates = {k: v for k, v in payload.dict().items() if v is not None}
     if "rut" in updates:
         updates["rut"] = normalize_rut(updates["rut"])
     if "tipo_sugerido" in updates and updates["tipo_sugerido"] not in ["Boleta", "Factura"]:
         raise HTTPException(status_code=400, detail="tipo_sugerido debe ser Boleta o Factura")
+
     update_venta(oid, **updates)
     return {"ok": True, "id": oid, "updated": updates}
+
+
+@app.post("/ventas/{oid}/reprocesar")
+def reprocesar_venta(oid: str):
+    venta = get_venta(oid)
+    if not venta:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+
+    try:
+        data = reprocesar_venta_desde_ml(str(oid))
+        return {"ok": True, "id": oid, "data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ventas/{oid}/autorizar")
@@ -684,7 +804,8 @@ def autorizar_venta(oid: str):
             rut_override=venta.get("rut"),
             direccion_override=venta.get("direccion"),
         )
-        update_venta(oid,
+        update_venta(
+            oid,
             estado="enviado",
             move_id=move_id,
             error=None,
@@ -728,6 +849,7 @@ def ui_bandeja():
     button { cursor: pointer; background: var(--blue); border: none; font-weight: 600; }
     button.secondary { background: var(--panel2); border: 1px solid var(--border); }
     button.success { background: var(--ok); color: #052e16; }
+    button.warn { background: var(--warn); color: #3b2300; }
     button.danger { background: var(--bad); color: white; }
     .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
     .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }
@@ -750,11 +872,11 @@ def ui_bandeja():
     .empty { text-align: center; padding: 40px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 14px; }
     .modal { position: fixed; inset: 0; background: rgba(2,6,23,0.8); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 100; }
     .modal.open { display: flex; }
-    .modal-card { width: min(620px, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
+    .modal-card { width: min(760px, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
     .modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
     .modal-grid .full { grid-column: 1 / -1; }
     label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; font-weight: 600; }
-    .modal-actions { display: flex; gap: 8px; margin-top: 18px; justify-content: flex-end; }
+    .modal-actions { display: flex; gap: 8px; margin-top: 18px; justify-content: flex-end; flex-wrap: wrap; }
     a.link { color: #93c5fd; text-decoration: none; font-size: 13px; }
     @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } .modal-grid { grid-template-columns: 1fr; } }
     @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
@@ -765,7 +887,7 @@ def ui_bandeja():
   <div class='topbar'>
     <div>
       <div class='title'>🛒 Bandeja de ventas ML → Odoo</div>
-      <div class='subtitle'>Revisa, edita y autoriza cada venta antes de crear el documento en Odoo.</div>
+      <div class='subtitle'>Revisa, edita, reprocesa y autoriza cada venta antes de crear el documento en Odoo.</div>
     </div>
     <div class='actions'>
       <button class='secondary' onclick='refreshData()'>↻ Actualizar</button>
@@ -795,7 +917,6 @@ def ui_bandeja():
   <div id='tableWrap'><div class='empty'>Cargando...</div></div>
 </div>
 
-<!-- Modal edición -->
 <div class='modal' id='editModal'>
   <div class='modal-card'>
     <div class='topbar' style='margin-bottom:0'>
@@ -807,6 +928,10 @@ def ui_bandeja():
     </div>
     <div class='modal-grid'>
       <div>
+        <label>ID venta ML</label>
+        <input id='editId' disabled>
+      </div>
+      <div>
         <label>Tipo documento</label>
         <select id='editTipo' onchange='toggleGiro()'>
           <option value='Boleta'>Boleta</option>
@@ -817,16 +942,16 @@ def ui_bandeja():
         <label>Email DTE</label>
         <input id='editEmail'>
       </div>
-      <div class='full'>
-        <label>Nombre cliente / razón social</label>
-        <input id='editCliente'>
-      </div>
       <div>
         <label>RUT</label>
         <input id='editRut'>
       </div>
-      <div>
-        <label>Dirección</label>
+      <div class='full'>
+        <label>Nombre cliente / razón social</label>
+        <input id='editCliente'>
+      </div>
+      <div class='full'>
+        <label>Dirección de facturación</label>
         <input id='editDireccion'>
       </div>
       <div class='full' id='giroGroup' style='display:none'>
@@ -836,6 +961,7 @@ def ui_bandeja():
     </div>
     <div class='modal-actions'>
       <button class='secondary' onclick='closeModal()'>Cancelar</button>
+      <button class='warn' onclick='reprocesarActual()'>Reprocesar desde ML</button>
       <button onclick='saveEdit()'>Guardar</button>
       <button class='success' onclick='saveAndAuthorize()'>Guardar y autorizar</button>
     </div>
@@ -853,6 +979,10 @@ function badge(estado) {
 
 function safe(v) { return v == null || v === '' ? '—' : String(v); }
 
+function copyId(id) {
+  navigator.clipboard.writeText(String(id));
+}
+
 function updateStats(items) {
   document.getElementById('cTotal').textContent = items.length;
   document.getElementById('cPend').textContent = items.filter(v => v.estado === 'pendiente').length;
@@ -865,7 +995,7 @@ function filteredVentas() {
   const s = document.getElementById('statusFilter').value;
   return ventas.filter(v => {
     const okS = !s || v.estado === s;
-    const okQ = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido].filter(Boolean).join(' ').toLowerCase().includes(q);
+    const okQ = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion].filter(Boolean).join(' ').toLowerCase().includes(q);
     return okS && okQ;
   });
 }
@@ -874,17 +1004,31 @@ function renderTable() {
   const items = filteredVentas();
   updateStats(ventas);
   const wrap = document.getElementById('tableWrap');
-  if (!items.length) { wrap.innerHTML = "<div class='empty'>No hay ventas para mostrar.</div>"; return; }
+  if (!items.length) {
+    wrap.innerHTML = "<div class='empty'>No hay ventas para mostrar.</div>";
+    return;
+  }
+
   wrap.innerHTML = `
     <table>
       <thead><tr>
-        <th>Fecha</th><th>Cliente</th><th>RUT</th><th>Dirección</th>
-        <th>Tipo</th><th>Estado</th><th>Move ID</th><th>Acciones</th>
+        <th>Fecha / ID ML</th>
+        <th>Cliente / Razón social</th>
+        <th>RUT</th>
+        <th>Dirección facturación</th>
+        <th>Tipo</th>
+        <th>Estado</th>
+        <th>Move ID</th>
+        <th>Acciones</th>
       </tr></thead>
       <tbody>
         ${items.map(v => `
           <tr>
-            <td>${safe(v.creado_en ? new Date(v.creado_en).toLocaleString('es-CL') : null)}<div class='small'>${safe(v.id)}</div></td>
+            <td>
+              ${safe(v.creado_en ? new Date(v.creado_en).toLocaleString('es-CL') : null)}
+              <div class='small'>${safe(v.id)}</div>
+              <div class='small'><a href='#' class='link' onclick='copyId("${String(v.id).replace(/"/g, '&quot;')}"); return false;'>Copiar ID</a></div>
+            </td>
             <td><strong>${safe(v.cliente)}</strong><div class='small'>${safe(v.email)}</div></td>
             <td>${safe(v.rut)}</td>
             <td>${safe(v.direccion)}</td>
@@ -893,8 +1037,9 @@ function renderTable() {
             <td>${safe(v.move_id)}</td>
             <td>
               <div class='row-actions'>
-                <button class='secondary' onclick='openEdit("${v.id}")'>Editar</button>
-                ${v.estado !== 'enviado' ? `<button class='success' onclick='autorizar("${v.id}")'>Autorizar</button>` : ''}
+                <button class='secondary' onclick='openEdit("${String(v.id).replace(/"/g, '&quot;')}")'>Editar</button>
+                <button class='warn' onclick='reprocesar("${String(v.id).replace(/"/g, '&quot;')}")'>Reprocesar</button>
+                ${v.estado !== 'enviado' ? `<button class='success' onclick='autorizar("${String(v.id).replace(/"/g, '&quot;')}")'>Autorizar</button>` : ''}
               </div>
             </td>
           </tr>
@@ -910,7 +1055,7 @@ async function refreshData() {
     const data = await res.json();
     ventas = Array.isArray(data.items) ? data.items : [];
     renderTable();
-  } catch(e) {
+  } catch (e) {
     document.getElementById('tableWrap').innerHTML = "<div class='empty'>Error cargando datos. Revisa /health</div>";
   }
 }
@@ -919,27 +1064,34 @@ async function autorizar(id) {
   if (!confirm(`¿Autorizar la venta ${id} y enviarla a Odoo?`)) return;
   const res = await fetch(`/ventas/${id}/autorizar`, { method: 'POST' });
   const data = await res.json().catch(() => ({}));
-  if (res.ok) { alert(`✅ Documento creado en Odoo: move_id=${data.move_id}`); }
-  else { alert(`❌ Error: ${data.detail || 'desconocido'}`); }
-  refreshData();
+  if (res.ok) {
+    alert(`✅ Documento creado en Odoo: move_id=${data.move_id}`);
+  } else {
+    alert(`❌ Error: ${data.detail || 'desconocido'}`);
+  }
+  await refreshData();
 }
 
 async function autorizarTodas() {
   const pendientes = ventas.filter(v => v.estado === 'pendiente');
-  if (!pendientes.length) { alert('No hay ventas pendientes'); return; }
+  if (!pendientes.length) {
+    alert('No hay ventas pendientes');
+    return;
+  }
   if (!confirm(`¿Autorizar las ${pendientes.length} ventas pendientes?`)) return;
-  let ok = 0, err = 0;
+
+  let ok = 0;
+  let err = 0;
   for (const v of pendientes) {
     const r = await fetch(`/ventas/${v.id}/autorizar`, { method: 'POST' });
     if (r.ok) ok++; else err++;
   }
   alert(`✅ Autorizadas: ${ok} | ❌ Errores: ${err}`);
-  refreshData();
+  await refreshData();
 }
 
 function toggleGiro() {
-  document.getElementById('giroGroup').style.display =
-    document.getElementById('editTipo').value === 'Factura' ? 'block' : 'none';
+  document.getElementById('giroGroup').style.display = document.getElementById('editTipo').value === 'Factura' ? 'block' : 'none';
 }
 
 function openEdit(id) {
@@ -947,6 +1099,7 @@ function openEdit(id) {
   if (!v) return;
   currentId = String(id);
   document.getElementById('modalSub').textContent = `Venta ${v.id}`;
+  document.getElementById('editId').value = v.id || '';
   document.getElementById('editTipo').value = v.tipo_sugerido || 'Boleta';
   document.getElementById('editEmail').value = v.email || '';
   document.getElementById('editCliente').value = v.cliente || '';
@@ -973,21 +1126,50 @@ async function saveEdit() {
     direccion: document.getElementById('editDireccion').value,
     giro: tipo === 'Factura' ? document.getElementById('editGiro').value : '',
   };
+
   const res = await fetch(`/ventas/${currentId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) { alert('No se pudo guardar'); return; }
+
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    alert(data.detail || 'No se pudo guardar');
+    return false;
+  }
+
+  await refreshData();
   closeModal();
-  refreshData();
+  return true;
+}
+
+async function reprocesar(id) {
+  const res = await fetch(`/ventas/${id}/reprocesar`, { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    alert(data.detail || 'No se pudo reprocesar');
+    return;
+  }
+  alert('✅ Venta reprocesada desde Mercado Libre');
+  await refreshData();
+
+  if (currentId && String(currentId) === String(id)) {
+    openEdit(id);
+  }
+}
+
+async function reprocesarActual() {
+  if (!currentId) return;
+  await reprocesar(currentId);
 }
 
 async function saveAndAuthorize() {
   if (!currentId) return;
   const id = currentId;
-  await saveEdit();
-  if (id) await autorizar(id);
+  const ok = await saveEdit();
+  if (!ok) return;
+  await autorizar(id);
 }
 
 document.getElementById('editModal').addEventListener('click', e => {
