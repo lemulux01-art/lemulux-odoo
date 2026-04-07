@@ -34,6 +34,9 @@ TOKEN_REFRESH_INTERVAL = 5 * 60 * 60
 DB_RETRIES = 20
 DB_RETRY_SECONDS = 3
 
+ODOO_JOURNAL_FACTURA_ID = 10
+ODOO_JOURNAL_BOLETA_ID = 21
+
 # =========================
 # HELPERS GENERALES
 # =========================
@@ -671,22 +674,8 @@ def get_partner_fields(ctx: OdooCtx) -> set[str]:
 
 def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
     if tipo == "Factura":
-        ids = odoo_exec(
-            ctx,
-            "account.journal",
-            "search",
-            [[["type", "=", "sale"], ["name", "=", "Facturas de cliente"], ["active", "=", True]]],
-            {"limit": 1},
-        )
-    else:
-        ids = odoo_exec(
-            ctx,
-            "account.journal",
-            "search",
-            [[["type", "=", "sale"], ["name", "ilike", "Boleta"], ["active", "=", True]]],
-            {"limit": 1},
-        )
-    return ids[0] if ids else None
+        return ODOO_JOURNAL_FACTURA_ID
+    return ODOO_JOURNAL_BOLETA_ID
 
 
 def get_chile_country_id(ctx: OdooCtx) -> Optional[int]:
@@ -722,11 +711,6 @@ def get_activity_field_name(ctx: OdooCtx) -> Optional[str]:
         if candidate in fields:
             return candidate
     return None
-
-
-def read_partner_by_id(ctx: OdooCtx, partner_id: int) -> dict:
-    rows = odoo_exec(ctx, "res.partner", "read", [[partner_id], ["id", "name", "vat", "email", "comment"]])
-    return rows[0] if rows else {}
 
 
 def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
@@ -809,8 +793,6 @@ def upsert_partner(
     if rut and rut_type_id and "l10n_latam_identification_type_id" in partner_fields:
         vals["l10n_latam_identification_type_id"] = rut_type_id
 
-    # Giro solo obligatorio / forzado para boleta.
-    # Factura requiere giro real, nunca "(boleta)".
     if activity_field:
         if tipo == "Factura":
             if giro_a_usar:
@@ -869,12 +851,9 @@ def create_document(
     giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
 
-    # Estándar acordado:
-    # Factura requiere datos empresa completos.
     if tipo == "Factura" and (not nombre or not rut or not direccion or not giro):
         raise Exception("Para Factura se requiere razón social, RUT, dirección y giro")
 
-    # Boleta permite giro forzado "(boleta)" si no existe.
     if tipo == "Boleta" and not giro:
         giro = DEFAULT_BOLETA_ACTIVITY
 
@@ -955,8 +934,6 @@ def process_webhook_order(order_id: str):
             logger.warning(f"[{order_id}] Orden no encontrada en ML")
             return
 
-        # NO enviar a Odoo automático.
-        # Solo guardar si está paid.
         if order.get("status") != "paid":
             logger.info(f"[{order_id}] Orden no pagada: {order.get('status')}")
             return
@@ -971,7 +948,6 @@ def process_webhook_order(order_id: str):
         email = extract_email(billing_info, order)
         tipo_sugerido = detect_tipo(order, billing_info)
 
-        # Si boleta y no hay giro, sugerir "(boleta)" en bandeja
         if tipo_sugerido == "Boleta" and not giro:
             giro = DEFAULT_BOLETA_ACTIVITY
 
@@ -1165,8 +1141,10 @@ def actualizar_venta(oid: str, payload: VentaUpdate):
     if "tipo_sugerido" in updates and updates["tipo_sugerido"] not in ["Boleta", "Factura"]:
         raise HTTPException(status_code=400, detail="tipo_sugerido debe ser Boleta o Factura")
 
-    # Si el usuario cambia a boleta y deja giro vacío, guardar sugerencia boleta.
     if updates.get("tipo_sugerido") == "Boleta" and not updates.get("giro") and not venta.get("giro"):
+        updates["giro"] = DEFAULT_BOLETA_ACTIVITY
+
+    if updates.get("tipo_sugerido") == "Boleta" and "giro" in updates and not updates["giro"]:
         updates["giro"] = DEFAULT_BOLETA_ACTIVITY
 
     update_venta(oid, **updates)
