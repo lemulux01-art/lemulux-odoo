@@ -1909,11 +1909,11 @@ async function refreshData() {
 }
 
 async function autorizar(id) {
-  if (!confirm(`¿Autorizar la venta ${id} y enviarla a Odoo?`)) return;
-  const res = await fetch(`/ventas/${id}/autorizar`, { method: 'POST' });
+  if (!confirm('¿Autorizar la venta ' + id + ' y enviarla a Odoo?')) return;
+  const res = await fetch('/ventas/' + id + '/autorizar', { method: 'POST' });
   const data = await res.json().catch(() => ({}));
-  if (res.ok) alert(`✅ Documento creado en Odoo: move_id=${data.move_id}`);
-  else alert(`❌ Error: ${data.detail || 'desconocido'}`);
+  if (res.ok) alert('✅ Documento creado en Odoo: move_id=' + data.move_id);
+  else alert('❌ Error: ' + (data.detail || 'desconocido'));
   await refreshData();
 }
 
@@ -1948,7 +1948,7 @@ async function openEdit(id) {
     const det = await res.json();
     document.getElementById('editTotal').value = money(det.total_bruto);
     document.getElementById('editItemsCount').value = det.cantidad_items || 0;
-    document.getElementById('editProducts').value = (det.productos || []).join('\n');
+    document.getElementById('editProducts').value = (det.productos || []).join('\x0A');
   } catch(e) {
     document.getElementById('editProducts').value = 'Error cargando productos';
   }
@@ -1973,7 +1973,7 @@ async function saveEdit() {
     giro: tipo === 'Factura' ? document.getElementById('editGiro').value : '',
   };
 
-  const res = await fetch(`/ventas/${currentId}`, {
+  const res = await fetch('/ventas/' + currentId, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -2013,7 +2013,7 @@ function onCheckboxChange() {
   if (seleccionadas.length >= 2) {
     btn.style.display = 'inline-block';
     info.style.display = 'block';
-    count.textContent = `${seleccionadas.length} ventas seleccionadas`;
+    count.textContent = seleccionadas.length + ' ventas seleccionadas';
   } else {
     btn.style.display = 'none';
     info.style.display = seleccionadas.length === 1 ? 'block' : 'none';
@@ -2032,7 +2032,7 @@ async function agruparSeleccionadas() {
 
   // Mostrar resumen antes de confirmar
   const ventasSelec = ids.map(id => ventas.find(v => String(v.id) === id)).filter(Boolean);
-  const resumen = ventasSelec.map(function(v){ return '• ' + safe(v.cliente) + ' — ' + safe(v.id); }).join('\n');
+  const resumen = ventasSelec.map(function(v){ return '• ' + safe(v.cliente) + ' — ' + safe(v.id); }).join('\x0A');
   const msg = '¿Agrupar estas ' + ids.length + ' ventas en una sola boleta/factura?' +
     '\n\nLa primera será la principal y las demás quedarán como rechazadas:' +
     '\n\n' + resumen +
@@ -2047,12 +2047,12 @@ async function agruparSeleccionadas() {
   const data = await res.json().catch(() => ({}));
 
   if (res.ok) {
-    alert(`✅ Ventas agrupadas en ${data.venta_principal}\n${data.total_items} ítems · Total bruto: ${money(data.total_bruto)}`);
+    alert('✅ Ventas agrupadas en ' + data.venta_principal + '\n' + data.total_items + ' ítems · Total bruto: ' + money(data.total_bruto));
     document.getElementById('btnAgrupar').style.display = 'none';
     document.getElementById('seleccionInfo').style.display = 'none';
     await refreshData();
   } else {
-    alert(`❌ Error: ${data.detail || 'desconocido'}`);
+    alert('❌ Error: ' + (data.detail || 'desconocido'));
   }
 }
 
@@ -2072,15 +2072,15 @@ async function reprocesarTodo() {
   btn.textContent = '↺ Reprocesar todo';
 
   if (res.ok) {
-    alert(`✅ Reprocesadas: ${data.ok} | ❌ Errores: ${data.error}`);
+    alert('✅ Reprocesadas: ' + data.ok + ' | ❌ Errores: ' + data.error);
     await refreshData();
   } else {
-    alert(`❌ Error: ${data.detail || 'desconocido'}`);
+    alert('❌ Error: ' + (data.detail || 'desconocido'));
   }
 }
 
 async function reprocesar(id) {
-  const res = await fetch(`/ventas/${id}/reprocesar`, { method: 'POST' });
+  const res = await fetch('/ventas/' + id + '/reprocesar', { method: 'POST' });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     alert(data.detail || 'No se pudo reprocesar');
@@ -2113,15 +2113,15 @@ document.getElementById('editModal').addEventListener('click', e => {
 // ========================
 
 async function verPack(id, packId) {
-  document.getElementById('packModalTitle').textContent = packId ? `Pack ${packId}` : `Orden ${id}`;
+  document.getElementById('packModalTitle').textContent = packId ? ('Pack ' + packId) : ('Orden ' + id);
   document.getElementById('packModalBody').innerHTML = "<p style='color:var(--muted)'>Cargando órdenes del pack...</p>";
   document.getElementById('packModal').classList.add('open');
 
   try {
-    const res = await fetch(`/ventas/${id}/pack`);
+    const res = await fetch('/ventas/' + id + '/pack');
     const data = await res.json();
     if (!res.ok) {
-      document.getElementById('packModalBody').innerHTML = `<p style='color:#f87171'>Error: ${data.detail || 'desconocido'}</p>`;
+      document.getElementById('packModalBody').innerHTML = '<p style="color:#f87171">Error: ' + (data.detail || 'desconocido') + '</p>';
       return;
     }
 
@@ -2130,20 +2130,17 @@ async function verPack(id, packId) {
 
     let html = '';
     if (data.pack_id) {
-      html += `<div style='margin-bottom:12px;color:var(--muted);font-size:13px'>Pack ID: <strong style='color:var(--text)'>${data.pack_id}</strong> · ${ordenes.length} orden(es) consolidada(s) · Total: <strong style='color:var(--ok)'>${money(totalPack)}</strong></div>`;
+      html += '<div style="margin-bottom:12px;color:var(--muted);font-size:13px">Pack ID: <strong style="color:var(--text)">' + data.pack_id + '</strong> · ' + ordenes.length + ' orden(es) consolidada(s) · Total: <strong style="color:var(--ok)">' + money(totalPack) + '</strong></div>';
     }
 
     for (const orden of ordenes) {
-      html += `
-        <div style='background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px;'>
-          <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>
-            <strong style='font-size:13px'>Order ID: ${orden.id}</strong>
-            <span style='font-size:12px;color:var(--muted)'>${orden.status || ''} · ${orden.item_count} ítem(s) · <strong style='color:var(--ok)'>${money(orden.total)}</strong></span>
-          </div>
-          <ul style='margin:0;padding-left:18px;'>
-            ${(orden.items || []).map(item => `<li style='font-size:13px;color:var(--muted);margin-bottom:3px;'>${item}</li>`).join('')}
-          </ul>
-        </div>`;
+          html += '<div style="background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px;">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">' +
+        '<strong style="font-size:13px">Order ID: ' + orden.id + '</strong>' +
+        '<span style="font-size:12px;color:var(--muted)">' + (orden.status || '') + ' · ' + orden.item_count + ' ítem(s) · <strong style="color:var(--ok)">' + money(orden.total) + '</strong></span>' +
+        '</div><ul style="margin:0;padding-left:18px;">' +
+        (orden.items || []).map(function(item){ return '<li style="font-size:13px;color:var(--muted);margin-bottom:3px;">' + item + '</li>'; }).join('') +
+        '</ul></div>';
     }
 
     if (!ordenes.length) {
@@ -2152,7 +2149,7 @@ async function verPack(id, packId) {
 
     document.getElementById('packModalBody').innerHTML = html;
   } catch(e) {
-    document.getElementById('packModalBody').innerHTML = `<p style='color:#f87171'>Error de conexión: ${e.message}</p>`;
+    document.getElementById('packModalBody').innerHTML = '<p style="color:#f87171">Error de conexión: ' + e.message + '</p>';
   }
 }
 
