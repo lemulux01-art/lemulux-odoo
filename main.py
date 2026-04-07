@@ -1805,6 +1805,7 @@ function badge(estado) {
 
 function safe(v) { return v == null || v === '' ? '—' : String(v); }
 
+
 function money(v) {
   const n = Number(v || 0);
   return new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 }).format(n);
@@ -1829,6 +1830,40 @@ function filteredVentas() {
   });
 }
 
+function rowHtml(v) {
+  const id = safe(v.id);
+  const fecha = v.creado_en ? new Date(v.creado_en + 'Z').toLocaleString('es-CL', {timeZone: 'America/Santiago'}) : '—';
+  const packId = v.pack_id ? safe(v.pack_id) : '';
+
+  let acciones = '';
+  acciones += '<button class="secondary" data-action="edit" data-id="' + id + '">Editar</button> ';
+  acciones += '<button class="warn" data-action="reprocesar" data-id="' + id + '">Reprocesar</button> ';
+  if (packId) {
+    acciones += '<button class="pack-btn" data-action="verpack" data-id="' + id + '" data-pack="' + packId + '">📦 Ver pack</button> ';
+  }
+  if (v.estado !== 'enviado') {
+    acciones += '<button class="success" data-action="autorizar" data-id="' + id + '">Autorizar</button>';
+  }
+
+  let productos = '';
+  if ((v.productos || []).length) {
+    productos = '<ul class="compact">' + v.productos.slice(0,3).map(function(p){ return '<li>' + safe(p) + '</li>'; }).join('') + '</ul>';
+  }
+
+  return '<tr id="row-' + id + '">' +
+    '<td><input type="checkbox" class="cb-row" data-id="' + id + '" onchange="onCheckboxChange()"></td>' +
+    '<td>' + safe(fecha) + '<div class="small">' + id + '</div><div class="small"><a href="#" class="link" data-action="copy" data-id="' + id + '">Copiar ID</a></div></td>' +
+    '<td><strong>' + safe(v.cliente) + '</strong><div class="small">' + safe(v.email) + '</div>' + (v.giro ? '<div class="small">' + safe(v.giro) + '</div>' : '') + '</td>' +
+    '<td>' + safe(v.rut) + '</td>' +
+    '<td>' + safe(v.direccion) + (v.ciudad ? '<div class="small">📍 ' + safe(v.ciudad) + '</div>' : '') + (v.region ? '<div class="small">' + safe(v.region) + '</div>' : '') + '</td>' +
+    '<td><strong>' + money(v.total_bruto) + '</strong><div class="small">' + safe(v.cantidad_items) + ' ítems</div>' + productos + '</td>' +
+    '<td>' + safe(v.tipo_sugerido) + '</td>' +
+    '<td>' + badge(v.estado) + (v.error ? '<div class="small" style="color:#f87171;margin-top:4px">' + safe(v.error).substring(0,80) + '</div>' : '') + '</td>' +
+    '<td><span style="font-size:13px">' + safe(v.estado_envio || '✅ Pagado') + '</span></td>' +
+    '<td><div class="row-actions">' + acciones + '</div></td>' +
+    '</tr>';
+}
+
 function renderTable() {
   const items = filteredVentas();
   updateStats(ventas);
@@ -1838,60 +1873,29 @@ function renderTable() {
     return;
   }
 
-  wrap.innerHTML = `
-    <table>
-      <thead><tr>
-        <th style='width:32px'><input type='checkbox' class='cb-row' id='cbTodos' onchange='toggleTodos(this)'></th>
-        <th>Fecha / ID ML</th>
-        <th>Cliente / Razón social</th>
-        <th>RUT</th>
-        <th>Dirección / Ciudad / Región</th>
-        <th>Total / Ítems</th>
-        <th>Tipo</th>
-        <th>Estado doc.</th>
-        <th>Estado envío ML</th>
-        <th>Acciones</th>
-      </tr></thead>
-      <tbody>
-        ${items.map(v => `
-          <tr id='row-${v.id}'>
-            <td><input type='checkbox' class='cb-row' data-id='${String(v.id)}' onchange='onCheckboxChange()'></td>
-            <td>
-              ${safe(v.creado_en ? new Date(v.creado_en + 'Z').toLocaleString('es-CL', {timeZone: 'America/Santiago'}) : null)}
-              <div class='small'>${safe(v.id)}</div>
-              <div class='small'><a href='#' class='link' onclick='copyId("${String(v.id).replace(/"/g, '&quot;')}"); return false;'>Copiar ID</a></div>
-            </td>
-            <td>
-              <strong>${safe(v.cliente)}</strong>
-              <div class='small'>${safe(v.email)}</div>
-              ${v.giro ? `<div class='small'>${safe(v.giro)}</div>` : ''}
-            </td>
-            <td>${safe(v.rut)}</td>
-            <td>
-              ${safe(v.direccion)}
-              ${v.ciudad ? `<div class='small'>📍 ${safe(v.ciudad)}</div>` : ''}
-              ${v.region ? `<div class='small'>${safe(v.region)}</div>` : ''}
-            </td>
-            <td>
-              <strong>${money(v.total_bruto)}</strong>
-              <div class='small'>${safe(v.cantidad_items)} ítems</div>
-              ${(v.productos || []).length ? `<ul class='compact'>${v.productos.slice(0,3).map(p => `<li>${safe(p)}</li>`).join('')}</ul>` : ''}
-            </td>
-            <td>${safe(v.tipo_sugerido)}</td>
-            <td>${badge(v.estado)}${v.error ? `<div class='small' style='color:#f87171;margin-top:4px'>${safe(v.error).substring(0,80)}</div>` : ''}</td>
-            <td><span style='font-size:13px'>${safe(v.estado_envio || '✅ Pagado')}</span></td>
-            <td>
-              <div class='row-actions'>
-                <button class='secondary' onclick='openEdit("${String(v.id).replace(/"/g, '&quot;')}")'>Editar</button>
-                <button class='warn' onclick='reprocesar("${String(v.id).replace(/"/g, '&quot;')}")'>Reprocesar</button>
-                ${v.pack_id ? `<button class='pack-btn' onclick='verPack("${String(v.id).replace(/"/g, '&quot;')}", "${String(v.pack_id).replace(/"/g, '&quot;')}"); return false;'>📦 Ver pack</button>` : ''}
-                ${v.estado !== 'enviado' ? `<button class='success' onclick='autorizar("${String(v.id).replace(/"/g, '&quot;')}")'>Autorizar</button>` : ''}
-              </div>
-            </td>
-          </tr>
-        `).join('')}
-      </tbody>
-    </table>`;
+  let html = '<table><thead><tr>';
+  html += '<th style="width:32px"><input type="checkbox" class="cb-row" id="cbTodos" onchange="toggleTodos(this)"></th>';
+  html += '<th>Fecha / ID ML</th><th>Cliente / Razón social</th><th>RUT</th>';
+  html += '<th>Dirección / Ciudad / Región</th><th>Total / Ítems</th>';
+  html += '<th>Tipo</th><th>Estado doc.</th><th>Estado envío ML</th><th>Acciones</th>';
+  html += '</tr></thead><tbody>';
+  items.forEach(function(v) { html += rowHtml(v); });
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+
+  // Delegación de eventos — evita problemas con onclick e IDs especiales
+  wrap.querySelectorAll('[data-action]').forEach(function(el) {
+    el.addEventListener('click', function(e) {
+      e.preventDefault();
+      const action = el.dataset.action;
+      const id = el.dataset.id;
+      if (action === 'edit') openEdit(id);
+      else if (action === 'reprocesar') reprocesar(id);
+      else if (action === 'autorizar') autorizar(id);
+      else if (action === 'verpack') verPack(id, el.dataset.pack);
+      else if (action === 'copy') { navigator.clipboard.writeText(id); }
+    });
+  });
 }
 
 async function refreshData() {
