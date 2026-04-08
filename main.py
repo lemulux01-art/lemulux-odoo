@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import os
 import time
 import threading
+import queue as queue_module
 import logging
 import requests
 import xmlrpc.client
@@ -1229,11 +1230,47 @@ def process_webhook_order(order_id: str):
 
 
 def reprocesar_venta_desde_ml(order_id: str):
-    order = get_ml_order(order_id)
-    if not order:
-        raise Exception("Orden no encontrada en ML")
+    venta = get_venta(order_id)
 
-    billing_raw = get_ml_billing_raw(order_id)
+    # Si la venta tiene pack_id, el order_id real puede ser distinto
+    # Intentar obtener la orden — si falla porque es un pack_id, buscar via pack
+    order = get_ml_order(order_id)
+
+    if not order:
+        # Puede ser un pack_id — intentar obtener via /packs
+        pack_data = get_ml_pack(order_id)
+        pack_order_ids = [str(o["id"]) for o in (pack_data.get("orders") or [])]
+        if not pack_order_ids:
+            raise Exception("Orden/pack no encontrado en ML: " + order_id)
+        # Usar la primera orden real del pack para obtener datos de billing
+        order = get_ml_order(pack_order_ids[0])
+        if not order:
+            raise Exception("No se pudo obtener ninguna orden del pack " + order_id)
+        # Consolidar items de todas las ordenes del pack
+        all_orders = []
+        for oid_pack in pack_order_ids:
+            o = get_ml_order(oid_pack) if oid_pack != pack_order_ids[0] else order
+            if o:
+                all_orders.append(o)
+        all_items = merge_order_items(all_orders)
+        order = {**order, "order_items": all_items, "id": int(order_id)}
+    elif venta and venta.get("pack_id") and str(venta["pack_id"]) != str(order_id):
+        # La venta es un pack consolidado — traer todos los items
+        pack_id = str(venta["pack_id"])
+        pack_data = get_ml_pack(pack_id)
+        pack_order_ids = [str(o["id"]) for o in (pack_data.get("orders") or [])]
+        all_orders = [order]
+        for oid_pack in pack_order_ids:
+            if oid_pack != str(order.get("id")):
+                o = get_ml_order(oid_pack)
+                if o:
+                    all_orders.append(o)
+        all_items = merge_order_items(all_orders)
+        order = {**order, "order_items": all_items}
+
+    # Usar order_id original de la primera orden para billing
+    billing_order_id = str(order.get("id", order_id))
+    billing_raw = get_ml_billing_raw(billing_order_id)
     billing_info = get_billing_info(billing_raw)
 
     rut = extract_rut(billing_info)
@@ -1253,7 +1290,7 @@ def reprocesar_venta_desde_ml(order_id: str):
     items, item_count, total_bruto = summarize_order_items(order)
 
     return {
-        "id": str(order["id"]),
+        "id": str(order_id),
         "cliente": cliente,
         "rut": rut,
         "email": email,
@@ -1270,12 +1307,39 @@ def reprocesar_venta_desde_ml(order_id: str):
 # STARTUP
 # =========================
 
+# =========================
+# COLA DE WEBHOOKS
+# =========================
+
+webhook_queue = queue_module.Queue()
+
+
+def webhook_worker():
+    """Worker que procesa webhooks de uno en uno con delay entre cada uno."""
+    while True:
+        try:
+            order_id = webhook_queue.get(timeout=5)
+            try:
+                process_webhook_order(order_id)
+            except Exception as e:
+                logger.error(f"[{order_id}] Error en webhook worker: {e}")
+            finally:
+                webhook_queue.task_done()
+                # Delay entre requests para no saturar ML
+                time.sleep(2)
+        except queue_module.Empty:
+            continue
+
+
 @app.on_event("startup")
 async def on_startup():
     wait_for_db()
     t = threading.Thread(target=schedule_token_refresh, daemon=True)
     t.start()
-    logger.info("⏰ Renovación automática de token ML iniciada (cada 5h)")
+    logger.info("Renovacion automatica de token ML iniciada (cada 5h)")
+    w = threading.Thread(target=webhook_worker, daemon=True)
+    w.start()
+    logger.info("Worker de cola de webhooks iniciado")
 
 
 # =========================
@@ -1321,11 +1385,11 @@ def debug_direccion(oid: str):
 
 
 @app.post("/ml/webhook")
-async def ml_webhook(request: Request, background_tasks: BackgroundTasks):
+async def ml_webhook(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": "Body inválido"})
+        return JSONResponse(status_code=400, content={"error": "Body invalido"})
 
     topic = body.get("topic", "")
     resource = body.get("resource", "")
@@ -1336,7 +1400,9 @@ async def ml_webhook(request: Request, background_tasks: BackgroundTasks):
     if not order_id:
         return {"ok": True}
 
-    background_tasks.add_task(process_webhook_order, order_id)
+    webhook_queue.put(order_id)
+    logger.info(f"Webhook encolado: {order_id} (cola: {webhook_queue.qsize()})")
+    return {"ok": True, "order_id": order_id, "queued": webhook_queue.qsize()}
     return {"ok": True, "order_id": order_id}
 
 
@@ -1388,6 +1454,20 @@ def ventas(estado: Optional[str] = None):
             "total_bruto": total_bruto,
         })
     return {"items": enriched}
+
+
+@app.post("/ventas/ingresar/{order_id}")
+def ingresar_manual(order_id: str):
+    """Fuerza la ingesta de una orden ML aunque no haya llegado el webhook."""
+    try:
+        process_webhook_order(order_id)
+        venta = get_venta(order_id)
+        if venta:
+            return {"ok": True, "id": order_id, "cliente": venta.get("cliente"), "estado": venta.get("estado")}
+        return {"ok": True, "id": order_id, "message": "Procesado pero verificar en dashboard"}
+    except Exception as e:
+        logger.error(f"Error en ingesta manual {order_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ventas/reprocesar-todo")
