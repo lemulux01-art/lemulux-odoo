@@ -659,28 +659,42 @@ def extract_direccion(order: dict, billing_info: dict, billing_raw: dict | None 
 
 
 def detect_tipo(order: dict, billing_info: dict) -> str:
+    # 1. Señal más directa: cust_type de ML
     cust_type = (safe_get(billing_info, "attributes", "cust_type", default="") or "").upper()
     if cust_type == "BU":
         return "Factura"
     if cust_type == "CO":
         return "Boleta"
 
+    # 2. Descripción del tipo de contribuyente
     taxpayer_desc = (
         safe_get(billing_info, "taxes", "taxpayer_type", "description", default="") or ""
     ).strip().lower()
-
     if taxpayer_desc and any(x in taxpayer_desc for x in [
-        "responsable", "empresa", "negocio", "iva", "jurídica", "juridica"
+        "responsable", "empresa", "negocio", "iva", "juridica"
     ]):
         return "Factura"
 
+    # 3. Tiene giro/actividad economica — señal mas confiable de empresa
     if extract_activity(billing_info, order):
         return "Factura"
 
+    # 4. Tiene razon social explicita en campos de empresa
     for key in ("business_name", "company_name", "razon_social", "social_reason", "legal_name"):
         val = billing_info.get(key)
         if isinstance(val, str) and val.strip():
             return "Factura"
+
+    # 5. Nombre contiene palabras clave de empresa (SPA, LTDA, etc)
+    nombre = extract_name(billing_info, order) or ""
+    nombre_upper = nombre.upper()
+    empresa_keywords = [
+        " SPA", " LTDA", "S.A.", " SA ", "LIMITADA", "EIRL", " INC",
+        " CORP", "COMERCIAL ", "CONSTRUCTORA", "CONSULTORA",
+        "INVERSIONES", "HOLDING", "SOCIEDAD ", " CIA", " CIA."
+    ]
+    if any(kw in nombre_upper for kw in empresa_keywords):
+        return "Factura"
 
     return "Boleta"
 
@@ -1746,6 +1760,44 @@ def autorizar_venta(oid: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/ventas/{oid}/anular")
+def anular_venta(oid: str):
+    """Anula el documento en Odoo (si existe) y resetea la venta a pendiente para reemitir."""
+    venta = get_venta(oid)
+    if not venta:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+    move_id = venta.get("move_id")
+    odoo_result = None
+    if move_id:
+        try:
+            ctx = odoo_connect()
+            # Intentar cancelar el asiento en Odoo
+            moves = odoo_exec(ctx, "account.move", "search", [[["id", "=", move_id]]])
+            if moves:
+                state = odoo_exec(ctx, "account.move", "read", [moves], {"fields": ["state"]})[0]["state"]
+                if state == "posted":
+                    odoo_exec(ctx, "account.move", "button_cancel", [moves])
+                    odoo_result = f"Documento {move_id} cancelado en Odoo"
+                elif state == "cancel":
+                    odoo_result = f"Documento {move_id} ya estaba cancelado"
+                else:
+                    odoo_result = f"Documento {move_id} en estado {state} - cancelar manualmente en Odoo"
+        except Exception as e:
+            odoo_result = f"No se pudo cancelar en Odoo: {e}"
+            logger.warning(f"[{oid}] Error cancelando en Odoo: {e}")
+
+    # Resetear la venta a pendiente para que se pueda reemitir
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ventas SET estado='pendiente', move_id=NULL, partner_id=NULL, error=NULL, enviado_en=NULL WHERE id=%s",
+                (oid,)
+            )
+        conn.commit()
+    logger.info(f"[{oid}] Venta anulada y reseteada a pendiente. Odoo: {odoo_result}")
+    return {"ok": True, "id": oid, "odoo": odoo_result, "message": "Venta reseteada a pendiente - puede reemitir"}
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -1771,6 +1823,7 @@ UI_HTML = """<!doctype html>
     button.secondary{background:var(--panel2);border:1px solid var(--border);}
     button.success{background:var(--ok);color:#052e16;}
     button.warn{background:var(--warn);color:#3b2300;}
+    button.bad{background:var(--bad);color:white;}
     .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;}
     .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;}
     .card h3{margin:0 0 6px 0;font-size:13px;color:var(--muted);font-weight:600;}
@@ -2106,6 +2159,9 @@ function rowHtml(v) {
   if (v.estado !== 'enviado') {
     acciones += '<button class="success" data-action="autorizar" data-id="' + esc(id) + '">Autorizar</button>';
   }
+  if (v.estado === 'enviado') {
+    acciones += '<button class="bad" data-action="anular" data-id="' + esc(id) + '">Anular</button>';
+  }
 
   return '<tr id="row-' + esc(id) + '">' +
     '<td><input type="checkbox" class="cb-row" data-id="' + esc(id) + '" onchange="onCheckboxChange()"></td>' +
@@ -2156,6 +2212,7 @@ function renderTable() {
       if (action === 'edit') openEdit(id);
       else if (action === 'reprocesar') reprocesar(id);
       else if (action === 'autorizar') autorizar(id);
+      else if (action === 'anular') anular(id);
       else if (action === 'verpack') verPack(id, el.dataset.pack);
       else if (action === 'copy') { try { navigator.clipboard.writeText(id); } catch(e2) {} }
     });
@@ -2209,6 +2266,20 @@ function autorizar(id) {
       if (data.ok) alert('Documento creado en Odoo: move_id=' + data.move_id);
       else alert('Error: ' + (data.detail || 'desconocido'));
       refreshData();
+    });
+}
+
+function anular(id) {
+  if (!confirm('Anular el documento Odoo de la venta ' + id + ' y resetear a pendiente para reemitir?')) return;
+  fetch('/ventas/' + id + '/anular', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        alert('Venta anulada. ' + (data.odoo || '') + ' Ahora puede editar y reautorizar.');
+        refreshData();
+      } else {
+        alert('Error: ' + (data.detail || 'desconocido'));
+      }
     });
 }
 
