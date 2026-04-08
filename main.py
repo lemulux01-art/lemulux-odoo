@@ -1457,6 +1457,71 @@ def agrupar_ventas(payload: AgruparPayload):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+class ClientePayload(BaseModel):
+    nombre: str
+    rut: str
+    email: str
+    direccion: Optional[str] = ""
+    ciudad: Optional[str] = ""
+    region: Optional[str] = ""
+    giro: Optional[str] = ""
+    es_empresa: bool = False
+
+
+@app.post("/clientes/crear")
+def crear_cliente(payload: ClientePayload):
+    """Crea un partner directamente en Odoo con los datos proporcionados."""
+    try:
+        ctx = odoo_connect()
+        chile_id = get_chile_country_id(ctx)
+        rut_type_id = get_rut_id_type(ctx)
+        activity_field = get_activity_field_name(ctx)
+        rut_norm = normalize_rut(payload.rut)
+        rut_odoo = rut_con_guion(rut_norm) if rut_norm else False
+        taxpayer_type = "1" if payload.es_empresa else "4"
+
+        # Verificar si ya existe
+        existing = find_partner_by_rut(ctx, payload.rut)
+        if existing:
+            raise HTTPException(status_code=409, detail=f"Ya existe un cliente con ese RUT (id={existing})")
+
+        vals = {
+            "name": payload.nombre.strip(),
+            "vat": rut_odoo,
+            "email": payload.email.strip(),
+            "l10n_cl_dte_email": payload.email.strip(),
+            "customer_rank": 1,
+            "company_type": "company" if payload.es_empresa else "person",
+            "is_company": payload.es_empresa,
+            "country_id": chile_id,
+            "l10n_cl_sii_taxpayer_type": taxpayer_type,
+        }
+        if payload.direccion:
+            vals["street"] = payload.direccion.strip()
+        if payload.ciudad:
+            vals["city"] = payload.ciudad.strip()
+        if payload.region and "state_id" in get_partner_fields(ctx):
+            state_id = get_state_id(ctx, payload.region)
+            if state_id:
+                vals["state_id"] = state_id
+        if rut_norm and rut_type_id:
+            vals["l10n_latam_identification_type_id"] = rut_type_id
+        if activity_field and payload.giro:
+            vals[activity_field] = payload.giro.strip()
+        elif payload.es_empresa and payload.giro:
+            vals["x_giro"] = payload.giro.strip()
+
+        partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
+        logger.info(f"Cliente creado manualmente: id={partner_id} nombre={payload.nombre}")
+        return {"ok": True, "partner_id": partner_id, "nombre": payload.nombre}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creando cliente: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/ventas/{oid}")
 def venta_detalle(oid: str):
     venta = get_venta(oid)
@@ -1688,20 +1753,112 @@ UI_HTML = """<!doctype html>
       <option value="error">Error</option>
       <option value="rechazado">Rechazado</option>
     </select>
-    <select id="turnoFilter" onchange="renderTable()">
-      <option value="">Todos los turnos</option>
-    </select>
     <select id="horaCorte" onchange="recalcularTurnos()">
       <option value="14">Corte 14:00</option>
       <option value="15">Corte 15:00</option>
       <option value="13">Corte 13:00</option>
       <option value="12">Corte 12:00</option>
     </select>
+    <button class="secondary" onclick="abrirCalendario()" id="btnCalendario">&#128197; Todos los turnos</button>
+    <button class="success" onclick="abrirCrearCliente()">+ Crear cliente</button>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
   <div id="selInfo" style="display:none;margin-bottom:10px;font-size:13px;color:var(--muted)"><span id="selCount"></span></div>
   <div id="tableWrap"><div class="empty">Cargando...</div></div>
+</div>
+
+<!-- Modal Calendario de turnos -->
+<div class="modal" id="calModal">
+  <div class="modal-card" style="max-width:520px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div class="title" style="font-size:20px">Seleccionar turno</div>
+      <button class="secondary" onclick="cerrarCalendario()">Cerrar</button>
+    </div>
+    <div style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
+      <label style="font-size:13px">Hora de corte:</label>
+      <select id="horaCorte2" onchange="sincronizarCorte(this.value); renderCalendario()">
+        <option value="14">14:00</option>
+        <option value="15">15:00</option>
+        <option value="13">13:00</option>
+        <option value="12">12:00</option>
+      </select>
+    </div>
+    <div id="calGrid" style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;text-align:center;"></div>
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;">
+      <button class="secondary" onclick="seleccionarTurno(''); cerrarCalendario()">Ver todos</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Crear Cliente -->
+<div class="modal" id="clienteModal">
+  <div class="modal-card" style="max-width:560px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div class="title" style="font-size:20px">Crear cliente en Odoo</div>
+      <button class="secondary" onclick="cerrarCrearCliente()">Cerrar</button>
+    </div>
+    <div class="modal-grid">
+      <div class="full">
+        <label>Tipo</label>
+        <select id="cliTipo" onchange="toggleCliGiro()">
+          <option value="persona">Persona natural (Boleta)</option>
+          <option value="empresa">Empresa (Factura)</option>
+        </select>
+      </div>
+      <div class="full">
+        <label>Nombre / Razon social</label>
+        <input id="cliNombre" placeholder="Nombre completo o razon social">
+      </div>
+      <div>
+        <label>RUT</label>
+        <input id="cliRut" placeholder="12345678-9">
+      </div>
+      <div>
+        <label>Email DTE</label>
+        <input id="cliEmail" placeholder="correo@ejemplo.com">
+      </div>
+      <div class="full">
+        <label>Direccion</label>
+        <input id="cliDireccion" placeholder="Calle y numero">
+      </div>
+      <div>
+        <label>Ciudad / Comuna</label>
+        <input id="cliCiudad" placeholder="Las Condes">
+      </div>
+      <div>
+        <label>Region</label>
+        <select id="cliRegion">
+          <option value="">-- Seleccionar --</option>
+          <option value="Metropolitana">Metropolitana (RM)</option>
+          <option value="Valparaiso">Valparaiso</option>
+          <option value="del BioBio">del BioBio</option>
+          <option value="de la Araucania">de la Araucania</option>
+          <option value="Antofagasta">Antofagasta</option>
+          <option value="Coquimbo">Coquimbo</option>
+          <option value="del Libertador Gral. Bernardo O'Higgins">O'Higgins</option>
+          <option value="del Maule">del Maule</option>
+          <option value="de los Lagos">de los Lagos</option>
+          <option value="Tarapaca">Tarapaca</option>
+          <option value="Atacama">Atacama</option>
+          <option value="Arica y Parinacota">Arica y Parinacota</option>
+          <option value="Aysen del Gral. Carlos Ibanez del Campo">Aysen</option>
+          <option value="Magallanes">Magallanes</option>
+          <option value="Los Rios">Los Rios</option>
+          <option value="del Nuble">del Nuble</option>
+        </select>
+      </div>
+      <div class="full" id="cliGiroGroup" style="display:none">
+        <label>Giro / Actividad economica</label>
+        <input id="cliGiro" placeholder="Comercio al por menor">
+      </div>
+    </div>
+    <div id="cliError" style="color:#f87171;font-size:13px;margin-top:12px;display:none"></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="cerrarCrearCliente()">Cancelar</button>
+      <button class="success" onclick="crearClienteOdoo()">Crear en Odoo</button>
+    </div>
+  </div>
 </div>
 <div class="modal" id="editModal">
   <div class="modal-card">
@@ -2185,6 +2342,193 @@ document.getElementById('editModal').addEventListener('click', function(e) {
 
 document.getElementById('packModal').addEventListener('click', function(e) {
   if (e.target.id === 'packModal') closePackModal();
+});
+
+// ========================
+// CALENDARIO DE TURNOS
+// ========================
+
+var turnoActivo = '';
+
+function seleccionarTurno(key) {
+  turnoActivo = key;
+  var btn = document.getElementById('btnCalendario');
+  if (!key) {
+    btn.textContent = '[Cal] Todos los turnos';
+    btn.style.background = '';
+  } else {
+    btn.textContent = '[Cal] ' + getTurnoLabel(key);
+    btn.style.background = 'var(--blue)';
+  }
+  renderTable();
+}
+
+function abrirCalendario() {
+  document.getElementById('horaCorte2').value = document.getElementById('horaCorte').value;
+  renderCalendario();
+  document.getElementById('calModal').classList.add('open');
+}
+
+function cerrarCalendario() {
+  document.getElementById('calModal').classList.remove('open');
+}
+
+function sincronizarCorte(val) {
+  document.getElementById('horaCorte').value = val;
+  recalcularTurnos();
+}
+
+function renderCalendario() {
+  var grid = document.getElementById('calGrid');
+  // Contar ventas por turno
+  var conteo = {};
+  ventas.forEach(function(v) {
+    var k = getTurnoKey(v.creado_en);
+    if (k) conteo[k] = (conteo[k] || 0) + 1;
+  });
+
+  var keys = Object.keys(conteo).sort().reverse();
+  if (!keys.length) {
+    grid.innerHTML = '<div style="grid-column:1/-1;color:#94a3b8;padding:20px">No hay turnos disponibles</div>';
+    return;
+  }
+
+  // Encabezados de dias de semana
+  var dias = ['Dom','Lun','Mar','Mie','Jue','Vie','Sab'];
+  var html = dias.map(function(d) {
+    return '<div style="font-size:11px;color:#94a3b8;padding:4px 0;font-weight:700">' + d + '</div>';
+  }).join('');
+
+  // Encontrar rango de fechas
+  var first = keys[keys.length-1];
+  var last = keys[0];
+  var p = first.split('-');
+  var startDate = new Date(Date.UTC(parseInt(p[0]), parseInt(p[1])-1, parseInt(p[2])));
+  // Retroceder al domingo de esa semana
+  var dow = startDate.getUTCDay();
+  startDate = new Date(startDate.getTime() - dow * 86400000);
+
+  var p2 = last.split('-');
+  var endDate = new Date(Date.UTC(parseInt(p2[0]), parseInt(p2[1])-1, parseInt(p2[2])));
+
+  var cur = new Date(startDate.getTime());
+  while (cur <= endDate) {
+    var y = cur.getUTCFullYear();
+    var m = String(cur.getUTCMonth()+1).padStart(2,'0');
+    var d = String(cur.getUTCDate()).padStart(2,'0');
+    var key = y + '-' + m + '-' + d;
+    var cnt = conteo[key] || 0;
+    var isActive = turnoActivo === key;
+    var bg = isActive ? 'var(--blue)' : (cnt > 0 ? 'var(--panel2)' : 'transparent');
+    var border = cnt > 0 ? '1px solid var(--border)' : '1px solid transparent';
+    var cursor = cnt > 0 ? 'pointer' : 'default';
+    var onclick = cnt > 0 ? 'onclick="seleccionarTurno(\'' + key + '\'); cerrarCalendario();"' : '';
+    html += '<div style="border-radius:8px;padding:6px 2px;background:' + bg + ';border:' + border + ';cursor:' + cursor + '" ' + onclick + '>';
+    html += '<div style="font-size:13px;font-weight:600">' + parseInt(d) + '</div>';
+    if (cnt > 0) {
+      html += '<div style="font-size:11px;color:' + (isActive ? 'white' : 'var(--ok)') + '">' + cnt + '</div>';
+    }
+    html += '</div>';
+    cur = new Date(cur.getTime() + 86400000);
+  }
+  grid.innerHTML = html;
+}
+
+// Override filteredVentas para usar turnoActivo
+var _filteredVentasOrig = filteredVentas;
+filteredVentas = function() {
+  var q = document.getElementById('searchInput').value.trim().toLowerCase();
+  var s = document.getElementById('statusFilter').value;
+  return ventas.filter(function(v) {
+    var okS = !s || v.estado === s;
+    var campos = [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase();
+    var okQ = !q || campos.indexOf(q) >= 0;
+    var okT = !turnoActivo || getTurnoKey(v.creado_en) === turnoActivo;
+    return okS && okQ && okT;
+  });
+};
+
+document.getElementById('calModal').addEventListener('click', function(e) {
+  if (e.target.id === 'calModal') cerrarCalendario();
+});
+
+// ========================
+// CREAR CLIENTE EN ODOO
+// ========================
+
+function toggleCliGiro() {
+  var esEmpresa = document.getElementById('cliTipo').value === 'empresa';
+  document.getElementById('cliGiroGroup').style.display = esEmpresa ? 'block' : 'none';
+}
+
+function abrirCrearCliente() {
+  document.getElementById('cliNombre').value = '';
+  document.getElementById('cliRut').value = '';
+  document.getElementById('cliEmail').value = '';
+  document.getElementById('cliDireccion').value = '';
+  document.getElementById('cliCiudad').value = '';
+  document.getElementById('cliRegion').value = '';
+  document.getElementById('cliGiro').value = '';
+  document.getElementById('cliTipo').value = 'persona';
+  document.getElementById('cliError').style.display = 'none';
+  toggleCliGiro();
+  document.getElementById('clienteModal').classList.add('open');
+}
+
+function cerrarCrearCliente() {
+  document.getElementById('clienteModal').classList.remove('open');
+}
+
+function crearClienteOdoo() {
+  var nombre = document.getElementById('cliNombre').value.trim();
+  var rut = document.getElementById('cliRut').value.trim();
+  var email = document.getElementById('cliEmail').value.trim();
+  var errDiv = document.getElementById('cliError');
+
+  if (!nombre || !rut || !email) {
+    errDiv.textContent = 'Nombre, RUT y email son obligatorios';
+    errDiv.style.display = 'block';
+    return;
+  }
+
+  var esEmpresa = document.getElementById('cliTipo').value === 'empresa';
+  var payload = {
+    nombre: nombre,
+    rut: rut,
+    email: email,
+    direccion: document.getElementById('cliDireccion').value.trim(),
+    ciudad: document.getElementById('cliCiudad').value.trim(),
+    region: document.getElementById('cliRegion').value,
+    giro: esEmpresa ? document.getElementById('cliGiro').value.trim() : '',
+    es_empresa: esEmpresa
+  };
+
+  errDiv.textContent = 'Creando...';
+  errDiv.style.display = 'block';
+  errDiv.style.color = '#94a3b8';
+
+  fetch('/clientes/crear', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }).then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        cerrarCrearCliente();
+        alert('Cliente creado en Odoo: ' + data.nombre + ' (id=' + data.partner_id + ')');
+      } else {
+        errDiv.style.color = '#f87171';
+        errDiv.textContent = 'Error: ' + (data.detail || 'desconocido');
+      }
+    })
+    .catch(function(e) {
+      errDiv.style.color = '#f87171';
+      errDiv.textContent = 'Error de conexion: ' + e.message;
+    });
+}
+
+document.getElementById('clienteModal').addEventListener('click', function(e) {
+  if (e.target.id === 'clienteModal') cerrarCrearCliente();
 });
 
 refreshData();
