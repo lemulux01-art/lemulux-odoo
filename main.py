@@ -1926,7 +1926,7 @@ function openEdit(id) {
     .then(function(det) {
       document.getElementById('editTotal').value = money(det.total_bruto);
       document.getElementById('editItemsCount').value = det.cantidad_items || 0;
-      document.getElementById('editProducts').value = (det.productos || []).join('\n');
+      document.getElementById('editProducts').value = (det.productos || []).join(String.fromCharCode(10));
     })
     .catch(function() {
       document.getElementById('editProducts').value = 'Error cargando productos';
@@ -2025,9 +2025,9 @@ function agruparSeleccionadas() {
     var v = null;
     for (var i = 0; i < ventas.length; i++) { if (String(ventas[i].id) === id) { v = ventas[i]; break; } }
     return v ? ('* ' + (v.cliente || id) + ' - ' + id) : id;
-  }).join('\n');
+  }).join(String.fromCharCode(10));
 
-  if (!confirm('Agrupar ' + ids.length + ' ventas en una sola boleta/factura?\n\nLa primera sera la principal:\n\n' + resumen + '\n\nEsta accion no se puede deshacer.')) return;
+  if (!confirm('Agrupar ' + ids.length + ' ventas en una sola boleta/factura? La primera sera la principal: ' + resumen + ' Esta accion no se puede deshacer.')) return;
 
   fetch('/ventas/agrupar', {
     method: 'POST',
