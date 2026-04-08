@@ -1135,15 +1135,18 @@ def create_document(
 # =========================
 
 ML_ESTADO_ENVIO = {
-    "payment_required": "⏳ Pendiente de pago",
-    "payment_in_process": "⏳ Pago en proceso",
-    "paid":              "✅ Pagado",
-    "ready_to_ship":     "📦 Listo para envío",
-    "shipped":           "🚚 En camino",
-    "delivered":         "🏠 Entregado",
-    "cancelled":         "❌ Cancelado",
-    "invalid":           "⚠️ Inválido",
+    "payment_required": "Pendiente de pago",
+    "payment_in_process": "Pago en proceso",
+    "paid":              "Pagado",
+    "ready_to_ship":     "Listo para envio",
+    "shipped":           "En camino",
+    "delivered":         "Entregado",
+    "cancelled":         "Cancelado",
+    "invalid":           "Invalido",
 }
+
+# Estados que se consideran "pagados" para ingreso al sistema
+ML_ESTADOS_VALIDOS = {"paid", "ready_to_ship", "shipped", "delivered"}
 
 
 def process_webhook_order(order_id: str):
@@ -1166,9 +1169,9 @@ def process_webhook_order(order_id: str):
                 logger.info(f"[pack:{pack_id}] Estado envío actualizado: {estado_envio}")
                 return
 
-            # Solo crear si está pagado
-            if ml_status != "paid":
-                logger.info(f"[pack:{pack_id}] No pagado ({ml_status}), ignorado")
+            # Solo crear si está en estado válido (pagado o posterior)
+            if ml_status not in ML_ESTADOS_VALIDOS:
+                logger.info(f"[pack:{pack_id}] Estado no valido para facturar ({ml_status}), ignorado")
                 return
 
             # Obtener todas las órdenes del pack
@@ -1217,8 +1220,8 @@ def process_webhook_order(order_id: str):
             logger.info(f"[{order_id}] Estado envío actualizado: {estado_envio}")
             return
 
-        if ml_status != "paid":
-            logger.info(f"[{order_id}] Orden no pagada ({ml_status}), no se agrega a bandeja")
+        if ml_status not in ML_ESTADOS_VALIDOS:
+            logger.info(f"[{order_id}] Estado no valido para facturar ({ml_status}), ignorado")
             return
 
         billing_raw = get_ml_billing_raw(order_id)
@@ -1357,30 +1360,46 @@ def get_ml_seller_id() -> Optional[str]:
 
 
 def get_ml_ordenes_recientes(seller_id: str, total: int = 200) -> list:
-    """Obtiene las ultimas N ordenes pagadas de ML paginando de 50 en 50."""
+    """Obtiene las ultimas N ordenes con estados validos para facturar, paginando de 50 en 50."""
+    # ML solo permite filtrar por un estado a la vez
+    estados = ["paid", "ready_to_ship", "shipped", "delivered"]
     todas = []
-    limit = 50
-    offset = 0
-    while len(todas) < total:
-        url = (
-            f"https://api.mercadolibre.com/orders/search"
-            f"?seller={seller_id}&order.status=paid&sort=date_desc"
-            f"&limit={limit}&offset={offset}"
-        )
-        try:
-            data = ml_get(url)
-        except Exception as e:
-            logger.warning(f"Error paginando ordenes ML offset={offset}: {e}")
-            break
-        resultados = data.get("results") or []
-        if not resultados:
-            break
-        todas.extend(resultados)
-        offset += limit
-        if len(resultados) < limit:
-            break  # no hay mas paginas
-        time.sleep(1)  # respetar rate limit entre paginas
-    return todas[:total]
+    por_estado = total // len(estados) + 50  # pedir suficientes de cada estado
+
+    for estado in estados:
+        offset = 0
+        limit = 50
+        while len([o for o in todas if o.get("status") == estado]) < por_estado:
+            url = (
+                f"https://api.mercadolibre.com/orders/search"
+                f"?seller={seller_id}&order.status={estado}&sort=date_desc"
+                f"&limit={limit}&offset={offset}"
+            )
+            try:
+                data = ml_get(url)
+            except Exception as e:
+                logger.warning(f"Error paginando ordenes ML estado={estado} offset={offset}: {e}")
+                break
+            resultados = data.get("results") or []
+            if not resultados:
+                break
+            todas.extend(resultados)
+            offset += limit
+            if len(resultados) < limit:
+                break
+            time.sleep(0.5)
+
+    # Deduplicar por ID y ordenar por fecha desc
+    visto = set()
+    unicas = []
+    for o in todas:
+        oid = str(o.get("id", ""))
+        if oid and oid not in visto:
+            visto.add(oid)
+            unicas.append(o)
+
+    unicas.sort(key=lambda o: o.get("date_created", ""), reverse=True)
+    return unicas[:total]
 
 def reconciliar_ordenes_ml():
     """
