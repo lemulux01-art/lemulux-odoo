@@ -2550,7 +2550,7 @@ function reconciliarML() {
       if (data.ok) {
         var msg = 'ML: ' + data.ordenes_ml + ' ordenes | BD: ' + data.en_bd + ' | Faltantes: ' + data.faltantes;
         if (data.encoladas && data.encoladas.length > 0) {
-          msg += '\nEncoladas para procesar: ' + data.encoladas.join(', ');
+          msg += ' - Encoladas: ' + data.encoladas.join(', ');
           setTimeout(refreshData, 5000);
         }
         alert(msg);
