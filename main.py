@@ -1345,6 +1345,72 @@ def webhook_worker():
 
 
 @app.on_event("startup")
+def get_ml_seller_id() -> Optional[str]:
+    """Obtiene el seller_id del token actual."""
+    try:
+        data = ml_get("https://api.mercadolibre.com/users/me")
+        return str(data.get("id", ""))
+    except Exception as e:
+        logger.error(f"No se pudo obtener seller_id: {e}")
+        return None
+
+
+def reconciliar_ordenes_ml():
+    """
+    Consulta las últimas ordenes pagadas en ML y verifica que estén en la BD.
+    Si falta alguna, la encola para procesamiento.
+    Se ejecuta cada 15 minutos en background.
+    """
+    while True:
+        time.sleep(15 * 60)  # cada 15 minutos
+        try:
+            seller_id = get_ml_seller_id()
+            if not seller_id:
+                continue
+
+            # Consultar órdenes pagadas de las últimas 2 horas
+            from datetime import timezone
+            ahora = datetime.now(timezone.utc)
+            desde = ahora.replace(microsecond=0).isoformat().replace("+00:00", ".000Z")
+            # ML usa date_last_updated, buscamos las recientes
+            url = (
+                f"https://api.mercadolibre.com/orders/search"
+                f"?seller={seller_id}&order.status=paid&sort=date_desc&limit=50"
+            )
+            data = ml_get(url)
+            ordenes_ml = data.get("results") or []
+
+            if not ordenes_ml:
+                continue
+
+            # Obtener IDs que ya están en la BD
+            ids_ml = [str(o["id"]) for o in ordenes_ml]
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    placeholders = ",".join(["%s"] * len(ids_ml))
+                    cur.execute(
+                        f"SELECT id FROM ventas WHERE id = ANY(%s::text[])",
+                        (ids_ml,)
+                    )
+                    ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
+
+            # Encontrar órdenes que no están en la BD
+            faltantes = [oid for oid in ids_ml if oid not in ids_en_bd]
+
+            if faltantes:
+                logger.warning(f"Reconciliacion: {len(faltantes)} ordenes faltantes en BD: {faltantes[:5]}")
+                for oid in faltantes:
+                    if oid not in list(webhook_queue.queue):
+                        webhook_queue.put(oid)
+                        logger.info(f"Reconciliacion: encolada orden faltante {oid}")
+                    time.sleep(1)
+            else:
+                logger.info(f"Reconciliacion OK: {len(ordenes_ml)} ordenes ML todas en BD")
+
+        except Exception as e:
+            logger.error(f"Error en reconciliacion: {e}")
+
+
 async def on_startup():
     wait_for_db()
     t = threading.Thread(target=schedule_token_refresh, daemon=True)
@@ -1353,6 +1419,9 @@ async def on_startup():
     w = threading.Thread(target=webhook_worker, daemon=True)
     w.start()
     logger.info("Worker de cola de webhooks iniciado")
+    r = threading.Thread(target=reconciliar_ordenes_ml, daemon=True)
+    r.start()
+    logger.info("Reconciliador de ordenes ML iniciado (cada 15 min)")
 
 
 # =========================
@@ -1413,10 +1482,13 @@ async def ml_webhook(request: Request):
     if not order_id:
         return {"ok": True}
 
-    webhook_queue.put(order_id)
-    logger.info(f"Webhook encolado: {order_id} (cola: {webhook_queue.qsize()})")
+    # Deduplicar — no encolar si ya está en la cola
+    if order_id not in list(webhook_queue.queue):
+        webhook_queue.put(order_id)
+        logger.info(f"Webhook encolado: {order_id} (cola: {webhook_queue.qsize()})")
+    else:
+        logger.info(f"Webhook duplicado ignorado: {order_id}")
     return {"ok": True, "order_id": order_id, "queued": webhook_queue.qsize()}
-    return {"ok": True, "order_id": order_id}
 
 
 @app.get("/ml/oauth/callback")
@@ -1467,6 +1539,45 @@ def ventas(estado: Optional[str] = None):
             "total_bruto": total_bruto,
         })
     return {"items": enriched}
+
+
+@app.post("/ventas/reconciliar")
+def reconciliar_manual():
+    """Fuerza reconciliacion inmediata con ML y encola ordenes faltantes."""
+    try:
+        seller_id = get_ml_seller_id()
+        if not seller_id:
+            raise HTTPException(status_code=500, detail="No se pudo obtener seller_id de ML")
+
+        url = f"https://api.mercadolibre.com/orders/search?seller={seller_id}&order.status=paid&sort=date_desc&limit=50"
+        data = ml_get(url)
+        ordenes_ml = data.get("results") or []
+        ids_ml = [str(o["id"]) for o in ordenes_ml]
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_ml,))
+                ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
+
+        faltantes = [oid for oid in ids_ml if oid not in ids_en_bd]
+        encoladas = []
+        for oid in faltantes:
+            if oid not in list(webhook_queue.queue):
+                webhook_queue.put(oid)
+                encoladas.append(oid)
+
+        logger.info(f"Reconciliacion manual: {len(ordenes_ml)} ordenes ML, {len(faltantes)} faltantes, {len(encoladas)} encoladas")
+        return {
+            "ok": True,
+            "ordenes_ml": len(ordenes_ml),
+            "en_bd": len(ids_en_bd),
+            "faltantes": len(faltantes),
+            "encoladas": encoladas
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ventas/ingresar/{order_id}")
@@ -1895,6 +2006,7 @@ UI_HTML = """<!doctype html>
     <button class="secondary" onclick="abrirCalendario()" id="btnCalendario">&#128197; Todos los turnos</button>
     <button class="success" onclick="abrirCrearCliente()">+ Crear cliente</button>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
+    <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 50 ordenes en ML y agrega las que falten en el sistema">&#128279; Reconciliar ML</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
   <div id="selInfo" style="display:none;margin-bottom:10px;font-size:13px;color:var(--muted)"><span id="selCount"></span></div>
@@ -2425,6 +2537,30 @@ function agruparSeleccionadas() {
       } else {
         alert('Error: ' + (data.detail || 'desconocido'));
       }
+    });
+}
+
+function reconciliarML() {
+  var btn = document.querySelector('[onclick="reconciliarML()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Consultando ML...'; }
+  fetch('/ventas/reconciliar', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar ML'; }
+      if (data.ok) {
+        var msg = 'ML: ' + data.ordenes_ml + ' ordenes | BD: ' + data.en_bd + ' | Faltantes: ' + data.faltantes;
+        if (data.encoladas && data.encoladas.length > 0) {
+          msg += '\nEncoladas para procesar: ' + data.encoladas.join(', ');
+          setTimeout(refreshData, 5000);
+        }
+        alert(msg);
+      } else {
+        alert('Error: ' + (data.detail || 'desconocido'));
+      }
+    })
+    .catch(function(e) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar ML'; }
+      alert('Error de conexion: ' + e.message);
     });
 }
 
