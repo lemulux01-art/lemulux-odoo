@@ -1355,6 +1355,33 @@ def get_ml_seller_id() -> Optional[str]:
         return None
 
 
+
+def get_ml_ordenes_recientes(seller_id: str, total: int = 200) -> list:
+    """Obtiene las ultimas N ordenes pagadas de ML paginando de 50 en 50."""
+    todas = []
+    limit = 50
+    offset = 0
+    while len(todas) < total:
+        url = (
+            f"https://api.mercadolibre.com/orders/search"
+            f"?seller={seller_id}&order.status=paid&sort=date_desc"
+            f"&limit={limit}&offset={offset}"
+        )
+        try:
+            data = ml_get(url)
+        except Exception as e:
+            logger.warning(f"Error paginando ordenes ML offset={offset}: {e}")
+            break
+        resultados = data.get("results") or []
+        if not resultados:
+            break
+        todas.extend(resultados)
+        offset += limit
+        if len(resultados) < limit:
+            break  # no hay mas paginas
+        time.sleep(1)  # respetar rate limit entre paginas
+    return todas[:total]
+
 def reconciliar_ordenes_ml():
     """
     Consulta las últimas ordenes pagadas en ML y verifica que estén en la BD.
@@ -1373,12 +1400,7 @@ def reconciliar_ordenes_ml():
             ahora = datetime.now(timezone.utc)
             desde = ahora.replace(microsecond=0).isoformat().replace("+00:00", ".000Z")
             # ML usa date_last_updated, buscamos las recientes
-            url = (
-                f"https://api.mercadolibre.com/orders/search"
-                f"?seller={seller_id}&order.status=paid&sort=date_desc&limit=50"
-            )
-            data = ml_get(url)
-            ordenes_ml = data.get("results") or []
+            ordenes_ml = get_ml_ordenes_recientes(seller_id, total=200)
 
             if not ordenes_ml:
                 continue
@@ -1549,9 +1571,7 @@ def reconciliar_manual():
         if not seller_id:
             raise HTTPException(status_code=500, detail="No se pudo obtener seller_id de ML")
 
-        url = f"https://api.mercadolibre.com/orders/search?seller={seller_id}&order.status=paid&sort=date_desc&limit=50"
-        data = ml_get(url)
-        ordenes_ml = data.get("results") or []
+        ordenes_ml = get_ml_ordenes_recientes(seller_id, total=200)
         ids_ml = [str(o["id"]) for o in ordenes_ml]
 
         with get_db() as conn:
