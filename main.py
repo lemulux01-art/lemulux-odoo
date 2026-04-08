@@ -1563,6 +1563,102 @@ def ventas(estado: Optional[str] = None):
     return {"items": enriched}
 
 
+
+class VentaManualPayload(BaseModel):
+    tipo: str = "Boleta"
+    order_id: Optional[str] = None
+    cliente: str
+    rut: str
+    email: str
+    direccion: Optional[str] = ""
+    ciudad: Optional[str] = ""
+    region: Optional[str] = ""
+    giro: Optional[str] = ""
+    productos: Optional[list] = []  # lista de strings descriptivos
+    total_bruto: Optional[float] = 0.0
+    autorizar: bool = False
+
+
+@app.post("/ventas/manual")
+def ingresar_venta_manual(payload: VentaManualPayload):
+    """Ingresa una venta manualmente sin pasar por ML."""
+    try:
+        rut_norm = normalize_rut(payload.rut)
+        oid = payload.order_id or f"MANUAL-{int(datetime.now().timestamp())}"
+        giro_final = payload.giro or (DEFAULT_BOLETA_ACTIVITY if payload.tipo == "Boleta" else "")
+
+        # Construir order_json simulado con los productos
+        items = []
+        for p in (payload.productos or []):
+            items.append({
+                "item": {"title": p},
+                "quantity": 1,
+                "unit_price": 0
+            })
+        order_fake = {
+            "id": oid,
+            "status": "paid",
+            "order_items": items,
+            "buyer": {"email": payload.email}
+        }
+        billing_fake = {}
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM ventas WHERE id = %s", (str(oid),))
+                if cur.fetchone():
+                    raise HTTPException(status_code=409, detail=f"Ya existe una venta con ID {oid}")
+                cur.execute(
+                    """INSERT INTO ventas
+                        (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region,
+                         tipo_sugerido, estado, estado_envio, order_json, billing_json)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', 'paid', %s, %s)
+                    """,
+                    (
+                        str(oid), None,
+                        payload.cliente.strip(),
+                        rut_norm,
+                        payload.email.strip(),
+                        giro_final,
+                        (payload.direccion or "").strip(),
+                        (payload.ciudad or "").strip(),
+                        (payload.region or "").strip(),
+                        payload.tipo,
+                        json.dumps(order_fake, ensure_ascii=False),
+                        json.dumps(billing_fake, ensure_ascii=False),
+                    )
+                )
+            conn.commit()
+
+        logger.info(f"Venta manual ingresada: id={oid} cliente={payload.cliente} tipo={payload.tipo}")
+
+        if payload.autorizar:
+            move_id, partner_id = create_document(
+                order=order_fake,
+                billing_raw=billing_fake,
+                tipo=payload.tipo,
+                email=payload.email,
+                giro=giro_final,
+                cliente_override=payload.cliente,
+                rut_override=rut_norm,
+                direccion_override=payload.direccion,
+                ciudad_override=payload.ciudad,
+                region_override=payload.region,
+            )
+            update_venta(str(oid), estado="enviado", move_id=move_id,
+                        partner_id=partner_id, error=None, enviado_en=datetime.now())
+            return {"ok": True, "id": oid, "move_id": move_id, "autorizado": True}
+
+        return {"ok": True, "id": oid, "autorizado": False}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error ingresando venta manual: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 @app.post("/ventas/reconciliar")
 def reconciliar_manual():
     """Fuerza reconciliacion inmediata con ML y encola ordenes faltantes."""
@@ -2025,8 +2121,9 @@ UI_HTML = """<!doctype html>
     </select>
     <button class="secondary" onclick="abrirCalendario()" id="btnCalendario">&#128197; Todos los turnos</button>
     <button class="success" onclick="abrirCrearCliente()">+ Crear cliente</button>
+    <button class="secondary" onclick="abrirIngresarVenta()" style="background:var(--blue)">+ Ingresar venta</button>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
-    <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 50 ordenes en ML y agrega las que falten en el sistema">&#128279; Reconciliar ML</button>
+    <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 200 ordenes en ML y agrega las que falten en el sistema">&#128279; Reconciliar ML</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
   <div id="selInfo" style="display:none;margin-bottom:10px;font-size:13px;color:var(--muted)"><span id="selCount"></span></div>
@@ -2178,6 +2275,85 @@ UI_HTML = """<!doctype html>
       <button class="secondary" onclick="closePackModal()">Cerrar</button>
     </div>
     <div id="packModalBody"></div>
+  </div>
+</div>
+<!-- Modal Ingresar Venta Manual -->
+<div class="modal" id="ventaManualModal">
+  <div class="modal-card" style="max-width:700px">
+    <div class="topbar" style="margin-bottom:0">
+      <div><div class="title" style="font-size:20px">+ Ingresar venta manual</div>
+      <div class="subtitle">Crea una venta directamente sin pasar por ML</div></div>
+      <button class="secondary" onclick="cerrarIngresarVenta()">Cerrar</button>
+    </div>
+    <div class="modal-grid" style="margin-top:16px">
+      <div>
+        <label>Tipo documento</label>
+        <select id="vmTipo" onchange="toggleVmGiro()">
+          <option value="Boleta">Boleta</option>
+          <option value="Factura">Factura</option>
+        </select>
+      </div>
+      <div>
+        <label>ID orden ML (opcional)</label>
+        <input id="vmOrderId" placeholder="ej: 2000012419074761">
+      </div>
+      <div class="full">
+        <label>Nombre / Razon social</label>
+        <input id="vmCliente" placeholder="Nombre completo o razon social">
+      </div>
+      <div>
+        <label>RUT</label>
+        <input id="vmRut" placeholder="12345678-9">
+      </div>
+      <div>
+        <label>Email DTE</label>
+        <input id="vmEmail" placeholder="correo@ejemplo.com" value="boleta@lemulux.com">
+      </div>
+      <div class="full">
+        <label>Direccion</label>
+        <input id="vmDireccion" placeholder="Calle y numero">
+      </div>
+      <div>
+        <label>Ciudad / Comuna</label>
+        <input id="vmCiudad" placeholder="Las Condes">
+      </div>
+      <div>
+        <label>Region</label>
+        <select id="vmRegion">
+          <option value="">-- Seleccionar --</option>
+          <option value="Metropolitana">Metropolitana (RM)</option>
+          <option value="Valparaiso">Valparaiso</option>
+          <option value="del BioBio">del BioBio</option>
+          <option value="de la Araucania">de la Araucania</option>
+          <option value="Antofagasta">Antofagasta</option>
+          <option value="Coquimbo">Coquimbo</option>
+          <option value="del Libertador Gral. Bernardo O'Higgins">O'Higgins</option>
+          <option value="del Maule">del Maule</option>
+          <option value="de los Lagos">de los Lagos</option>
+          <option value="Tarapaca">Tarapaca</option>
+          <option value="Atacama">Atacama</option>
+          <option value="Arica y Parinacota">Arica y Parinacota</option>
+          <option value="Aysen del Gral. Carlos Ibanez del Campo">Aysen</option>
+          <option value="Magallanes">Magallanes</option>
+          <option value="Los Rios">Los Rios</option>
+          <option value="del Nuble">del Nuble</option>
+        </select>
+      </div>
+      <div class="full" id="vmGiroGroup" style="display:none">
+        <label>Giro / Actividad economica</label>
+        <input id="vmGiro" placeholder="Comercio al por menor">
+      </div>
+      <div class="full">
+        <label>Productos (uno por linea, formato: Descripcion x cantidad $precio_unitario)</label>
+        <textarea id="vmProductos" style="min-height:120px" placeholder="Foco Led 24w x2 $9990&#10;Tubo Led T8 x1 $4990"></textarea>
+      </div>
+    </div>
+    <div id="vmError" style="color:#f87171;font-size:13px;margin-top:12px;display:none"></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="cerrarIngresarVenta()">Cancelar</button>
+      <button onclick="guardarVentaManual()">Guardar como pendiente</button>
+      <button class="success" onclick="guardarYAutorizarManual()">Guardar y autorizar</button>
+    </div>
   </div>
 </div>
 <script src="/ui/app.js"></script>
@@ -2715,6 +2891,122 @@ function toggleCliGiro() {
   document.getElementById('cliGiroGroup').style.display = esEmpresa ? 'block' : 'none';
 }
 
+function abrirIngresarVenta() {
+  document.getElementById('vmTipo').value = 'Boleta';
+  document.getElementById('vmOrderId').value = '';
+  document.getElementById('vmCliente').value = '';
+  document.getElementById('vmRut').value = '';
+  document.getElementById('vmEmail').value = 'boleta@lemulux.com';
+  document.getElementById('vmDireccion').value = '';
+  document.getElementById('vmCiudad').value = '';
+  document.getElementById('vmRegion').value = '';
+  document.getElementById('vmGiro').value = '';
+  document.getElementById('vmProductos').value = '';
+  document.getElementById('vmError').style.display = 'none';
+  toggleVmGiro();
+  document.getElementById('ventaManualModal').classList.add('open');
+}
+
+function cerrarIngresarVenta() {
+  document.getElementById('ventaManualModal').classList.remove('open');
+}
+
+function toggleVmGiro() {
+  var esFactura = document.getElementById('vmTipo').value === 'Factura';
+  document.getElementById('vmGiroGroup').style.display = esFactura ? 'block' : 'none';
+}
+
+function buildVentaManualPayload(autorizar) {
+  var nombre = document.getElementById('vmCliente').value.trim();
+  var rut = document.getElementById('vmRut').value.trim();
+  var email = document.getElementById('vmEmail').value.trim();
+  if (!nombre || !rut || !email) return null;
+  var tipo = document.getElementById('vmTipo').value;
+  var productosRaw = document.getElementById('vmProductos').value.trim();
+  var productos = productosRaw ? productosRaw.split(String.fromCharCode(10)).map(function(l){ return l.trim(); }).filter(Boolean) : [];
+  return {
+    tipo: tipo,
+    order_id: document.getElementById('vmOrderId').value.trim() || null,
+    cliente: nombre,
+    rut: rut,
+    email: email,
+    direccion: document.getElementById('vmDireccion').value.trim(),
+    ciudad: document.getElementById('vmCiudad').value.trim(),
+    region: document.getElementById('vmRegion').value,
+    giro: tipo === 'Factura' ? document.getElementById('vmGiro').value.trim() : '',
+    productos: productos,
+    autorizar: autorizar
+  };
+}
+
+function guardarVentaManual() {
+  var payload = buildVentaManualPayload(false);
+  var errDiv = document.getElementById('vmError');
+  if (!payload) {
+    errDiv.textContent = 'Nombre, RUT y email son obligatorios';
+    errDiv.style.display = 'block';
+    return;
+  }
+  errDiv.textContent = 'Guardando...';
+  errDiv.style.display = 'block';
+  errDiv.style.color = '#94a3b8';
+  fetch('/ventas/manual', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }).then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        cerrarIngresarVenta();
+        alert('Venta ingresada: ' + data.id);
+        refreshData();
+      } else {
+        errDiv.style.color = '#f87171';
+        errDiv.textContent = 'Error: ' + (data.detail || 'desconocido');
+      }
+    })
+    .catch(function(e) {
+      errDiv.style.color = '#f87171';
+      errDiv.textContent = 'Error de conexion: ' + e.message;
+    });
+}
+
+function guardarYAutorizarManual() {
+  var payload = buildVentaManualPayload(true);
+  var errDiv = document.getElementById('vmError');
+  if (!payload) {
+    errDiv.textContent = 'Nombre, RUT y email son obligatorios';
+    errDiv.style.display = 'block';
+    return;
+  }
+  errDiv.textContent = 'Guardando y autorizando en Odoo...';
+  errDiv.style.display = 'block';
+  errDiv.style.color = '#94a3b8';
+  fetch('/ventas/manual', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }).then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        cerrarIngresarVenta();
+        if (data.autorizado) {
+          alert('Venta autorizada en Odoo: move_id=' + data.move_id);
+        } else {
+          alert('Venta ingresada: ' + data.id);
+        }
+        refreshData();
+      } else {
+        errDiv.style.color = '#f87171';
+        errDiv.textContent = 'Error: ' + (data.detail || 'desconocido');
+      }
+    })
+    .catch(function(e) {
+      errDiv.style.color = '#f87171';
+      errDiv.textContent = 'Error de conexion: ' + e.message;
+    });
+}
+
 function abrirCrearCliente() {
   document.getElementById('cliNombre').value = '';
   document.getElementById('cliRut').value = '';
@@ -2793,6 +3085,9 @@ document.getElementById('calModal').addEventListener('click', function(e) {
 });
 document.getElementById('clienteModal').addEventListener('click', function(e) {
   if (e.target.id === 'clienteModal') cerrarCrearCliente();
+});
+document.getElementById('ventaManualModal').addEventListener('click', function(e) {
+  if (e.target.id === 'ventaManualModal') cerrarIngresarVenta();
 });
 
 refreshData();
