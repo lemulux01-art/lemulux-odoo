@@ -254,8 +254,8 @@ def save_venta(
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
-    # Excluir order_json y billing_json del listado — son grandes y solo se necesitan al autorizar
-    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, pack_id, move_id, partner_id, error, creado_en, enviado_en"
+    # Incluir order_json para calcular productos y totales
+    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json"
     with get_db() as conn:
         with conn.cursor() as cur:
             if estado:
@@ -1371,15 +1371,21 @@ def manual_refresh():
 @app.get("/ventas")
 def ventas(estado: Optional[str] = None):
     items = list_ventas(estado)
-    # order_json no viene en list_ventas para ahorrar ancho de banda
-    # Los productos/totales se muestran como placeholders hasta que se edite/reprocese
     enriched = []
     for v in items:
+        try:
+            order = json.loads(v.get("order_json") or "{}")
+            productos, cantidad_items, total_bruto = summarize_order_items(order)
+        except Exception:
+            productos, cantidad_items, total_bruto = [], 0, 0.0
+        # No enviar order_json al cliente — solo los datos calculados
+        v.pop("order_json", None)
+        v.pop("billing_json", None)
         enriched.append({
             **v,
-            "productos": [],
-            "cantidad_items": "—",
-            "total_bruto": 0,
+            "productos": productos,
+            "cantidad_items": cantidad_items,
+            "total_bruto": total_bruto,
         })
     return {"items": enriched}
 
@@ -1818,7 +1824,8 @@ function rowHtml(v) {
       (v.ciudad ? '<div class="small">' + safe(v.ciudad) + '</div>' : '') +
       (v.region ? '<div class="small">' + safe(v.region) + '</div>' : '') + '</td>' +
     '<td><strong>' + money(v.total_bruto) + '</strong>' +
-      '<div class="small">' + safe(v.cantidad_items) + ' items</div></td>' +
+      '<div class="small">' + safe(v.cantidad_items) + ' items</div>' +
+      (v.productos && v.productos.length ? '<ul class="compact">' + v.productos.slice(0,3).map(function(p){ return '<li>' + safe(p) + '</li>'; }).join('') + '</ul>' : '') + '</td>' +
     '<td>' + safe(v.tipo_sugerido) + '</td>' +
     '<td>' + badge(v.estado) +
       (v.error ? '<div class="small" style="color:#f87171;margin-top:4px">' + safe(v.error).substring(0,80) + '</div>' : '') + '</td>' +
