@@ -1748,144 +1748,149 @@ UI_HTML = """<!doctype html>
 </html>
 """
 
+
 UI_JS = '''
-let ventas = [];
-let currentId = null;
+
+var ventas = [];
+var currentId = null;
 
 function badge(estado) {
-  const map = { pendiente: 'badge-pendiente', enviado: 'badge-enviado', error: 'badge-error' };
-  return '<span class="badge ' + (map[estado] || 'badge-default') + '">' + safe(estado) + '</span>';
+  var map = {pendiente:'badge-pendiente', enviado:'badge-enviado', error:'badge-error', rechazado:'badge-default'};
+  return '<span class="badge ' + (map[estado] || 'badge-default') + '">' + esc(estado) + '</span>';
 }
 
 function safe(v) {
-  if (v == null || v === '') return '—';
-  return String(v)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-function escAttr(v) {
-  if (v == null) return '';
-  return String(v)
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  if (v == null || v === '') return '-';
+  return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function esc(v) {
+  if (v == null) return '';
+  return String(v).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 
 function money(v) {
-  const n = Number(v || 0);
-  return new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', maximumFractionDigits: 0 }).format(n);
+  var n = Number(v || 0);
+  return new Intl.NumberFormat('es-CL', {style:'currency', currency:'CLP', maximumFractionDigits:0}).format(n);
 }
-
-function copyId(id) { navigator.clipboard.writeText(String(id)); }
 
 function updateStats(items) {
   document.getElementById('cTotal').textContent = items.length;
-  document.getElementById('cPend').textContent = items.filter(v => v.estado === 'pendiente').length;
-  document.getElementById('cEnv').textContent = items.filter(v => v.estado === 'enviado').length;
-  document.getElementById('cErr').textContent = items.filter(v => v.estado === 'error').length;
+  document.getElementById('cPend').textContent = items.filter(function(v){ return v.estado === 'pendiente'; }).length;
+  document.getElementById('cEnv').textContent = items.filter(function(v){ return v.estado === 'enviado'; }).length;
+  document.getElementById('cErr').textContent = items.filter(function(v){ return v.estado === 'error'; }).length;
 }
 
 function filteredVentas() {
-  const q = document.getElementById('searchInput').value.trim().toLowerCase();
-  const s = document.getElementById('statusFilter').value;
-  return ventas.filter(v => {
-    const okS = !s || v.estado === s;
-    const okQ = !q || [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro, ...(v.productos || [])].filter(Boolean).join(' ').toLowerCase().includes(q);
+  var q = document.getElementById('searchInput').value.trim().toLowerCase();
+  var s = document.getElementById('statusFilter').value;
+  return ventas.filter(function(v) {
+    var okS = !s || v.estado === s;
+    var campos = [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase();
+    var okQ = !q || campos.indexOf(q) >= 0;
     return okS && okQ;
   });
 }
 
 function rowHtml(v) {
-  const id = String(v.id || '');
-  const fecha = v.creado_en ? new Date(v.creado_en + 'Z').toLocaleString('es-CL', {timeZone: 'America/Santiago'}) : '—';
-  const packId = v.pack_id ? String(v.pack_id) : '';
+  var id = String(v.id || '');
+  var fecha = v.creado_en ? new Date(v.creado_en + 'Z').toLocaleString('es-CL', {timeZone:'America/Santiago'}) : '-';
 
-  let acciones = '';
-  acciones += '<button class="secondary" data-action="edit" data-id="' + escAttr(id) + '">Editar</button> ';
-  acciones += '<button class="warn" data-action="reprocesar" data-id="' + escAttr(id) + '">Reprocesar</button> ';
-  if (packId) {
-    acciones += '<button class="pack-btn" data-action="verpack" data-id="' + escAttr(id) + '" data-pack="' + escAttr(packId) + '">📦 Ver pack</button> ';
+  var acciones = '';
+  acciones += '<button class="secondary" data-action="edit" data-id="' + esc(id) + '">Editar</button> ';
+  acciones += '<button class="warn" data-action="reprocesar" data-id="' + esc(id) + '">Reprocesar</button> ';
+  if (v.pack_id) {
+    acciones += '<button class="pack-btn" data-action="verpack" data-id="' + esc(id) + '" data-pack="' + esc(v.pack_id) + '">Pack</button> ';
   }
   if (v.estado !== 'enviado') {
-    acciones += '<button class="success" data-action="autorizar" data-id="' + escAttr(id) + '">Autorizar</button>';
+    acciones += '<button class="success" data-action="autorizar" data-id="' + esc(id) + '">Autorizar</button>';
   }
 
-  let productos = '';
-  if ((v.productos || []).length) {
-    productos = '<ul class="compact">' + v.productos.slice(0,3).map(function(p){ return '<li>' + safe(p) + '</li>'; }).join('') + '</ul>';
-  }
-
-  return '<tr id="row-' + escAttr(id) + '">' +
-    '<td><input type="checkbox" class="cb-row" data-id="' + escAttr(id) + '" onchange="onCheckboxChange()"></td>' +
-    '<td>' + safe(fecha) + '<div class="small">' + safe(id) + '</div><div class="small"><a href="#" class="link" data-action="copy" data-id="' + escAttr(id) + '">Copiar ID</a></div></td>' +
-    '<td><strong>' + safe(v.cliente) + '</strong><div class="small">' + safe(v.email) + '</div>' + (v.giro ? '<div class="small">' + safe(v.giro) + '</div>' : '') + '</td>' +
+  return '<tr id="row-' + esc(id) + '">' +
+    '<td><input type="checkbox" class="cb-row" data-id="' + esc(id) + '" onchange="onCheckboxChange()"></td>' +
+    '<td>' + safe(fecha) + '<div class="small">' + safe(id) + '</div>' +
+      '<div class="small"><a href="#" class="link" data-action="copy" data-id="' + esc(id) + '">Copiar ID</a></div></td>' +
+    '<td><strong>' + safe(v.cliente) + '</strong>' +
+      '<div class="small">' + safe(v.email) + '</div>' +
+      (v.giro && v.giro !== '(boleta)' ? '<div class="small">' + safe(v.giro) + '</div>' : '') + '</td>' +
     '<td>' + safe(v.rut) + '</td>' +
-    '<td>' + safe(v.direccion) + (v.ciudad ? '<div class="small">📍 ' + safe(v.ciudad) + '</div>' : '') + (v.region ? '<div class="small">' + safe(v.region) + '</div>' : '') + '</td>' +
-    '<td><strong>' + money(v.total_bruto) + '</strong><div class="small">' + safe(v.cantidad_items) + ' ítems</div>' + productos + '</td>' +
+    '<td>' + safe(v.direccion) +
+      (v.ciudad ? '<div class="small">' + safe(v.ciudad) + '</div>' : '') +
+      (v.region ? '<div class="small">' + safe(v.region) + '</div>' : '') + '</td>' +
+    '<td><strong>' + money(v.total_bruto) + '</strong>' +
+      '<div class="small">' + safe(v.cantidad_items) + ' items</div></td>' +
     '<td>' + safe(v.tipo_sugerido) + '</td>' +
-    '<td>' + badge(v.estado) + (v.error ? '<div class="small" style="color:#f87171;margin-top:4px">' + safe(v.error).substring(0,80) + '</div>' : '') + '</td>' +
-    '<td><span style="font-size:13px">' + safe(v.estado_envio || '✅ Pagado') + '</span></td>' +
+    '<td>' + badge(v.estado) +
+      (v.error ? '<div class="small" style="color:#f87171;margin-top:4px">' + safe(v.error).substring(0,80) + '</div>' : '') + '</td>' +
+    '<td><span>' + safe(v.estado_envio || 'paid') + '</span></td>' +
     '<td><div class="row-actions">' + acciones + '</div></td>' +
     '</tr>';
 }
 
 function renderTable() {
-  const items = filteredVentas();
+  var items = filteredVentas();
   updateStats(ventas);
-  const wrap = document.getElementById('tableWrap');
+  var wrap = document.getElementById('tableWrap');
   if (!items.length) {
-    wrap.innerHTML = "<div class='empty'>No hay ventas para mostrar.</div>";
+    wrap.innerHTML = '<div class="empty">No hay ventas para mostrar.</div>';
     return;
   }
 
-  let html = '<table><thead><tr>';
+  var html = '<table><thead><tr>';
   html += '<th style="width:32px"><input type="checkbox" class="cb-row" id="cbTodos" onchange="toggleTodos(this)"></th>';
-  html += '<th>Fecha / ID ML</th><th>Cliente / Razón social</th><th>RUT</th>';
-  html += '<th>Dirección / Ciudad / Región</th><th>Total / Ítems</th>';
-  html += '<th>Tipo</th><th>Estado doc.</th><th>Estado envío ML</th><th>Acciones</th>';
+  html += '<th>Fecha / ID ML</th>';
+  html += '<th>Cliente</th>';
+  html += '<th>RUT</th>';
+  html += '<th>Direccion / Ciudad / Region</th>';
+  html += '<th>Total / Items</th>';
+  html += '<th>Tipo</th>';
+  html += '<th>Estado doc.</th>';
+  html += '<th>Estado envio ML</th>';
+  html += '<th>Acciones</th>';
   html += '</tr></thead><tbody>';
-  items.forEach(function(v) { html += rowHtml(v); });
+
+  for (var i = 0; i < items.length; i++) {
+    html += rowHtml(items[i]);
+  }
   html += '</tbody></table>';
   wrap.innerHTML = html;
 
-  // Delegación de eventos — evita problemas con onclick e IDs especiales
   wrap.querySelectorAll('[data-action]').forEach(function(el) {
     el.addEventListener('click', function(e) {
       e.preventDefault();
-      const action = el.dataset.action;
-      const id = el.dataset.id;
+      var action = el.dataset.action;
+      var id = el.dataset.id;
       if (action === 'edit') openEdit(id);
       else if (action === 'reprocesar') reprocesar(id);
       else if (action === 'autorizar') autorizar(id);
       else if (action === 'verpack') verPack(id, el.dataset.pack);
-      else if (action === 'copy') { navigator.clipboard.writeText(id); }
+      else if (action === 'copy') { try { navigator.clipboard.writeText(id); } catch(e) {} }
     });
   });
 }
 
-async function refreshData() {
-  document.getElementById('tableWrap').innerHTML = "<div class='empty'>Cargando...</div>";
-  try {
-    const res = await fetch('/ventas');
-    const data = await res.json();
-    ventas = Array.isArray(data.items) ? data.items : [];
-    renderTable();
-  } catch (e) {
-    document.getElementById('tableWrap').innerHTML = "<div class='empty'>Error cargando datos. Revisa /health</div>";
-  }
+function refreshData() {
+  document.getElementById('tableWrap').innerHTML = '<div class="empty">Cargando...</div>';
+  fetch('/ventas')
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      ventas = Array.isArray(data.items) ? data.items : [];
+      renderTable();
+    })
+    .catch(function() {
+      document.getElementById('tableWrap').innerHTML = '<div class="empty">Error cargando datos.</div>';
+    });
 }
 
-async function autorizar(id) {
-  if (!confirm('¿Autorizar la venta ' + id + ' y enviarla a Odoo?')) return;
-  const res = await fetch('/ventas/' + id + '/autorizar', { method: 'POST' });
-  const data = await res.json().catch(() => ({}));
-  if (res.ok) alert('✅ Documento creado en Odoo: move_id=' + data.move_id);
-  else alert('❌ Error: ' + (data.detail || 'desconocido'));
-  await refreshData();
+function autorizar(id) {
+  if (!confirm('Autorizar la venta ' + id + ' y enviarla a Odoo?')) return;
+  fetch('/ventas/' + id + '/autorizar', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) alert('Documento creado en Odoo: move_id=' + data.move_id);
+      else alert('Error: ' + (data.detail || 'desconocido'));
+      refreshData();
+    });
 }
 
 function toggleGiro() {
@@ -1893,11 +1898,14 @@ function toggleGiro() {
     document.getElementById('editTipo').value === 'Factura' ? 'block' : 'none';
 }
 
-async function openEdit(id) {
-  const v = ventas.find(x => String(x.id) === String(id));
+function openEdit(id) {
+  var v = null;
+  for (var i = 0; i < ventas.length; i++) {
+    if (String(ventas[i].id) === String(id)) { v = ventas[i]; break; }
+  }
   if (!v) return;
   currentId = String(id);
-  document.getElementById('modalSub').textContent = 'Venta ' + String(v.id);
+  document.getElementById('modalSub').textContent = 'Venta ' + v.id;
   document.getElementById('editId').value = v.id || '';
   document.getElementById('editTipo').value = v.tipo_sugerido || 'Boleta';
   document.getElementById('editEmail').value = v.email || '';
@@ -1913,16 +1921,16 @@ async function openEdit(id) {
   toggleGiro();
   document.getElementById('editModal').classList.add('open');
 
-  // Cargar detalle completo (con productos y total) en background
-  try {
-    const res = await fetch('/ventas/' + id);
-    const det = await res.json();
-    document.getElementById('editTotal').value = money(det.total_bruto);
-    document.getElementById('editItemsCount').value = det.cantidad_items || 0;
-    document.getElementById('editProducts').value = (det.productos || []).join(String.fromCharCode(10));
-  } catch(e) {
-    document.getElementById('editProducts').value = 'Error cargando productos';
-  }
+  fetch('/ventas/' + id)
+    .then(function(r){ return r.json(); })
+    .then(function(det) {
+      document.getElementById('editTotal').value = money(det.total_bruto);
+      document.getElementById('editItemsCount').value = det.cantidad_items || 0;
+      document.getElementById('editProducts').value = (det.productos || []).join('\n');
+    })
+    .catch(function() {
+      document.getElementById('editProducts').value = 'Error cargando productos';
+    });
 }
 
 function closeModal() {
@@ -1930,10 +1938,10 @@ function closeModal() {
   document.getElementById('editModal').classList.remove('open');
 }
 
-async function saveEdit() {
-  if (!currentId) return false;
-  const tipo = document.getElementById('editTipo').value;
-  const payload = {
+function saveEdit() {
+  if (!currentId) return Promise.resolve(false);
+  var tipo = document.getElementById('editTipo').value;
+  var payload = {
     tipo_sugerido: tipo,
     email: document.getElementById('editEmail').value,
     cliente: document.getElementById('editCliente').value,
@@ -1941,43 +1949,51 @@ async function saveEdit() {
     direccion: document.getElementById('editDireccion').value,
     ciudad: document.getElementById('editCiudad').value,
     region: document.getElementById('editRegion').value,
-    giro: tipo === 'Factura' ? document.getElementById('editGiro').value : '',
+    giro: tipo === 'Factura' ? document.getElementById('editGiro').value : ''
   };
-
-  const res = await fetch('/ventas/' + currentId, {
+  return fetch('/ventas/' + currentId, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }).then(function(r) {
+    if (!r.ok) { alert('No se pudo guardar'); return false; }
+    closeModal();
+    refreshData();
+    return true;
   });
-
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    alert(data.detail || 'No se pudo guardar');
-    return false;
-  }
-
-  await refreshData();
-  closeModal();
-  return true;
 }
 
-// ========================
-// CHECKBOX Y AGRUPACIÓN
-// ========================
+function saveAndAuthorize() {
+  if (!currentId) return;
+  var id = currentId;
+  saveEdit().then(function(ok) {
+    if (ok) autorizar(id);
+  });
+}
 
-function getSeleccionadas() {
-  return Array.from(document.querySelectorAll('.cb-row[data-id]:checked')).map(cb => cb.dataset.id);
+function reprocesar(id) {
+  fetch('/ventas/' + id + '/reprocesar', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (!data.ok) { alert(data.detail || 'No se pudo reprocesar'); return; }
+      alert('Venta reprocesada desde Mercado Libre');
+      refreshData();
+    });
+}
+
+function reprocesarActual() {
+  if (!currentId) return;
+  reprocesar(currentId);
 }
 
 function onCheckboxChange() {
-  const seleccionadas = getSeleccionadas();
-  const btn = document.getElementById('btnAgrupar');
-  const info = document.getElementById('seleccionInfo');
-  const count = document.getElementById('seleccionCount');
+  var seleccionadas = getSeleccionadas();
+  var btn = document.getElementById('btnAgrupar');
+  var info = document.getElementById('selInfo');
+  var count = document.getElementById('selCount');
 
-  // Resaltar filas seleccionadas
-  document.querySelectorAll('.cb-row[data-id]').forEach(cb => {
-    const row = document.getElementById('row-' + cb.dataset.id);
+  document.querySelectorAll('.cb-row[data-id]').forEach(function(cb) {
+    var row = document.getElementById('row-' + cb.dataset.id);
     if (row) row.classList.toggle('seleccionada', cb.checked);
   });
 
@@ -1988,156 +2004,120 @@ function onCheckboxChange() {
   } else {
     btn.style.display = 'none';
     info.style.display = seleccionadas.length === 1 ? 'block' : 'none';
-    count.textContent = seleccionadas.length === 1 ? '1 venta seleccionada — selecciona al menos 1 más para agrupar' : '';
+    count.textContent = seleccionadas.length === 1 ? '1 venta seleccionada - selecciona al menos 1 mas para agrupar' : '';
   }
 }
 
 function toggleTodos(cb) {
-  document.querySelectorAll('.cb-row[data-id]').forEach(c => c.checked = cb.checked);
+  document.querySelectorAll('.cb-row[data-id]').forEach(function(c) { c.checked = cb.checked; });
   onCheckboxChange();
 }
 
-async function agruparSeleccionadas() {
-  const ids = getSeleccionadas();
+function getSeleccionadas() {
+  return Array.from(document.querySelectorAll('.cb-row[data-id]:checked')).map(function(cb){ return cb.dataset.id; });
+}
+
+function agruparSeleccionadas() {
+  var ids = getSeleccionadas();
   if (ids.length < 2) { alert('Selecciona al menos 2 ventas para agrupar'); return; }
 
-  // Mostrar resumen antes de confirmar
-  const ventasSelec = ids.map(id => ventas.find(v => String(v.id) === id)).filter(Boolean);
-  const resumen = ventasSelec.map(function(v){ return '• ' + safe(v.cliente) + ' — ' + safe(v.id); }).join(String.fromCharCode(10));
-  const nl = String.fromCharCode(10);
-  const msg = '¿Agrupar estas ' + ids.length + ' ventas en una sola boleta/factura?' + nl + nl + 'La primera sera la principal y las demas quedaran como rechazadas:' + nl + nl + resumen + nl + nl + 'Esta accion no se puede deshacer.';
-  if (!confirm(msg)) return;
+  var resumen = ids.map(function(id) {
+    var v = null;
+    for (var i = 0; i < ventas.length; i++) { if (String(ventas[i].id) === id) { v = ventas[i]; break; } }
+    return v ? ('* ' + (v.cliente || id) + ' - ' + id) : id;
+  }).join('\n');
 
-  const res = await fetch('/ventas/agrupar', {
+  if (!confirm('Agrupar ' + ids.length + ' ventas en una sola boleta/factura?\n\nLa primera sera la principal:\n\n' + resumen + '\n\nEsta accion no se puede deshacer.')) return;
+
+  fetch('/ventas/agrupar', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids }),
-  });
-  const data = await res.json().catch(() => ({}));
-
-  if (res.ok) {
-    alert('Ventas agrupadas en ' + data.venta_principal + '. Items: ' + data.total_items + '. Total: ' + money(data.total_bruto));
-    document.getElementById('btnAgrupar').style.display = 'none';
-    document.getElementById('seleccionInfo').style.display = 'none';
-    await refreshData();
-  } else {
-    alert('❌ Error: ' + (data.detail || 'desconocido'));
-  }
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ids: ids})
+  }).then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        alert('Ventas agrupadas en ' + data.venta_principal + '. Items: ' + data.total_items + '. Total: ' + money(data.total_bruto));
+        document.getElementById('btnAgrupar').style.display = 'none';
+        document.getElementById('selInfo').style.display = 'none';
+        refreshData();
+      } else {
+        alert('Error: ' + (data.detail || 'desconocido'));
+      }
+    });
 }
 
-async function reprocesarTodo() {
-  const pendientes = ventas.filter(v => v.estado === 'pendiente' || v.estado === 'error');
+function reprocesarTodo() {
+  var pendientes = ventas.filter(function(v){ return v.estado === 'pendiente' || v.estado === 'error'; });
   if (!pendientes.length) { alert('No hay ventas pendientes para reprocesar'); return; }
-  if (!confirm('¿Reprocesar las ' + pendientes.length + ' ventas pendientes/con error desde ML?\nEsto actualizará los datos de cada venta con la información actual de Mercado Libre.')) return;
+  if (!confirm('Reprocesar las ' + pendientes.length + ' ventas pendientes/con error desde ML?')) return;
 
-  const btn = event.target;
-  btn.disabled = true;
-  btn.textContent = '↺ Reprocesando...';
+  var btn = document.querySelector('[onclick="reprocesarTodo()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Reprocesando...'; }
 
-  const res = await fetch('/ventas/reprocesar-todo', { method: 'POST' });
-  const data = await res.json().catch(() => ({}));
-
-  btn.disabled = false;
-  btn.textContent = '↺ Reprocesar todo';
-
-  if (res.ok) {
-    alert('✅ Reprocesadas: ' + data.ok + ' | ❌ Errores: ' + data.error);
-    await refreshData();
-  } else {
-    alert('❌ Error: ' + (data.detail || 'desconocido'));
-  }
+  fetch('/ventas/reprocesar-todo', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Reprocesar todo'; }
+      alert('Reprocesadas: ' + data.ok + ' | Errores: ' + data.error);
+      refreshData();
+    });
 }
 
-async function reprocesar(id) {
-  const res = await fetch('/ventas/' + id + '/reprocesar', { method: 'POST' });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    alert(data.detail || 'No se pudo reprocesar');
-    return;
-  }
-  alert('✅ Venta reprocesada desde Mercado Libre');
-  await refreshData();
-  if (currentId && String(currentId) === String(id)) openEdit(id);
-}
-
-async function reprocesarActual() {
-  if (!currentId) return;
-  await reprocesar(currentId);
-}
-
-async function saveAndAuthorize() {
-  if (!currentId) return;
-  const id = currentId;
-  const ok = await saveEdit();
-  if (!ok) return;
-  await autorizar(id);
-}
-
-document.getElementById('editModal').addEventListener('click', e => {
-  if (e.target.id === 'editModal') closeModal();
-});
-
-// ========================
-// MODAL PACK
-// ========================
-
-async function verPack(id, packId) {
+function verPack(id, packId) {
   document.getElementById('packModalTitle').textContent = packId ? ('Pack ' + packId) : ('Orden ' + id);
-  document.getElementById('packModalBody').innerHTML = "<p style='color:var(--muted)'>Cargando órdenes del pack...</p>";
+  document.getElementById('packModalBody').innerHTML = '<p style="color:#94a3b8">Cargando ordenes del pack...</p>';
   document.getElementById('packModal').classList.add('open');
 
-  try {
-    const res = await fetch('/ventas/' + id + '/pack');
-    const data = await res.json();
-    if (!res.ok) {
-      document.getElementById('packModalBody').innerHTML = '<p style="color:#f87171">Error: ' + (data.detail || 'desconocido') + '</p>';
-      return;
-    }
-
-    const ordenes = data.ordenes || [];
-    const totalPack = data.total_pack || 0;
-
-    let html = '';
-    if (data.pack_id) {
-      html += '<div style="margin-bottom:12px;color:var(--muted);font-size:13px">Pack ID: <strong style="color:var(--text)">' + data.pack_id + '</strong> · ' + ordenes.length + ' orden(es) consolidada(s) · Total: <strong style="color:var(--ok)">' + money(totalPack) + '</strong></div>';
-    }
-
-    for (const orden of ordenes) {
-          html += '<div style="background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px;">' +
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">' +
-        '<strong style="font-size:13px">Order ID: ' + orden.id + '</strong>' +
-        '<span style="font-size:12px;color:var(--muted)">' + (orden.status || '') + ' · ' + orden.item_count + ' ítem(s) · <strong style="color:var(--ok)">' + money(orden.total) + '</strong></span>' +
-        '</div><ul style="margin:0;padding-left:18px;">' +
-        (orden.items || []).map(function(item){ return '<li style="font-size:13px;color:var(--muted);margin-bottom:3px;">' + item + '</li>'; }).join('') +
-        '</ul></div>';
-    }
-
-    if (!ordenes.length) {
-      html = "<p style='color:var(--muted)'>No se encontraron órdenes en este pack.</p>";
-    }
-
-    document.getElementById('packModalBody').innerHTML = html;
-  } catch(e) {
-    document.getElementById('packModalBody').innerHTML = '<p style="color:#f87171">Error de conexión: ' + e.message + '</p>';
-  }
+  fetch('/ventas/' + id + '/pack')
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      var ordenes = data.ordenes || [];
+      var html = '';
+      if (data.pack_id) {
+        html += '<div style="margin-bottom:12px;font-size:13px">Pack ID: <strong>' + safe(data.pack_id) + '</strong> - ' + ordenes.length + ' orden(es) - Total: <strong>' + money(data.total_pack) + '</strong></div>';
+      }
+      for (var i = 0; i < ordenes.length; i++) {
+        var o = ordenes[i];
+        html += '<div style="background:#1f2937;border:1px solid #334155;border-radius:10px;padding:14px;margin-bottom:10px;">';
+        html += '<div style="display:flex;justify-content:space-between;margin-bottom:8px;">';
+        html += '<strong>Order ID: ' + safe(o.id) + '</strong>';
+        html += '<span style="color:#94a3b8">' + safe(o.status) + ' - ' + o.item_count + ' item(s) - <strong>' + money(o.total) + '</strong></span>';
+        html += '</div><ul style="margin:0;padding-left:18px;">';
+        (o.items || []).forEach(function(item) {
+          html += '<li style="font-size:13px;color:#94a3b8;margin-bottom:3px;">' + safe(item) + '</li>';
+        });
+        html += '</ul></div>';
+      }
+      if (!ordenes.length) html = '<p style="color:#94a3b8">No se encontraron ordenes.</p>';
+      document.getElementById('packModalBody').innerHTML = html;
+    })
+    .catch(function(e) {
+      document.getElementById('packModalBody').innerHTML = '<p style="color:#f87171">Error: ' + e.message + '</p>';
+    });
 }
 
 function closePackModal() {
   document.getElementById('packModal').classList.remove('open');
 }
 
-document.getElementById('packModal').addEventListener('click', e => {
+document.getElementById('editModal').addEventListener('click', function(e) {
+  if (e.target.id === 'editModal') closeModal();
+});
+
+document.getElementById('packModal').addEventListener('click', function(e) {
   if (e.target.id === 'packModal') closePackModal();
 });
 
 refreshData();
-setInterval(() => {
-  // No recargar si el modal de edición está abierto
-  if (!document.getElementById('editModal').classList.contains('open')) {
+setInterval(function() {
+  if (!document.getElementById('editModal').classList.contains('open') &&
+      !document.getElementById('packModal').classList.contains('open')) {
     refreshData();
   }
 }, 60000);
+
 '''
+
 
 
 @app.get("/ui/app.js")
