@@ -1246,45 +1246,44 @@ def process_webhook_order(order_id: str):
 def reprocesar_venta_desde_ml(order_id: str):
     venta = get_venta(order_id)
 
-    # Si la venta tiene pack_id, el order_id real puede ser distinto
-    # Intentar obtener la orden — si falla porque es un pack_id, buscar via pack
     order = get_ml_order(order_id)
+    first_real_order_id = order_id  # ID de orden real para billing
 
     if not order:
-        # Puede ser un pack_id — intentar obtener via /packs
+        # Es un pack_id — buscar ordenes reales
         pack_data = get_ml_pack(order_id)
         pack_order_ids = [str(o["id"]) for o in (pack_data.get("orders") or [])]
         if not pack_order_ids:
             raise Exception("Orden/pack no encontrado en ML: " + order_id)
-        # Usar la primera orden real del pack para obtener datos de billing
-        order = get_ml_order(pack_order_ids[0])
+        first_real_order_id = pack_order_ids[0]
+        order = get_ml_order(first_real_order_id)
         if not order:
             raise Exception("No se pudo obtener ninguna orden del pack " + order_id)
-        # Consolidar items de todas las ordenes del pack
         all_orders = []
         for oid_pack in pack_order_ids:
-            o = get_ml_order(oid_pack) if oid_pack != pack_order_ids[0] else order
+            o = get_ml_order(oid_pack) if oid_pack != first_real_order_id else order
             if o:
                 all_orders.append(o)
         all_items = merge_order_items(all_orders)
         order = {**order, "order_items": all_items, "id": int(order_id)}
     elif venta and venta.get("pack_id") and str(venta["pack_id"]) != str(order_id):
-        # La venta es un pack consolidado — traer todos los items
         pack_id = str(venta["pack_id"])
         pack_data = get_ml_pack(pack_id)
         pack_order_ids = [str(o["id"]) for o in (pack_data.get("orders") or [])]
+        first_real_order_id = str(order.get("id", order_id))
         all_orders = [order]
         for oid_pack in pack_order_ids:
-            if oid_pack != str(order.get("id")):
+            if oid_pack != first_real_order_id:
                 o = get_ml_order(oid_pack)
                 if o:
                     all_orders.append(o)
         all_items = merge_order_items(all_orders)
         order = {**order, "order_items": all_items}
+    else:
+        first_real_order_id = str(order.get("id", order_id))
 
-    # Usar order_id original de la primera orden para billing
-    billing_order_id = str(order.get("id", order_id))
-    billing_raw = get_ml_billing_raw(billing_order_id)
+    # Billing siempre con ID de orden real (no pack_id)
+    billing_raw = get_ml_billing_raw(first_real_order_id)
     billing_info = get_billing_info(billing_raw)
 
     rut = extract_rut(billing_info)
@@ -1661,6 +1660,7 @@ def reprocesar_venta(oid: str):
         data = reprocesar_venta_desde_ml(str(oid))
         return {"ok": True, "id": oid, "data": data}
     except Exception as e:
+        logger.error(f"[{oid}] Error reprocesando: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
