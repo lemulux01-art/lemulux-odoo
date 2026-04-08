@@ -2095,6 +2095,32 @@ function refreshData() {
     });
 }
 
+function refreshSilente() {
+  fetch('/ventas')
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      var nuevas = Array.isArray(data.items) ? data.items : [];
+      var cambio = nuevas.length !== ventas.length;
+      if (!cambio) {
+        for (var i = 0; i < nuevas.length; i++) {
+          var nv = nuevas[i];
+          var ov = null;
+          for (var j = 0; j < ventas.length; j++) {
+            if (String(ventas[j].id) === String(nv.id)) { ov = ventas[j]; break; }
+          }
+          if (!ov || ov.estado !== nv.estado || ov.estado_envio !== nv.estado_envio || ov.move_id !== nv.move_id) {
+            cambio = true; break;
+          }
+        }
+      }
+      if (cambio) {
+        ventas = nuevas;
+        renderTable();
+      }
+    })
+    .catch(function() {});
+}
+
 function autorizar(id) {
   if (!confirm('Autorizar la venta ' + id + ' y enviarla a Odoo?')) return;
   fetch('/ventas/' + id + '/autorizar', {method:'POST'})
@@ -2467,8 +2493,8 @@ setInterval(function() {
   var anyOpen = ['editModal','packModal','calModal','clienteModal'].some(function(id) {
     return document.getElementById(id).classList.contains('open');
   });
-  if (!anyOpen) refreshData();
-}, 60000);
+  if (!anyOpen) refreshSilente();
+}, 30000);
 '''
 
 
