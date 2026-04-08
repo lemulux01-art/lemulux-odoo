@@ -1688,6 +1688,15 @@ UI_HTML = """<!doctype html>
       <option value="error">Error</option>
       <option value="rechazado">Rechazado</option>
     </select>
+    <select id="turnoFilter" onchange="renderTable()">
+      <option value="">Todos los turnos</option>
+    </select>
+    <select id="horaCorte" onchange="recalcularTurnos()">
+      <option value="14">Corte 14:00</option>
+      <option value="15">Corte 15:00</option>
+      <option value="13">Corte 13:00</option>
+      <option value="12">Corte 12:00</option>
+    </select>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
@@ -1787,14 +1796,77 @@ function updateStats(items) {
   document.getElementById('cErr').textContent = items.filter(function(v){ return v.estado === 'error'; }).length;
 }
 
+function getHoraCorte() {
+  return parseInt(document.getElementById('horaCorte').value || '14', 10);
+}
+
+function getTurnoKey(fechaStr) {
+  // Calcula a que turno pertenece una venta segun hora de corte
+  // Un turno va desde HH:00 de un dia hasta HH:00 del dia siguiente
+  if (!fechaStr) return '';
+  var d = new Date(fechaStr + 'Z');
+  // Convertir a hora Chile (UTC-3 o UTC-4)
+  var chileOffset = -3 * 60; // minutos, aproximado (sin DST exacto)
+  var localMs = d.getTime() + chileOffset * 60000;
+  var local = new Date(localMs);
+  var hora = local.getUTCHours();
+  var corte = getHoraCorte();
+  // Si la hora es antes del corte, pertenece al turno del dia anterior
+  var turnoDate = new Date(localMs);
+  if (hora < corte) {
+    turnoDate = new Date(localMs - 24 * 60 * 60 * 1000);
+  }
+  var y = turnoDate.getUTCFullYear();
+  var m = String(turnoDate.getUTCMonth() + 1).padStart(2, '0');
+  var dd = String(turnoDate.getUTCDate()).padStart(2, '0');
+  return y + '-' + m + '-' + dd;
+}
+
+function getTurnoLabel(key) {
+  if (!key) return '';
+  // key = 'YYYY-MM-DD', turno va de ese dia HH:00 al siguiente HH:00
+  var corte = getHoraCorte();
+  var partes = key.split('-');
+  var d1 = new Date(Date.UTC(parseInt(partes[0]), parseInt(partes[1])-1, parseInt(partes[2])));
+  var d2 = new Date(d1.getTime() + 24 * 60 * 60 * 1000);
+  function fmt(d) {
+    return String(d.getUTCDate()).padStart(2,'0') + '/' + String(d.getUTCMonth()+1).padStart(2,'0');
+  }
+  return fmt(d1) + ' ' + String(corte).padStart(2,'0') + ':00 - ' + fmt(d2) + ' ' + String(corte).padStart(2,'0') + ':00';
+}
+
+function recalcularTurnos() {
+  var sel = document.getElementById('turnoFilter');
+  var valorActual = sel.value;
+  // Reconstruir opciones de turno
+  var keys = {};
+  ventas.forEach(function(v) {
+    var k = getTurnoKey(v.creado_en);
+    if (k) keys[k] = true;
+  });
+  var sorted = Object.keys(keys).sort().reverse();
+  sel.innerHTML = '<option value="">Todos los turnos</option>';
+  sorted.forEach(function(k) {
+    var opt = document.createElement('option');
+    opt.value = k;
+    opt.textContent = getTurnoLabel(k);
+    sel.appendChild(opt);
+  });
+  // Restaurar seleccion si sigue existiendo
+  if (valorActual && keys[valorActual]) sel.value = valorActual;
+  renderTable();
+}
+
 function filteredVentas() {
   var q = document.getElementById('searchInput').value.trim().toLowerCase();
   var s = document.getElementById('statusFilter').value;
+  var turno = document.getElementById('turnoFilter').value;
   return ventas.filter(function(v) {
     var okS = !s || v.estado === s;
     var campos = [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase();
     var okQ = !q || campos.indexOf(q) >= 0;
-    return okS && okQ;
+    var okT = !turno || getTurnoKey(v.creado_en) === turno;
+    return okS && okQ && okT;
   });
 }
 
@@ -1882,7 +1954,7 @@ function refreshData() {
     .then(function(r){ return r.json(); })
     .then(function(data) {
       ventas = Array.isArray(data.items) ? data.items : [];
-      renderTable();
+      recalcularTurnos();
     })
     .catch(function() {
       document.getElementById('tableWrap').innerHTML = '<div class="empty">Error cargando datos.</div>';
