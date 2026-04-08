@@ -1457,6 +1457,71 @@ def agrupar_ventas(payload: AgruparPayload):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+class ClientePayload(BaseModel):
+    nombre: str
+    rut: str
+    email: str
+    direccion: Optional[str] = ""
+    ciudad: Optional[str] = ""
+    region: Optional[str] = ""
+    giro: Optional[str] = ""
+    es_empresa: bool = False
+
+
+@app.post("/clientes/crear")
+def crear_cliente(payload: ClientePayload):
+    """Crea un partner directamente en Odoo con los datos proporcionados."""
+    try:
+        ctx = odoo_connect()
+        chile_id = get_chile_country_id(ctx)
+        rut_type_id = get_rut_id_type(ctx)
+        activity_field = get_activity_field_name(ctx)
+        rut_norm = normalize_rut(payload.rut)
+        rut_odoo = rut_con_guion(rut_norm) if rut_norm else False
+        taxpayer_type = "1" if payload.es_empresa else "4"
+
+        # Verificar si ya existe
+        existing = find_partner_by_rut(ctx, payload.rut)
+        if existing:
+            raise HTTPException(status_code=409, detail=f"Ya existe un cliente con ese RUT (id={existing})")
+
+        vals = {
+            "name": payload.nombre.strip(),
+            "vat": rut_odoo,
+            "email": payload.email.strip(),
+            "l10n_cl_dte_email": payload.email.strip(),
+            "customer_rank": 1,
+            "company_type": "company" if payload.es_empresa else "person",
+            "is_company": payload.es_empresa,
+            "country_id": chile_id,
+            "l10n_cl_sii_taxpayer_type": taxpayer_type,
+        }
+        if payload.direccion:
+            vals["street"] = payload.direccion.strip()
+        if payload.ciudad:
+            vals["city"] = payload.ciudad.strip()
+        if payload.region and "state_id" in get_partner_fields(ctx):
+            state_id = get_state_id(ctx, payload.region)
+            if state_id:
+                vals["state_id"] = state_id
+        if rut_norm and rut_type_id:
+            vals["l10n_latam_identification_type_id"] = rut_type_id
+        if activity_field and payload.giro:
+            vals[activity_field] = payload.giro.strip()
+        elif payload.es_empresa and payload.giro:
+            vals["x_giro"] = payload.giro.strip()
+
+        partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
+        logger.info(f"Cliente creado manualmente: id={partner_id} nombre={payload.nombre}")
+        return {"ok": True, "partner_id": partner_id, "nombre": payload.nombre}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creando cliente: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/ventas/{oid}")
 def venta_detalle(oid: str):
     venta = get_venta(oid)
@@ -1688,20 +1753,112 @@ UI_HTML = """<!doctype html>
       <option value="error">Error</option>
       <option value="rechazado">Rechazado</option>
     </select>
-    <select id="turnoFilter" onchange="renderTable()">
-      <option value="">Todos los turnos</option>
-    </select>
     <select id="horaCorte" onchange="recalcularTurnos()">
       <option value="14">Corte 14:00</option>
       <option value="15">Corte 15:00</option>
       <option value="13">Corte 13:00</option>
       <option value="12">Corte 12:00</option>
     </select>
+    <button class="secondary" onclick="abrirCalendario()" id="btnCalendario">&#128197; Todos los turnos</button>
+    <button class="success" onclick="abrirCrearCliente()">+ Crear cliente</button>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
   <div id="selInfo" style="display:none;margin-bottom:10px;font-size:13px;color:var(--muted)"><span id="selCount"></span></div>
   <div id="tableWrap"><div class="empty">Cargando...</div></div>
+</div>
+
+<!-- Modal Calendario de turnos -->
+<div class="modal" id="calModal">
+  <div class="modal-card" style="max-width:520px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div class="title" style="font-size:20px">Seleccionar turno</div>
+      <button class="secondary" onclick="cerrarCalendario()">Cerrar</button>
+    </div>
+    <div style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
+      <label style="font-size:13px">Hora de corte:</label>
+      <select id="horaCorte2" onchange="sincronizarCorte(this.value); renderCalendario()">
+        <option value="14">14:00</option>
+        <option value="15">15:00</option>
+        <option value="13">13:00</option>
+        <option value="12">12:00</option>
+      </select>
+    </div>
+    <div id="calGrid" style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;text-align:center;"></div>
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;">
+      <button class="secondary" onclick="seleccionarTurno(''); cerrarCalendario()">Ver todos</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Crear Cliente -->
+<div class="modal" id="clienteModal">
+  <div class="modal-card" style="max-width:560px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div class="title" style="font-size:20px">Crear cliente en Odoo</div>
+      <button class="secondary" onclick="cerrarCrearCliente()">Cerrar</button>
+    </div>
+    <div class="modal-grid">
+      <div class="full">
+        <label>Tipo</label>
+        <select id="cliTipo" onchange="toggleCliGiro()">
+          <option value="persona">Persona natural (Boleta)</option>
+          <option value="empresa">Empresa (Factura)</option>
+        </select>
+      </div>
+      <div class="full">
+        <label>Nombre / Razon social</label>
+        <input id="cliNombre" placeholder="Nombre completo o razon social">
+      </div>
+      <div>
+        <label>RUT</label>
+        <input id="cliRut" placeholder="12345678-9">
+      </div>
+      <div>
+        <label>Email DTE</label>
+        <input id="cliEmail" placeholder="correo@ejemplo.com">
+      </div>
+      <div class="full">
+        <label>Direccion</label>
+        <input id="cliDireccion" placeholder="Calle y numero">
+      </div>
+      <div>
+        <label>Ciudad / Comuna</label>
+        <input id="cliCiudad" placeholder="Las Condes">
+      </div>
+      <div>
+        <label>Region</label>
+        <select id="cliRegion">
+          <option value="">-- Seleccionar --</option>
+          <option value="Metropolitana">Metropolitana (RM)</option>
+          <option value="Valparaiso">Valparaiso</option>
+          <option value="del BioBio">del BioBio</option>
+          <option value="de la Araucania">de la Araucania</option>
+          <option value="Antofagasta">Antofagasta</option>
+          <option value="Coquimbo">Coquimbo</option>
+          <option value="del Libertador Gral. Bernardo O'Higgins">O'Higgins</option>
+          <option value="del Maule">del Maule</option>
+          <option value="de los Lagos">de los Lagos</option>
+          <option value="Tarapaca">Tarapaca</option>
+          <option value="Atacama">Atacama</option>
+          <option value="Arica y Parinacota">Arica y Parinacota</option>
+          <option value="Aysen del Gral. Carlos Ibanez del Campo">Aysen</option>
+          <option value="Magallanes">Magallanes</option>
+          <option value="Los Rios">Los Rios</option>
+          <option value="del Nuble">del Nuble</option>
+        </select>
+      </div>
+      <div class="full" id="cliGiroGroup" style="display:none">
+        <label>Giro / Actividad economica</label>
+        <input id="cliGiro" placeholder="Comercio al por menor">
+      </div>
+    </div>
+    <div id="cliError" style="color:#f87171;font-size:13px;margin-top:12px;display:none"></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="cerrarCrearCliente()">Cancelar</button>
+      <button class="success" onclick="crearClienteOdoo()">Crear en Odoo</button>
+    </div>
+  </div>
 </div>
 <div class="modal" id="editModal">
   <div class="modal-card">
@@ -1765,9 +1922,9 @@ UI_HTML = """<!doctype html>
 
 
 UI_JS = '''
-
 var ventas = [];
 var currentId = null;
+var turnoActivo = '';
 
 function badge(estado) {
   var map = {pendiente:'badge-pendiente', enviado:'badge-enviado', error:'badge-error', rechazado:'badge-default'};
@@ -1789,29 +1946,18 @@ function money(v) {
   return new Intl.NumberFormat('es-CL', {style:'currency', currency:'CLP', maximumFractionDigits:0}).format(n);
 }
 
-function updateStats(items) {
-  document.getElementById('cTotal').textContent = items.length;
-  document.getElementById('cPend').textContent = items.filter(function(v){ return v.estado === 'pendiente'; }).length;
-  document.getElementById('cEnv').textContent = items.filter(function(v){ return v.estado === 'enviado'; }).length;
-  document.getElementById('cErr').textContent = items.filter(function(v){ return v.estado === 'error'; }).length;
-}
-
 function getHoraCorte() {
   return parseInt(document.getElementById('horaCorte').value || '14', 10);
 }
 
 function getTurnoKey(fechaStr) {
-  // Calcula a que turno pertenece una venta segun hora de corte
-  // Un turno va desde HH:00 de un dia hasta HH:00 del dia siguiente
   if (!fechaStr) return '';
   var d = new Date(fechaStr + 'Z');
-  // Convertir a hora Chile (UTC-3 o UTC-4)
-  var chileOffset = -3 * 60; // minutos, aproximado (sin DST exacto)
+  var chileOffset = -3 * 60;
   var localMs = d.getTime() + chileOffset * 60000;
   var local = new Date(localMs);
   var hora = local.getUTCHours();
   var corte = getHoraCorte();
-  // Si la hora es antes del corte, pertenece al turno del dia anterior
   var turnoDate = new Date(localMs);
   if (hora < corte) {
     turnoDate = new Date(localMs - 24 * 60 * 60 * 1000);
@@ -1824,7 +1970,6 @@ function getTurnoKey(fechaStr) {
 
 function getTurnoLabel(key) {
   if (!key) return '';
-  // key = 'YYYY-MM-DD', turno va de ese dia HH:00 al siguiente HH:00
   var corte = getHoraCorte();
   var partes = key.split('-');
   var d1 = new Date(Date.UTC(parseInt(partes[0]), parseInt(partes[1])-1, parseInt(partes[2])));
@@ -1835,37 +1980,35 @@ function getTurnoLabel(key) {
   return fmt(d1) + ' ' + String(corte).padStart(2,'0') + ':00 - ' + fmt(d2) + ' ' + String(corte).padStart(2,'0') + ':00';
 }
 
-function recalcularTurnos() {
-  var sel = document.getElementById('turnoFilter');
-  var valorActual = sel.value;
-  // Reconstruir opciones de turno
-  var keys = {};
-  ventas.forEach(function(v) {
-    var k = getTurnoKey(v.creado_en);
-    if (k) keys[k] = true;
-  });
-  var sorted = Object.keys(keys).sort().reverse();
-  sel.innerHTML = '<option value="">Todos los turnos</option>';
-  sorted.forEach(function(k) {
-    var opt = document.createElement('option');
-    opt.value = k;
-    opt.textContent = getTurnoLabel(k);
-    sel.appendChild(opt);
-  });
-  // Restaurar seleccion si sigue existiendo
-  if (valorActual && keys[valorActual]) sel.value = valorActual;
+function seleccionarTurno(key) {
+  turnoActivo = key;
+  var btn = document.getElementById('btnCalendario');
+  if (!key) {
+    btn.textContent = '[Cal] Todos los turnos';
+    btn.style.background = 'var(--panel2)';
+  } else {
+    btn.textContent = '[Cal] ' + getTurnoLabel(key);
+    btn.style.background = 'var(--blue)';
+  }
+  cerrarCalendario();
   renderTable();
+}
+
+function updateStats(items) {
+  document.getElementById('cTotal').textContent = ventas.length;
+  document.getElementById('cPend').textContent = ventas.filter(function(v){ return v.estado === 'pendiente'; }).length;
+  document.getElementById('cEnv').textContent = ventas.filter(function(v){ return v.estado === 'enviado'; }).length;
+  document.getElementById('cErr').textContent = ventas.filter(function(v){ return v.estado === 'error'; }).length;
 }
 
 function filteredVentas() {
   var q = document.getElementById('searchInput').value.trim().toLowerCase();
   var s = document.getElementById('statusFilter').value;
-  var turno = document.getElementById('turnoFilter').value;
   return ventas.filter(function(v) {
     var okS = !s || v.estado === s;
     var campos = [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase();
     var okQ = !q || campos.indexOf(q) >= 0;
-    var okT = !turno || getTurnoKey(v.creado_en) === turno;
+    var okT = !turnoActivo || getTurnoKey(v.creado_en) === turnoActivo;
     return okS && okQ && okT;
   });
 }
@@ -1908,7 +2051,7 @@ function rowHtml(v) {
 
 function renderTable() {
   var items = filteredVentas();
-  updateStats(ventas);
+  updateStats(items);
   var wrap = document.getElementById('tableWrap');
   if (!items.length) {
     wrap.innerHTML = '<div class="empty">No hay ventas para mostrar.</div>';
@@ -1917,20 +2060,11 @@ function renderTable() {
 
   var html = '<table><thead><tr>';
   html += '<th style="width:32px"><input type="checkbox" class="cb-row" id="cbTodos" onchange="toggleTodos(this)"></th>';
-  html += '<th>Fecha / ID ML</th>';
-  html += '<th>Cliente</th>';
-  html += '<th>RUT</th>';
-  html += '<th>Direccion / Ciudad / Region</th>';
-  html += '<th>Total / Items</th>';
-  html += '<th>Tipo</th>';
-  html += '<th>Estado doc.</th>';
-  html += '<th>Estado envio ML</th>';
-  html += '<th>Acciones</th>';
+  html += '<th>Fecha / ID ML</th><th>Cliente</th><th>RUT</th>';
+  html += '<th>Direccion / Ciudad / Region</th><th>Total / Items</th>';
+  html += '<th>Tipo</th><th>Estado doc.</th><th>Estado envio ML</th><th>Acciones</th>';
   html += '</tr></thead><tbody>';
-
-  for (var i = 0; i < items.length; i++) {
-    html += rowHtml(items[i]);
-  }
+  for (var i = 0; i < items.length; i++) { html += rowHtml(items[i]); }
   html += '</tbody></table>';
   wrap.innerHTML = html;
 
@@ -1943,7 +2077,7 @@ function renderTable() {
       else if (action === 'reprocesar') reprocesar(id);
       else if (action === 'autorizar') autorizar(id);
       else if (action === 'verpack') verPack(id, el.dataset.pack);
-      else if (action === 'copy') { try { navigator.clipboard.writeText(id); } catch(e) {} }
+      else if (action === 'copy') { try { navigator.clipboard.writeText(id); } catch(e2) {} }
     });
   });
 }
@@ -1954,7 +2088,7 @@ function refreshData() {
     .then(function(r){ return r.json(); })
     .then(function(data) {
       ventas = Array.isArray(data.items) ? data.items : [];
-      recalcularTurnos();
+      renderTable();
     })
     .catch(function() {
       document.getElementById('tableWrap').innerHTML = '<div class="empty">Error cargando datos.</div>';
@@ -1999,7 +2133,6 @@ function openEdit(id) {
   document.getElementById('editProducts').value = 'Cargando...';
   toggleGiro();
   document.getElementById('editModal').classList.add('open');
-
   fetch('/ventas/' + id)
     .then(function(r){ return r.json(); })
     .then(function(det) {
@@ -2045,9 +2178,7 @@ function saveEdit() {
 function saveAndAuthorize() {
   if (!currentId) return;
   var id = currentId;
-  saveEdit().then(function(ok) {
-    if (ok) autorizar(id);
-  });
+  saveEdit().then(function(ok) { if (ok) autorizar(id); });
 }
 
 function reprocesar(id) {
@@ -2070,12 +2201,10 @@ function onCheckboxChange() {
   var btn = document.getElementById('btnAgrupar');
   var info = document.getElementById('selInfo');
   var count = document.getElementById('selCount');
-
   document.querySelectorAll('.cb-row[data-id]').forEach(function(cb) {
     var row = document.getElementById('row-' + cb.dataset.id);
     if (row) row.classList.toggle('seleccionada', cb.checked);
   });
-
   if (seleccionadas.length >= 2) {
     btn.style.display = 'inline-block';
     info.style.display = 'block';
@@ -2099,15 +2228,12 @@ function getSeleccionadas() {
 function agruparSeleccionadas() {
   var ids = getSeleccionadas();
   if (ids.length < 2) { alert('Selecciona al menos 2 ventas para agrupar'); return; }
-
   var resumen = ids.map(function(id) {
     var v = null;
     for (var i = 0; i < ventas.length; i++) { if (String(ventas[i].id) === id) { v = ventas[i]; break; } }
     return v ? ('* ' + (v.cliente || id) + ' - ' + id) : id;
   }).join(String.fromCharCode(10));
-
   if (!confirm('Agrupar ' + ids.length + ' ventas en una sola boleta/factura? La primera sera la principal: ' + resumen + ' Esta accion no se puede deshacer.')) return;
-
   fetch('/ventas/agrupar', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -2129,10 +2255,8 @@ function reprocesarTodo() {
   var pendientes = ventas.filter(function(v){ return v.estado === 'pendiente' || v.estado === 'error'; });
   if (!pendientes.length) { alert('No hay ventas pendientes para reprocesar'); return; }
   if (!confirm('Reprocesar las ' + pendientes.length + ' ventas pendientes/con error desde ML?')) return;
-
   var btn = document.querySelector('[onclick="reprocesarTodo()"]');
   if (btn) { btn.disabled = true; btn.textContent = 'Reprocesando...'; }
-
   fetch('/ventas/reprocesar-todo', {method:'POST'})
     .then(function(r){ return r.json(); })
     .then(function(data) {
@@ -2146,7 +2270,6 @@ function verPack(id, packId) {
   document.getElementById('packModalTitle').textContent = packId ? ('Pack ' + packId) : ('Orden ' + id);
   document.getElementById('packModalBody').innerHTML = '<p style="color:#94a3b8">Cargando ordenes del pack...</p>';
   document.getElementById('packModal').classList.add('open');
-
   fetch('/ventas/' + id + '/pack')
     .then(function(r){ return r.json(); })
     .then(function(data) {
@@ -2179,23 +2302,176 @@ function closePackModal() {
   document.getElementById('packModal').classList.remove('open');
 }
 
+// ========================
+// CALENDARIO DE TURNOS
+// ========================
+
+function abrirCalendario() {
+  document.getElementById('horaCorte2').value = document.getElementById('horaCorte').value;
+  renderCalendario();
+  document.getElementById('calModal').classList.add('open');
+}
+
+function cerrarCalendario() {
+  document.getElementById('calModal').classList.remove('open');
+}
+
+function sincronizarCorte(val) {
+  document.getElementById('horaCorte').value = val;
+  renderTable();
+}
+
+function renderCalendario() {
+  var grid = document.getElementById('calGrid');
+  var conteo = {};
+  ventas.forEach(function(v) {
+    var k = getTurnoKey(v.creado_en);
+    if (k) conteo[k] = (conteo[k] || 0) + 1;
+  });
+  var keys = Object.keys(conteo).sort().reverse();
+  if (!keys.length) {
+    grid.innerHTML = '<div style="grid-column:1/-1;color:#94a3b8;padding:20px">No hay turnos disponibles</div>';
+    return;
+  }
+  var dias = ['Dom','Lun','Mar','Mie','Jue','Vie','Sab'];
+  var html = dias.map(function(d) {
+    return '<div style="font-size:11px;color:#94a3b8;padding:4px 0;font-weight:700">' + d + '</div>';
+  }).join('');
+  var first = keys[keys.length-1];
+  var last = keys[0];
+  var p = first.split('-');
+  var startDate = new Date(Date.UTC(parseInt(p[0]), parseInt(p[1])-1, parseInt(p[2])));
+  var dow = startDate.getUTCDay();
+  startDate = new Date(startDate.getTime() - dow * 86400000);
+  var p2 = last.split('-');
+  var endDate = new Date(Date.UTC(parseInt(p2[0]), parseInt(p2[1])-1, parseInt(p2[2])));
+  var cur = new Date(startDate.getTime());
+  while (cur <= endDate) {
+    var y = cur.getUTCFullYear();
+    var m = String(cur.getUTCMonth()+1).padStart(2,'0');
+    var d = String(cur.getUTCDate()).padStart(2,'0');
+    var key = y + '-' + m + '-' + d;
+    var cnt = conteo[key] || 0;
+    var isActive = turnoActivo === key;
+    var bg = isActive ? 'var(--blue)' : (cnt > 0 ? 'var(--panel2)' : 'transparent');
+    var border = cnt > 0 ? '1px solid var(--border)' : '1px solid transparent';
+    var cursor = cnt > 0 ? 'pointer' : 'default';
+    var clickAttr = cnt > 0 ? ' data-turno="' + key + '"' : '';
+    html += '<div class="cal-day" style="border-radius:8px;padding:6px 2px;background:' + bg + ';border:' + border + ';cursor:' + cursor + '"' + clickAttr + '>';
+    html += '<div style="font-size:13px;font-weight:600">' + parseInt(d) + '</div>';
+    if (cnt > 0) {
+      html += '<div style="font-size:11px;color:' + (isActive ? 'white' : '#22c55e') + '">' + cnt + '</div>';
+    }
+    html += '</div>';
+    cur = new Date(cur.getTime() + 86400000);
+  }
+  grid.innerHTML = html;
+  grid.querySelectorAll('[data-turno]').forEach(function(el) {
+    el.addEventListener('click', function() {
+      seleccionarTurno(el.dataset.turno);
+    });
+  });
+}
+
+// ========================
+// CREAR CLIENTE EN ODOO
+// ========================
+
+function toggleCliGiro() {
+  var esEmpresa = document.getElementById('cliTipo').value === 'empresa';
+  document.getElementById('cliGiroGroup').style.display = esEmpresa ? 'block' : 'none';
+}
+
+function abrirCrearCliente() {
+  document.getElementById('cliNombre').value = '';
+  document.getElementById('cliRut').value = '';
+  document.getElementById('cliEmail').value = '';
+  document.getElementById('cliDireccion').value = '';
+  document.getElementById('cliCiudad').value = '';
+  document.getElementById('cliRegion').value = '';
+  document.getElementById('cliGiro').value = '';
+  document.getElementById('cliTipo').value = 'persona';
+  document.getElementById('cliError').style.display = 'none';
+  toggleCliGiro();
+  document.getElementById('clienteModal').classList.add('open');
+}
+
+function cerrarCrearCliente() {
+  document.getElementById('clienteModal').classList.remove('open');
+}
+
+function crearClienteOdoo() {
+  var nombre = document.getElementById('cliNombre').value.trim();
+  var rut = document.getElementById('cliRut').value.trim();
+  var email = document.getElementById('cliEmail').value.trim();
+  var errDiv = document.getElementById('cliError');
+  if (!nombre || !rut || !email) {
+    errDiv.textContent = 'Nombre, RUT y email son obligatorios';
+    errDiv.style.display = 'block';
+    errDiv.style.color = '#f87171';
+    return;
+  }
+  var esEmpresa = document.getElementById('cliTipo').value === 'empresa';
+  var payload = {
+    nombre: nombre,
+    rut: rut,
+    email: email,
+    direccion: document.getElementById('cliDireccion').value.trim(),
+    ciudad: document.getElementById('cliCiudad').value.trim(),
+    region: document.getElementById('cliRegion').value,
+    giro: esEmpresa ? document.getElementById('cliGiro').value.trim() : '',
+    es_empresa: esEmpresa
+  };
+  errDiv.textContent = 'Creando...';
+  errDiv.style.display = 'block';
+  errDiv.style.color = '#94a3b8';
+  fetch('/clientes/crear', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }).then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        cerrarCrearCliente();
+        alert('Cliente creado en Odoo: ' + data.nombre + ' (id=' + data.partner_id + ')');
+      } else {
+        errDiv.style.color = '#f87171';
+        errDiv.textContent = 'Error: ' + (data.detail || 'desconocido');
+      }
+    })
+    .catch(function(e) {
+      errDiv.style.color = '#f87171';
+      errDiv.textContent = 'Error de conexion: ' + e.message;
+    });
+}
+
+// ========================
+// EVENTOS Y ARRANQUE
+// ========================
+
 document.getElementById('editModal').addEventListener('click', function(e) {
   if (e.target.id === 'editModal') closeModal();
 });
-
 document.getElementById('packModal').addEventListener('click', function(e) {
   if (e.target.id === 'packModal') closePackModal();
+});
+document.getElementById('calModal').addEventListener('click', function(e) {
+  if (e.target.id === 'calModal') cerrarCalendario();
+});
+document.getElementById('clienteModal').addEventListener('click', function(e) {
+  if (e.target.id === 'clienteModal') cerrarCrearCliente();
 });
 
 refreshData();
 setInterval(function() {
-  if (!document.getElementById('editModal').classList.contains('open') &&
-      !document.getElementById('packModal').classList.contains('open')) {
-    refreshData();
-  }
+  var anyOpen = ['editModal','packModal','calModal','clienteModal'].some(function(id) {
+    return document.getElementById(id).classList.contains('open');
+  });
+  if (!anyOpen) refreshData();
 }, 60000);
-
 '''
+
+
 
 
 
