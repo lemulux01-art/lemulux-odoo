@@ -2786,7 +2786,7 @@ function reconciliarML() {
       if (data.ok) {
         var msg = 'ML: ' + data.ordenes_ml + ' ordenes | BD: ' + data.en_bd + ' | Faltantes: ' + data.faltantes;
         if (data.mensaje) {
-          msg += '\n' + data.mensaje;
+          msg += ' ' + data.mensaje;
           setTimeout(refreshData, 10000);
           setTimeout(refreshData, 30000);
           setTimeout(refreshData, 60000);
