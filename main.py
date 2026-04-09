@@ -1581,13 +1581,27 @@ def manual_refresh():
 def ventas(estado: Optional[str] = None):
     items = list_ventas(estado)
     enriched = []
+
+    LOGISTIC_LABELS = {
+        "self_service":  "Colecta",
+        "xd_drop_off":   "Flex",
+        "default_xd":    "Flex",
+        "fulfillment":   "Full",
+        "not_specified": "No especificado",
+        "custom":        "Personalizado",
+    }
+
     for v in items:
         try:
             order = json.loads(v.get("order_json") or "{}")
             productos, cantidad_items, total_bruto = summarize_order_items(order)
+            logistic_type = (
+                order.get("shipping", {}) or {}
+            ).get("logistic_type", "") or ""
+            tipo_envio = LOGISTIC_LABELS.get(logistic_type, logistic_type or "No especificado")
         except Exception:
             productos, cantidad_items, total_bruto = [], 0, 0.0
-        # No enviar order_json al cliente — solo los datos calculados
+            tipo_envio = "-"
         v.pop("order_json", None)
         v.pop("billing_json", None)
         enriched.append({
@@ -1595,6 +1609,7 @@ def ventas(estado: Optional[str] = None):
             "productos": productos,
             "cantidad_items": cantidad_items,
             "total_bruto": total_bruto,
+            "tipo_envio": tipo_envio,
         })
     return {"items": enriched}
 
@@ -2427,6 +2442,19 @@ function badge(estado) {
   return '<span class="badge ' + (map[estado] || 'badge-default') + '">' + esc(estado) + '</span>';
 }
 
+function enviobadge(tipo) {
+  if (!tipo || tipo === '-' || tipo === 'No especificado') {
+    return '<span style="font-size:12px;color:#94a3b8">-</span>';
+  }
+  var colors = {
+    'Colecta': 'background:#1e3a5f;color:#93c5fd',
+    'Flex':    'background:#14532d;color:#86efac',
+    'Full':    'background:#4c1d95;color:#c4b5fd'
+  };
+  var style = colors[tipo] || 'background:#1f2937;color:#94a3b8';
+  return '<span style="' + style + ';padding:3px 8px;border-radius:999px;font-size:11px;font-weight:700">' + esc(tipo) + '</span>';
+}
+
 function safe(v) {
   if (v == null || v === '') return '-';
   return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -2541,6 +2569,7 @@ function rowHtml(v) {
       '<div class="small">' + safe(v.cantidad_items) + ' items</div>' +
       (v.productos && v.productos.length ? '<ul class="compact">' + v.productos.slice(0,3).map(function(p){ return '<li>' + safe(p) + '</li>'; }).join('') + '</ul>' : '') + '</td>' +
     '<td>' + safe(v.tipo_sugerido) + '</td>' +
+    '<td>' + enviobadge(v.tipo_envio) + '</td>' +
     '<td>' + badge(v.estado) +
       (v.error ? '<div class="small" style="color:#f87171;margin-top:4px">' + safe(v.error).substring(0,80) + '</div>' : '') + '</td>' +
     '<td><span>' + safe(v.estado_envio || 'paid') + '</span></td>' +
@@ -2561,7 +2590,7 @@ function renderTable() {
   html += '<th style="width:32px"><input type="checkbox" class="cb-row" id="cbTodos" onchange="toggleTodos(this)"></th>';
   html += '<th>Fecha / ID ML</th><th>Cliente</th><th>RUT</th>';
   html += '<th>Direccion / Ciudad / Region</th><th>Total / Items</th>';
-  html += '<th>Tipo</th><th>Estado doc.</th><th>Estado envio ML</th><th>Acciones</th>';
+  html += '<th>Tipo</th><th>Envio</th><th>Estado doc.</th><th>Estado envio ML</th><th>Acciones</th>';
   html += '</tr></thead><tbody>';
   for (var i = 0; i < items.length; i++) { html += rowHtml(items[i]); }
   html += '</tbody></table>';
