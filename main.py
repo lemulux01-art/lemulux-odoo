@@ -127,6 +127,7 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS region TEXT",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_envio TEXT DEFAULT 'paid'",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS pack_id TEXT",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS tipo_envio_ml TEXT DEFAULT ''",
             ]:
                 cur.execute(stmt)
         conn.commit()
@@ -227,11 +228,14 @@ def save_venta(
                 logger.info(f"[{oid}] Venta actualizada (estado={existing['estado']})")
                 return
 
+            # Extraer tipo de envio desde shipment
+            tipo_envio_ml = extract_logistic_type(order)
+
             cur.execute(
                 """
                 INSERT INTO ventas
-                    (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, order_json, billing_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s)
+                    (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, order_json, billing_json, tipo_envio_ml)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, %s)
                 ON CONFLICT (id) DO NOTHING
                 """,
                 (
@@ -248,6 +252,7 @@ def save_venta(
                     order.get("status", "paid"),
                     json.dumps(order, ensure_ascii=False),
                     json.dumps(billing, ensure_ascii=False),
+                    tipo_envio_ml,
                 ),
             )
         conn.commit()
@@ -255,8 +260,7 @@ def save_venta(
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
-    # Incluir order_json para calcular productos y totales
-    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json"
+    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml"
     with get_db() as conn:
         with conn.cursor() as cur:
             if estado:
@@ -792,6 +796,41 @@ def ml_get(url: str) -> dict:
 
 def get_ml_order(order_id: str) -> dict:
     return ml_get(f"https://api.mercadolibre.com/orders/{order_id}")
+
+
+def get_ml_shipment(shipping_id) -> dict:
+    """Obtiene datos del envio incluyendo logistic_type."""
+    if not shipping_id:
+        return {}
+    try:
+        return ml_get(f"https://api.mercadolibre.com/shipments/{shipping_id}")
+    except Exception:
+        return {}
+
+
+def extract_logistic_type(order: dict) -> str:
+    """Extrae el tipo de logistica desde la orden o consultando el shipment."""
+    LOGISTIC_LABELS = {
+        "cross_docking": "Colecta",
+        "self_service":  "Colecta",
+        "drop_off":      "Colecta",
+        "xd_drop_off":   "Flex",
+        "default_xd":    "Flex",
+        "fulfillment":   "Full",
+    }
+    # Primero intentar en el order directamente
+    shipping = order.get("shipping") or {}
+    logistic = shipping.get("logistic_type")
+    if logistic:
+        return LOGISTIC_LABELS.get(logistic, logistic)
+    # Si no hay, consultar /shipments/{id}
+    shipping_id = shipping.get("id")
+    if shipping_id:
+        shipment = get_ml_shipment(shipping_id)
+        logistic = shipment.get("logistic_type")
+        if logistic:
+            return LOGISTIC_LABELS.get(logistic, logistic)
+    return ""
 
 
 def get_ml_pack(pack_id: str) -> dict:
@@ -1606,27 +1645,14 @@ def manual_refresh():
 def ventas(estado: Optional[str] = None):
     items = list_ventas(estado)
     enriched = []
-
-    LOGISTIC_LABELS = {
-        "self_service":  "Colecta",
-        "xd_drop_off":   "Flex",
-        "default_xd":    "Flex",
-        "fulfillment":   "Full",
-        "not_specified": "No especificado",
-        "custom":        "Personalizado",
-    }
-
     for v in items:
         try:
             order = json.loads(v.get("order_json") or "{}")
             productos, cantidad_items, total_bruto = summarize_order_items(order)
-            logistic_type = (
-                order.get("shipping", {}) or {}
-            ).get("logistic_type", "") or ""
-            tipo_envio = LOGISTIC_LABELS.get(logistic_type, logistic_type or "No especificado")
         except Exception:
             productos, cantidad_items, total_bruto = [], 0, 0.0
-            tipo_envio = "-"
+        # Usar tipo_envio_ml guardado en BD; si está vacío mostrar "-"
+        tipo_envio = v.get("tipo_envio_ml") or "-"
         v.pop("order_json", None)
         v.pop("billing_json", None)
         enriched.append({
