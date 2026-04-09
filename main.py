@@ -1342,7 +1342,7 @@ def webhook_worker():
             finally:
                 webhook_queue.task_done()
                 # Delay entre requests para no saturar ML
-                time.sleep(2)
+                time.sleep(3)
         except queue_module.Empty:
             continue
 
@@ -1362,7 +1362,7 @@ def get_ml_seller_id() -> Optional[str]:
 def get_ml_ordenes_recientes(seller_id: str, total: int = 200) -> list:
     """Obtiene las ultimas N ordenes con estados validos para facturar, paginando de 50 en 50."""
     # ML solo permite filtrar por un estado a la vez
-    estados = ["paid", "ready_to_ship", "shipped", "delivered"]
+    estados = ["paid"]  # ML solo soporta "paid" en orders/search
     todas = []
     por_estado = total // len(estados) + 50  # pedir suficientes de cada estado
 
@@ -1387,7 +1387,7 @@ def get_ml_ordenes_recientes(seller_id: str, total: int = 200) -> list:
             offset += limit
             if len(resultados) < limit:
                 break
-            time.sleep(0.5)
+            time.sleep(2)  # respetar rate limit entre paginas
 
     # Deduplicar por ID y ordenar por fecha desc
     visto = set()
@@ -1439,12 +1439,14 @@ def reconciliar_ordenes_ml():
             faltantes = [oid for oid in ids_ml if oid not in ids_en_bd]
 
             if faltantes:
-                logger.warning(f"Reconciliacion: {len(faltantes)} ordenes faltantes en BD: {faltantes[:5]}")
-                for oid in faltantes:
+                logger.warning(f"Reconciliacion auto: {len(faltantes)} faltantes, encolando hasta 10")
+                encoladas_auto = 0
+                for oid in faltantes[:10]:
                     if oid not in list(webhook_queue.queue):
                         webhook_queue.put(oid)
-                        logger.info(f"Reconciliacion: encolada orden faltante {oid}")
-                    time.sleep(1)
+                        encoladas_auto += 1
+                    time.sleep(0.5)
+                logger.info(f"Reconciliacion auto: {encoladas_auto} ordenes encoladas")
             else:
                 logger.info(f"Reconciliacion OK: {len(ordenes_ml)} ordenes ML todas en BD")
 
@@ -1680,7 +1682,7 @@ def ingresar_venta_manual(payload: VentaManualPayload):
 
 @app.post("/ventas/reconciliar")
 def reconciliar_manual():
-    """Fuerza reconciliacion inmediata con ML y encola ordenes faltantes."""
+    """Fuerza reconciliacion con ML. Encola todas las faltantes en background con delays."""
     try:
         seller_id = get_ml_seller_id()
         if not seller_id:
@@ -1695,19 +1697,38 @@ def reconciliar_manual():
                 ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
 
         faltantes = [oid for oid in ids_ml if oid not in ids_en_bd]
-        encoladas = []
-        for oid in faltantes:
-            if oid not in list(webhook_queue.queue):
-                webhook_queue.put(oid)
-                encoladas.append(oid)
 
-        logger.info(f"Reconciliacion manual: {len(ordenes_ml)} ordenes ML, {len(faltantes)} faltantes, {len(encoladas)} encoladas")
+        if not faltantes:
+            return {"ok": True, "ordenes_ml": len(ordenes_ml), "en_bd": len(ids_en_bd), "faltantes": 0, "encoladas": []}
+
+        # Lanzar en background para no bloquear el request
+        def encolar_en_lotes(lista):
+            lote = 10
+            for i in range(0, len(lista), lote):
+                chunk = lista[i:i+lote]
+                encoladas_chunk = 0
+                for oid in chunk:
+                    if oid not in list(webhook_queue.queue):
+                        webhook_queue.put(oid)
+                        encoladas_chunk += 1
+                logger.info(f"Reconciliacion: encolado lote {i//lote+1} ({encoladas_chunk} ordenes). Cola: {webhook_queue.qsize()}")
+                # Esperar a que la cola baje antes del siguiente lote
+                wait = 0
+                while webhook_queue.qsize() > 5 and wait < 120:
+                    time.sleep(5)
+                    wait += 5
+
+        t = threading.Thread(target=encolar_en_lotes, args=(faltantes,), daemon=True)
+        t.start()
+
+        logger.info(f"Reconciliacion manual: {len(ordenes_ml)} ML, {len(faltantes)} faltantes, procesando en background")
         return {
             "ok": True,
             "ordenes_ml": len(ordenes_ml),
             "en_bd": len(ids_en_bd),
             "faltantes": len(faltantes),
-            "encoladas": encoladas
+            "mensaje": f"Procesando {len(faltantes)} ventas faltantes en background (lotes de 10). Apareceran progresivamente en el dashboard.",
+            "encoladas": faltantes[:5]
         }
     except HTTPException:
         raise
@@ -2764,6 +2785,12 @@ function reconciliarML() {
       if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar ML'; }
       if (data.ok) {
         var msg = 'ML: ' + data.ordenes_ml + ' ordenes | BD: ' + data.en_bd + ' | Faltantes: ' + data.faltantes;
+        if (data.mensaje) {
+          msg += '\n' + data.mensaje;
+          setTimeout(refreshData, 10000);
+          setTimeout(refreshData, 30000);
+          setTimeout(refreshData, 60000);
+        }
         if (data.encoladas && data.encoladas.length > 0) {
           msg += ' - Encoladas: ' + data.encoladas.join(', ');
           setTimeout(refreshData, 5000);
