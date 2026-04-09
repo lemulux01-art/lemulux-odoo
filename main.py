@@ -1347,7 +1347,6 @@ def webhook_worker():
             continue
 
 
-@app.on_event("startup")
 def get_ml_seller_id() -> Optional[str]:
     """Obtiene el seller_id del token actual."""
     try:
@@ -1454,6 +1453,7 @@ def reconciliar_ordenes_ml():
             logger.error(f"Error en reconciliacion: {e}")
 
 
+@app.on_event("startup")
 async def on_startup():
     wait_for_db()
     t = threading.Thread(target=schedule_token_refresh, daemon=True)
