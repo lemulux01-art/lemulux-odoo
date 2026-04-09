@@ -1761,6 +1761,57 @@ def ingresar_venta_manual(payload: VentaManualPayload):
 
 
 
+@app.post("/ventas/actualizar-envio")
+def actualizar_tipo_envio():
+    """Actualiza tipo_envio_ml en ventas que tienen ese campo vacio consultando ML."""
+    try:
+        # Obtener ventas sin tipo_envio_ml
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, order_json FROM ventas WHERE tipo_envio_ml IS NULL OR tipo_envio_ml = '' LIMIT 100"
+                )
+                rows = cur.fetchall()
+
+        if not rows:
+            return {"ok": True, "actualizadas": 0, "mensaje": "Todas las ventas ya tienen tipo de envio"}
+
+        def procesar_en_background():
+            actualizadas = 0
+            errores = 0
+            for row in rows:
+                try:
+                    oid = str(row["id"])
+                    order = json.loads(row.get("order_json") or "{}")
+                    tipo_envio = extract_logistic_type(order)
+                    if tipo_envio:
+                        with get_db() as conn2:
+                            with conn2.cursor() as cur2:
+                                cur2.execute(
+                                    "UPDATE ventas SET tipo_envio_ml = %s WHERE id = %s",
+                                    (tipo_envio, oid)
+                                )
+                            conn2.commit()
+                        actualizadas += 1
+                    time.sleep(1)  # respetar rate limit ML
+                except Exception as e:
+                    logger.warning(f"Error actualizando envio {row['id']}: {e}")
+                    errores += 1
+                    time.sleep(2)
+            logger.info(f"Actualizacion tipo_envio: {actualizadas} actualizadas, {errores} errores de {len(rows)} ventas")
+
+        t = threading.Thread(target=procesar_en_background, daemon=True)
+        t.start()
+
+        return {
+            "ok": True,
+            "procesando": len(rows),
+            "mensaje": f"Actualizando tipo de envio en {len(rows)} ventas en background. Recarga el dashboard en ~2 minutos."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ventas/reconciliar")
 def reconciliar_manual():
     """Fuerza reconciliacion con ML. Encola todas las faltantes en background con delays."""
@@ -2245,6 +2296,7 @@ UI_HTML = """<!doctype html>
     <button class="secondary" onclick="abrirIngresarVenta()" style="background:var(--blue)">+ Ingresar venta</button>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
     <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 200 ordenes en ML y agrega las que falten en el sistema">&#128279; Reconciliar ML</button>
+    <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio (Colecta/Flex) en ventas existentes">&#128666; Actualizar envios</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
   <div id="selInfo" style="display:none;margin-bottom:10px;font-size:13px;color:var(--muted)"><span id="selCount"></span></div>
@@ -2868,6 +2920,29 @@ function agruparSeleccionadas() {
       } else {
         alert('Error: ' + (data.detail || 'desconocido'));
       }
+    });
+}
+
+function actualizarEnvio() {
+  var btn = document.querySelector('[onclick="actualizarEnvio()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Consultando...'; }
+  fetch('/ventas/actualizar-envio', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Actualizar envios'; }
+      if (data.ok) {
+        alert(data.mensaje);
+        if (data.procesando > 0) {
+          setTimeout(refreshData, 30000);
+          setTimeout(refreshData, 90000);
+        }
+      } else {
+        alert('Error: ' + (data.detail || 'desconocido'));
+      }
+    })
+    .catch(function(e) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Actualizar envios'; }
+      alert('Error: ' + e.message);
     });
 }
 
