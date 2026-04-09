@@ -754,7 +754,10 @@ def schedule_token_refresh():
         refresh_ml_token()
 
 
+_consecutive_429 = 0  # contador global de 429 consecutivos
+
 def ml_get(url: str) -> dict:
+    global _consecutive_429
     for attempt in range(6):
         try:
             res = requests.get(url, headers=ml_headers(), timeout=30)
@@ -765,22 +768,26 @@ def ml_get(url: str) -> dict:
         if res.status_code == 401:
             logger.warning(f"401 en {url}, renovando token...")
             if not refresh_ml_token():
-                raise Exception("Token ML inválido y no se pudo renovar")
+                raise Exception("Token ML invalido y no se pudo renovar")
             continue
 
         if res.status_code == 429:
-            wait = min(5 * (attempt + 1), 30)
-            logger.warning(f"429 en {url}, reintento en {wait}s")
+            _consecutive_429 += 1
+            # Backoff exponencial basado en 429 consecutivos
+            wait = min(5 * (attempt + 1) + (_consecutive_429 * 2), 60)
+            logger.warning(f"429 en {url}, reintento en {wait}s (consecutivos: {_consecutive_429})")
             time.sleep(wait)
             continue
 
         if res.status_code == 404:
+            _consecutive_429 = 0
             return {}
 
         res.raise_for_status()
+        _consecutive_429 = 0  # reset al tener exito
         return res.json()
 
-    raise Exception(f"ML devolvió demasiados errores para {url}")
+    raise Exception(f"ML devolvio demasiados errores para {url}")
 
 
 def get_ml_order(order_id: str) -> dict:
@@ -1331,18 +1338,26 @@ webhook_queue = queue_module.Queue()
 
 
 def webhook_worker():
-    """Worker que procesa webhooks de uno en uno con delay entre cada uno."""
+    """Worker que procesa webhooks de uno en uno con delay adaptativo."""
+    global _consecutive_429
     while True:
         try:
             order_id = webhook_queue.get(timeout=5)
             try:
                 process_webhook_order(order_id)
+                # Si hubo muchos 429 recientes, esperar más entre órdenes
+                base_delay = 3
+                extra = min(_consecutive_429 * 2, 30)
+                time.sleep(base_delay + extra)
             except Exception as e:
                 logger.error(f"[{order_id}] Error en webhook worker: {e}")
+                # Si es por 429, esperar más antes de siguiente
+                if "demasiados errores" in str(e) or "429" in str(e):
+                    time.sleep(30)
+                else:
+                    time.sleep(3)
             finally:
                 webhook_queue.task_done()
-                # Delay entre requests para no saturar ML
-                time.sleep(3)
         except queue_module.Empty:
             continue
 
