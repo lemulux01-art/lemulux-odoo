@@ -1503,6 +1503,31 @@ def health():
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
 
+@app.get("/debug/shipping/{oid}")
+def debug_shipping(oid: str):
+    """Ver datos de shipping de una orden para diagnosticar tipo de envio."""
+    venta = get_venta(oid)
+    order_json = {}
+    if venta and venta.get("order_json"):
+        order_json = json.loads(venta["order_json"])
+    shipping = order_json.get("shipping") or {}
+    shipping_id = shipping.get("id")
+    shipment_data = {}
+    if shipping_id:
+        try:
+            shipment_data = ml_get(f"https://api.mercadolibre.com/shipments/{shipping_id}")
+        except Exception as e:
+            shipment_data = {"error": str(e)}
+    return {
+        "order_shipping_field": shipping,
+        "shipping_id": shipping_id,
+        "shipment_data": shipment_data,
+        "logistic_type_in_order": shipping.get("logistic_type"),
+        "logistic_type_in_shipment": (shipment_data.get("logistic_type") or
+                                       shipment_data.get("shipping_option", {}).get("shipping_method_id")),
+    }
+
+
 @app.get("/debug/direccion/{oid}")
 def debug_direccion(oid: str):
     order = get_ml_order(oid)
