@@ -810,10 +810,10 @@ def get_ml_shipment(shipping_id) -> dict:
 
 def extract_logistic_type(order: dict) -> str:
     """Extrae el tipo de logistica desde el shipment de ML.
-    La distincion Flex vs Colecta se determina por receiver_address.types:
-    - Si contiene 'flex_pickup' -> Flex
-    - Si no -> Colecta (cross_docking o self_service sin flex)
-    - fulfillment -> Full
+    Logica confirmada con datos reales:
+    - sender_address.types contiene 'self_service_partner' -> Flex
+    - sender_address.types contiene 'milkrun' -> Colecta
+    - logistic_type == 'fulfillment' -> Full
     """
     shipping = order.get("shipping") or {}
     shipping_id = shipping.get("id")
@@ -825,17 +825,15 @@ def extract_logistic_type(order: dict) -> str:
 
     logistic_type = shipment.get("logistic_type", "")
 
-    # Full es siempre Full
     if logistic_type == "fulfillment":
         return "Full"
 
-    # Flex se detecta por receiver_address.types contiene "flex_pickup"
-    receiver_types = (shipment.get("receiver_address") or {}).get("types") or []
-    if "flex_pickup" in receiver_types:
+    sender_types = (shipment.get("sender_address") or {}).get("types") or []
+
+    if "self_service_partner" in sender_types:
         return "Flex"
 
-    # Todo lo demas es Colecta (cross_docking, self_service, drop_off)
-    if logistic_type in ("cross_docking", "self_service", "drop_off", "default_xd", "xd_drop_off"):
+    if "milkrun" in sender_types or logistic_type == "cross_docking":
         return "Colecta"
 
     return logistic_type or ""
