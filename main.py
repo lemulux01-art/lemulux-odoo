@@ -1771,18 +1771,18 @@ def ingresar_venta_manual(payload: VentaManualPayload):
 
 @app.post("/ventas/actualizar-envio")
 def actualizar_tipo_envio():
-    """Actualiza tipo_envio_ml en ventas que tienen ese campo vacio consultando ML."""
+    """Actualiza tipo_envio_ml en todas las ventas consultando ML en tiempo real."""
     try:
-        # Obtener ventas sin tipo_envio_ml
         with get_db() as conn:
             with conn.cursor() as cur:
+                # Procesar todas, no solo las vacias - para corregir clasificaciones erroneas
                 cur.execute(
-                    "SELECT id, order_json FROM ventas WHERE tipo_envio_ml IS NULL OR tipo_envio_ml = '' LIMIT 100"
+                    "SELECT id, order_json FROM ventas WHERE estado != 'enviado' ORDER BY creado_en DESC LIMIT 100"
                 )
                 rows = cur.fetchall()
 
         if not rows:
-            return {"ok": True, "actualizadas": 0, "mensaje": "Todas las ventas ya tienen tipo de envio"}
+            return {"ok": True, "actualizadas": 0, "mensaje": "No hay ventas para procesar"}
 
         def procesar_en_background():
             actualizadas = 0
@@ -1801,12 +1801,13 @@ def actualizar_tipo_envio():
                                 )
                             conn2.commit()
                         actualizadas += 1
-                    time.sleep(1)  # respetar rate limit ML
+                        logger.info(f"[{oid}] tipo_envio actualizado: {tipo_envio}")
+                    time.sleep(1)
                 except Exception as e:
                     logger.warning(f"Error actualizando envio {row['id']}: {e}")
                     errores += 1
                     time.sleep(2)
-            logger.info(f"Actualizacion tipo_envio: {actualizadas} actualizadas, {errores} errores de {len(rows)} ventas")
+            logger.info(f"Actualizacion tipo_envio completa: {actualizadas} OK, {errores} errores de {len(rows)}")
 
         t = threading.Thread(target=procesar_en_background, daemon=True)
         t.start()
@@ -1816,6 +1817,8 @@ def actualizar_tipo_envio():
             "procesando": len(rows),
             "mensaje": f"Actualizando tipo de envio en {len(rows)} ventas en background. Recarga el dashboard en ~2 minutos."
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
