@@ -1787,26 +1787,35 @@ def actualizar_tipo_envio():
         def procesar_en_background():
             actualizadas = 0
             errores = 0
-            for row in rows:
-                try:
-                    oid = str(row["id"])
-                    order = json.loads(row.get("order_json") or "{}")
-                    tipo_envio = extract_logistic_type(order)
-                    if tipo_envio:
-                        with get_db() as conn2:
-                            with conn2.cursor() as cur2:
-                                cur2.execute(
-                                    "UPDATE ventas SET tipo_envio_ml = %s WHERE id = %s",
-                                    (tipo_envio, oid)
-                                )
-                            conn2.commit()
-                        actualizadas += 1
-                        logger.info(f"[{oid}] tipo_envio actualizado: {tipo_envio}")
-                    time.sleep(1)
-                except Exception as e:
-                    logger.warning(f"Error actualizando envio {row['id']}: {e}")
-                    errores += 1
-                    time.sleep(2)
+            lote = 10
+            for i in range(0, len(rows), lote):
+                chunk = rows[i:i+lote]
+                for row in chunk:
+                    try:
+                        oid = str(row["id"])
+                        order = json.loads(row.get("order_json") or "{}")
+                        tipo_envio = extract_logistic_type(order)
+                        if tipo_envio:
+                            with get_db() as conn2:
+                                with conn2.cursor() as cur2:
+                                    cur2.execute(
+                                        "UPDATE ventas SET tipo_envio_ml = %s WHERE id = %s",
+                                        (tipo_envio, oid)
+                                    )
+                                conn2.commit()
+                            actualizadas += 1
+                            logger.info(f"[{oid}] tipo_envio actualizado: {tipo_envio}")
+                        time.sleep(1)
+                    except Exception as e:
+                        logger.warning(f"Error actualizando envio {row['id']}: {e}")
+                        errores += 1
+                        time.sleep(3)
+                logger.info(f"Actualizacion envio: lote {i//lote+1} completado. Esperando cola...")
+                # Esperar a que la cola de webhooks baje antes del siguiente lote
+                wait = 0
+                while webhook_queue.qsize() > 5 and wait < 120:
+                    time.sleep(5)
+                    wait += 5
             logger.info(f"Actualizacion tipo_envio completa: {actualizadas} OK, {errores} errores de {len(rows)}")
 
         t = threading.Thread(target=procesar_en_background, daemon=True)
