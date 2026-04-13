@@ -128,6 +128,7 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_envio TEXT DEFAULT 'paid'",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS pack_id TEXT",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS tipo_envio_ml TEXT DEFAULT ''",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS nc_motivo TEXT DEFAULT ''",
             ]:
                 cur.execute(stmt)
         conn.commit()
@@ -2177,6 +2178,97 @@ def autorizar_venta(oid: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/ventas/{oid}/nota-credito")
+def crear_nota_credito(oid: str, body: dict):
+    """Crea una Nota de Credito completa en Odoo como reversal del documento original."""
+    venta = get_venta(oid)
+    if not venta:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+    if venta.get("estado") != "enviado":
+        raise HTTPException(status_code=400, detail="Solo se puede crear NC de ventas ya enviadas a Odoo")
+    move_id = venta.get("move_id")
+    if not move_id:
+        raise HTTPException(status_code=400, detail="La venta no tiene documento en Odoo")
+
+    motivo = (body.get("motivo") or "").strip()
+    if not motivo:
+        raise HTTPException(status_code=400, detail="El motivo es obligatorio")
+
+    try:
+        ctx = odoo_connect()
+
+        # Verificar que el documento existe y está publicado
+        moves = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "name"]})
+        if not moves:
+            raise HTTPException(status_code=404, detail=f"Documento {move_id} no encontrado en Odoo")
+        move = moves[0]
+        if move["state"] != "posted":
+            raise HTTPException(status_code=400, detail=f"Documento {move['name']} no está publicado (estado: {move['state']})")
+
+        # Crear el reversal (NC completa)
+        from datetime import date
+        reversal_vals = {
+            "move_ids": [move_id],
+            "date": date.today().isoformat(),
+            "reason": motivo,
+            "journal_id": False,  # usar mismo journal
+            "refund_method": "cancel",  # NC completa
+        }
+        # account.move.reversal wizard
+        wizard_id = odoo_exec(ctx, "account.move.reversal", "create", [reversal_vals])
+        result = odoo_exec(ctx, "account.move.reversal", "reverse_moves", [[wizard_id]])
+
+        # Obtener el move_id de la NC creada
+        nc_move_id = None
+        if isinstance(result, dict):
+            domain = result.get("domain")
+            if domain:
+                # Buscar la NC recién creada
+                ncs = odoo_exec(ctx, "account.move", "search", [domain])
+                if ncs:
+                    nc_move_id = ncs[0]
+            res_id = result.get("res_id")
+            if res_id:
+                nc_move_id = res_id
+
+        # Si no se encontró por wizard, buscar por reversed_entry_id
+        if not nc_move_id:
+            ncs = odoo_exec(ctx, "account.move", "search",
+                           [[["reversed_entry_id", "=", move_id]]], {"limit": 1})
+            if ncs:
+                nc_move_id = ncs[0]
+
+        # Publicar la NC si quedó en borrador
+        if nc_move_id:
+            nc_state = odoo_exec(ctx, "account.move", "read", [[nc_move_id]], {"fields": ["state"]})[0]["state"]
+            if nc_state == "draft":
+                odoo_exec(ctx, "account.move", "action_post", [[nc_move_id]])
+            logger.info(f"[{oid}] NC creada y publicada: move_id={nc_move_id}")
+
+        # Actualizar estado en BD
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE ventas SET estado='nota_credito', nc_motivo=%s WHERE id=%s",
+                    (motivo, oid)
+                )
+            conn.commit()
+
+        return {
+            "ok": True,
+            "id": oid,
+            "nc_move_id": nc_move_id,
+            "motivo": motivo,
+            "mensaje": f"Nota de credito creada y publicada en Odoo"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{oid}] Error creando NC: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ventas/{oid}/anular")
 def anular_venta(oid: str):
     """Anula el documento en Odoo (si existe) y resetea la venta a pendiente para reemitir."""
@@ -2257,6 +2349,7 @@ UI_HTML = """<!doctype html>
     .badge-pendiente{background:rgba(245,158,11,0.15);color:#fbbf24;}
     .badge-enviado{background:rgba(34,197,94,0.15);color:#4ade80;}
     .badge-error{background:rgba(239,68,68,0.15);color:#f87171;}
+    .badge-nc{background:rgba(251,191,36,0.15);color:#fbbf24;}
     .badge-default{background:rgba(148,163,184,0.15);color:#cbd5e1;}
     .row-actions{display:flex;gap:6px;flex-wrap:wrap;}
     .pack-btn{background:#7c3aed;color:white;border:none;border-radius:8px;padding:9px 12px;font-size:14px;font-weight:600;cursor:pointer;}
@@ -2344,6 +2437,38 @@ UI_HTML = """<!doctype html>
   </div>
 </div>
 
+<!-- Modal Nota de Credito -->
+<div class="modal" id="ncModal">
+  <div class="modal-card" style="max-width:500px">
+    <div class="topbar" style="margin-bottom:0">
+      <div><div class="title" style="font-size:20px">&#128203; Nota de Credito</div>
+      <div class="subtitle" id="ncModalSub"></div></div>
+      <button class="secondary" onclick="cerrarNC()">Cerrar</button>
+    </div>
+    <div style="margin-top:16px;padding:12px;background:var(--panel2);border-radius:8px;font-size:13px" id="ncModalInfo"></div>
+    <div style="margin-top:16px">
+      <label>Motivo de la nota de credito</label>
+      <select id="ncMotivo" onchange="toggleNcOtro()">
+        <option value="">-- Seleccionar motivo --</option>
+        <option value="Devuelto">Devuelto</option>
+        <option value="Error en la entrega">Error en la entrega</option>
+        <option value="Producto llego en mal estado">Producto llego en mal estado</option>
+        <option value="Producto enviado distinto al solicitado">Producto enviado distinto al solicitado</option>
+        <option value="No despachado">No despachado</option>
+        <option value="otro">Otro motivo...</option>
+      </select>
+    </div>
+    <div style="margin-top:12px;display:none" id="ncOtroGroup">
+      <label>Especificar motivo</label>
+      <input id="ncOtro" placeholder="Describe el motivo">
+    </div>
+    <div id="ncError" style="color:#f87171;font-size:13px;margin-top:12px;display:none"></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="cerrarNC()">Cancelar</button>
+      <button class="bad" onclick="confirmarNC()">Crear Nota de Credito</button>
+    </div>
+  </div>
+</div>
 <!-- Modal Crear Cliente -->
 <div class="modal" id="clienteModal">
   <div class="modal-card" style="max-width:560px">
@@ -2559,8 +2684,9 @@ var currentId = null;
 var turnoActivo = '';
 
 function badge(estado) {
-  var map = {pendiente:'badge-pendiente', enviado:'badge-enviado', error:'badge-error', rechazado:'badge-default'};
-  return '<span class="badge ' + (map[estado] || 'badge-default') + '">' + esc(estado) + '</span>';
+  var map = {pendiente:'badge-pendiente', enviado:'badge-enviado', error:'badge-error', rechazado:'badge-default', nota_credito:'badge-nc'};
+  var label = {nota_credito:'N/C'};
+  return '<span class="badge ' + (map[estado] || 'badge-default') + '">' + esc(label[estado] || estado) + '</span>';
 }
 
 function enviobadge(tipo) {
@@ -2674,6 +2800,9 @@ function rowHtml(v) {
   if (v.estado === 'enviado') {
     acciones += '<button class="bad" data-action="anular" data-id="' + esc(id) + '">Anular</button>';
   }
+  if (v.estado === 'enviado') {
+    acciones += '<button class="bad" style="background:#92400e;border-color:#92400e" data-action="notacredito" data-id="' + esc(id) + '">N/C</button>';
+  }
 
   return '<tr id="row-' + esc(id) + '">' +
     '<td><input type="checkbox" class="cb-row" data-id="' + esc(id) + '" onchange="onCheckboxChange()"></td>' +
@@ -2726,6 +2855,7 @@ function renderTable() {
       else if (action === 'reprocesar') reprocesar(id);
       else if (action === 'autorizar') autorizar(id);
       else if (action === 'anular') anular(id);
+      else if (action === 'notacredito') abrirNC(id);
       else if (action === 'verpack') verPack(id, el.dataset.pack);
       else if (action === 'copy') { try { navigator.clipboard.writeText(id); } catch(e2) {} }
     });
@@ -2779,6 +2909,72 @@ function autorizar(id) {
       if (data.ok) alert('Documento creado en Odoo: move_id=' + data.move_id);
       else alert('Error: ' + (data.detail || 'desconocido'));
       refreshData();
+    });
+}
+
+var _ncCurrentId = null;
+
+function abrirNC(id) {
+  var v = null;
+  for (var i = 0; i < ventas.length; i++) {
+    if (String(ventas[i].id) === String(id)) { v = ventas[i]; break; }
+  }
+  if (!v) return;
+  _ncCurrentId = String(id);
+  document.getElementById('ncModalSub').textContent = 'Venta ' + id;
+  document.getElementById('ncModalInfo').innerHTML =
+    '<strong>' + esc(v.cliente) + '</strong><br>' +
+    'RUT: ' + esc(v.rut) + '<br>' +
+    'Total: ' + money(v.total_bruto) + '<br>' +
+    'Tipo: ' + esc(v.tipo_sugerido);
+  document.getElementById('ncMotivo').value = '';
+  document.getElementById('ncOtro').value = '';
+  document.getElementById('ncOtroGroup').style.display = 'none';
+  document.getElementById('ncError').style.display = 'none';
+  document.getElementById('ncModal').classList.add('open');
+}
+
+function cerrarNC() {
+  _ncCurrentId = null;
+  document.getElementById('ncModal').classList.remove('open');
+}
+
+function toggleNcOtro() {
+  var val = document.getElementById('ncMotivo').value;
+  document.getElementById('ncOtroGroup').style.display = val === 'otro' ? 'block' : 'none';
+}
+
+function confirmarNC() {
+  if (!_ncCurrentId) return;
+  var motivo = document.getElementById('ncMotivo').value;
+  if (motivo === 'otro') motivo = document.getElementById('ncOtro').value.trim();
+  var errDiv = document.getElementById('ncError');
+  if (!motivo) {
+    errDiv.textContent = 'Debes seleccionar o ingresar un motivo';
+    errDiv.style.display = 'block';
+    return;
+  }
+  errDiv.textContent = 'Creando nota de credito en Odoo...';
+  errDiv.style.display = 'block';
+  errDiv.style.color = '#94a3b8';
+  fetch('/ventas/' + _ncCurrentId + '/nota-credito', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({motivo: motivo})
+  }).then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        cerrarNC();
+        alert('Nota de credito creada en Odoo. Motivo: ' + motivo);
+        refreshData();
+      } else {
+        errDiv.style.color = '#f87171';
+        errDiv.textContent = 'Error: ' + (data.detail || 'desconocido');
+      }
+    })
+    .catch(function(e) {
+      errDiv.style.color = '#f87171';
+      errDiv.textContent = 'Error de conexion: ' + e.message;
     });
 }
 
@@ -3319,6 +3515,9 @@ document.getElementById('calModal').addEventListener('click', function(e) {
 });
 document.getElementById('clienteModal').addEventListener('click', function(e) {
   if (e.target.id === 'clienteModal') cerrarCrearCliente();
+});
+document.getElementById('ncModal').addEventListener('click', function(e) {
+  if (e.target.id === 'ncModal') cerrarNC();
 });
 document.getElementById('ventaManualModal').addEventListener('click', function(e) {
   if (e.target.id === 'ventaManualModal') cerrarIngresarVenta();
