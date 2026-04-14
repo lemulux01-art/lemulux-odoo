@@ -1290,12 +1290,6 @@ def wc_get_meta(order: dict, key: str) -> str:
 
 
 def wc_extract_tipodoc(order: dict) -> str:
-    # Si llenó giro o RUT empresa -> Factura sin importar billing_tipodoc
-    giro = wc_get_meta(order, WC_FIELD_GIRO).strip()
-    rut_empresa = wc_get_meta(order, WC_FIELD_RUT_EMPRESA).strip()
-    if giro or rut_empresa:
-        return "Factura"
-    # Fallback: revisar el campo tipodoc explícito
     tipodoc_raw = wc_get_meta(order, WC_FIELD_TIPODOC).strip().lower()
     if "factura" in tipodoc_raw:
         return "Factura"
@@ -2101,18 +2095,10 @@ def crear_nota_credito(oid: str, body: dict):
         if move["state"] != "posted":
             raise HTTPException(status_code=400, detail=f"Documento {move['name']} no esta publicado (estado: {move['state']})")
         from datetime import date
-        # Odoo 17-18 usa refund_method, Odoo 19 renombro a refund_type
-        reversal_fields = odoo_exec(ctx, "account.move.reversal", "fields_get", [], {"attributes": ["string"]})
         reversal_vals = {
-            "move_ids": [(6, 0, [move_id])],
-            "date": date.today().isoformat(),
-            "reason": motivo,
-            "journal_id": False,
+            "move_ids": [move_id], "date": date.today().isoformat(),
+            "reason": motivo, "journal_id": False, "refund_method": "cancel",
         }
-        if "refund_method" in reversal_fields:
-            reversal_vals["refund_method"] = "cancel"
-        elif "refund_type" in reversal_fields:
-            reversal_vals["refund_type"] = "cancel"
         wizard_id = odoo_exec(ctx, "account.move.reversal", "create", [reversal_vals])
         result = odoo_exec(ctx, "account.move.reversal", "reverse_moves", [[wizard_id]])
         nc_move_id = None
@@ -2210,9 +2196,6 @@ UI_HTML = """<!doctype html>
     .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;}
     .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;}
     .card h3{margin:0 0 6px 0;font-size:13px;color:var(--muted);font-weight:600;}
-    .card.activa{border-color:#3b82f6;background:#0f1f3d;}
-    .card#cardML.activa{border-color:#3b82f6;background:#0a1628;}
-    .card#cardWC.activa{border-color:#22c55e;background:#052e16;}
     .card .value{font-size:26px;font-weight:700;}
     .toolbar{display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap;}
     .toolbar input{flex:1;min-width:220px;}
@@ -2259,22 +2242,10 @@ UI_HTML = """<!doctype html>
     </div>
   </div>
   <div class="grid">
-    <div class="card" id="cardTodas" style="cursor:pointer" onclick="setFuente('')">
-      <h3>Total</h3><div class="value" id="cTotal">&mdash;</div>
-      <div style="font-size:12px;color:var(--muted);margin-top:4px">Todas las fuentes</div>
-    </div>
-    <div class="card" id="cardML" style="cursor:pointer" onclick="setFuente('mercadolibre')">
-      <h3>&#x1F6CD; Mercado Libre</h3><div class="value" id="cML">&mdash;</div>
-      <div style="font-size:12px;color:#93c5fd;margin-top:4px" id="cMLpend"></div>
-    </div>
-    <div class="card" id="cardWC" style="cursor:pointer" onclick="setFuente('woocommerce')">
-      <h3>&#x1F6D2; WooCommerce</h3><div class="value" id="cWC">&mdash;</div>
-      <div style="font-size:12px;color:#86efac;margin-top:4px" id="cWCpend"></div>
-    </div>
-    <div class="card">
-      <h3>Pendientes / Error</h3><div class="value" id="cPend">&mdash;</div>
-      <div style="font-size:12px;color:#f87171;margin-top:4px" id="cErr"></div>
-    </div>
+    <div class="card"><h3>Total</h3><div class="value" id="cTotal">&mdash;</div></div>
+    <div class="card"><h3>Pendientes</h3><div class="value" id="cPend">&mdash;</div></div>
+    <div class="card"><h3>Enviadas</h3><div class="value" id="cEnv">&mdash;</div></div>
+    <div class="card"><h3>Con error</h3><div class="value" id="cErr">&mdash;</div></div>
   </div>
   <div class="toolbar">
     <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="renderTable()">
@@ -2285,7 +2256,12 @@ UI_HTML = """<!doctype html>
       <option value="error">Error</option>
       <option value="rechazado">Rechazado</option>
     </select>
-    <input type="hidden" id="fuenteFilter" value="">
+    <select id="fuenteFilter" onchange="renderTable()">
+      <option value="">Todas las fuentes</option>
+      <option value="mercadolibre">Solo ML</option>
+      <option value="woocommerce">Solo WooCommerce</option>
+      <option value="manual">Solo Manual</option>
+    </select>
     <select id="horaCorte" onchange="recalcularTurnos()">
       <option value="14">Corte 14:00</option>
       <option value="15">Corte 15:00</option>
@@ -2616,33 +2592,11 @@ function seleccionarTurno(key) {
   renderTable();
 }
 
-function setFuente(f) {
-  document.getElementById('fuenteFilter').value = f;
-  ['cardTodas','cardML','cardWC'].forEach(function(id) {
-    document.getElementById(id).classList.remove('activa');
-  });
-  if (f === '') document.getElementById('cardTodas').classList.add('activa');
-  else if (f === 'mercadolibre') document.getElementById('cardML').classList.add('activa');
-  else if (f === 'woocommerce') document.getElementById('cardWC').classList.add('activa');
-  renderTable();
-}
-
 function updateStats(items) {
-  var totalML  = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre'; }).length;
-  var totalWC  = ventas.filter(function(v){ return v.fuente === 'woocommerce'; }).length;
-  var pendML   = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre' && v.estado === 'pendiente'; }).length;
-  var pendWC   = ventas.filter(function(v){ return v.fuente === 'woocommerce' && v.estado === 'pendiente'; }).length;
-  var errML    = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre' && v.estado === 'error'; }).length;
-  var errWC    = ventas.filter(function(v){ return v.fuente === 'woocommerce' && v.estado === 'error'; }).length;
-  var totalPend = ventas.filter(function(v){ return v.estado === 'pendiente'; }).length;
-  var totalErr  = ventas.filter(function(v){ return v.estado === 'error'; }).length;
   document.getElementById('cTotal').textContent = ventas.length;
-  document.getElementById('cML').textContent = totalML;
-  document.getElementById('cWC').textContent = totalWC;
-  document.getElementById('cPend').textContent = totalPend;
-  document.getElementById('cMLpend').textContent = pendML + ' pend' + (errML ? ' / ' + errML + ' err' : '');
-  document.getElementById('cWCpend').textContent = pendWC + ' pend' + (errWC ? ' / ' + errWC + ' err' : '');
-  document.getElementById('cErr').textContent = totalErr > 0 ? totalErr + ' con error' : '';
+  document.getElementById('cPend').textContent = ventas.filter(function(v){ return v.estado === 'pendiente'; }).length;
+  document.getElementById('cEnv').textContent = ventas.filter(function(v){ return v.estado === 'enviado'; }).length;
+  document.getElementById('cErr').textContent = ventas.filter(function(v){ return v.estado === 'error'; }).length;
 }
 
 function filteredVentas() {
