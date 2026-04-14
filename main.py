@@ -29,6 +29,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lemulux")
 
+import sys
+sys.setrecursionlimit(500)  # limite conservador para detectar recursion antes del crash
+
 app = FastAPI(title="lemulux-odoo")
 
 IVA_RATE = 1.19
@@ -166,6 +169,7 @@ def save_venta(
     region: str = "",
     pack_id: str = "",
     order_items_override: list = None,
+    forzar_actualizacion: bool = False,
 ):
     # Si hay pack_id, usar ese como ID de la venta para consolidar
     oid = str(pack_id) if pack_id else str(order["id"])
@@ -186,55 +190,83 @@ def save_venta(
             existing = cur.fetchone()
 
             if existing:
-                # Solo actualizar datos del webhook si la venta está pendiente
-                # Si ya fue enviada o tiene datos editados, solo actualizar el JSON de la orden
                 if existing["estado"] in ("enviado", "error"):
-                    # Solo actualizar el JSON por si acaso, sin tocar datos editados
                     cur.execute(
                         "UPDATE ventas SET order_json = %s, billing_json = %s WHERE id = %s",
                         (json.dumps(order, ensure_ascii=False),
                          json.dumps(billing, ensure_ascii=False), oid),
                     )
                 else:
-                    # Pendiente: actualizar datos pero respetar ediciones manuales
-                    cur.execute(
-                        """
-                        UPDATE ventas
-                        SET cliente = COALESCE(NULLIF(cliente, 'Cliente ML'), %s, cliente),
-                            rut = CASE WHEN (rut IS NULL OR rut = '') THEN %s ELSE rut END,
-                            email = CASE WHEN (email IS NULL OR email = '') THEN %s ELSE email END,
-                            direccion = CASE WHEN (direccion IS NULL OR direccion = '') THEN %s ELSE direccion END,
-                            ciudad = CASE WHEN (ciudad IS NULL OR ciudad = '') THEN %s ELSE ciudad END,
-                            region = CASE WHEN (region IS NULL OR region = '') THEN %s ELSE region END,
-                            tipo_sugerido = %s,
-                            order_json = %s,
-                            billing_json = %s,
-                            giro = CASE
-                                WHEN (giro IS NULL OR giro = '' OR giro = '(boleta)') THEN %s
-                                ELSE giro
-                            END
-                        WHERE id = %s
-                        """,
-                        (
-                            cliente_final,
-                            rut_final,
-                            email_final,
-                            direccion_final,
-                            ciudad_final,
-                            region_final,
-                            tipo_sugerido,
-                            json.dumps(order, ensure_ascii=False),
-                            json.dumps(billing, ensure_ascii=False),
-                            giro_final,
-                            oid,
-                        ),
-                    )
+                    if forzar_actualizacion:
+                        # Al reprocesar: actualizar RUT y giro siempre si el nuevo tiene valor
+                        cur.execute(
+                            """
+                            UPDATE ventas
+                            SET cliente = CASE WHEN %s != '' AND %s != 'Cliente ML' THEN %s ELSE COALESCE(NULLIF(cliente,'Cliente ML'), cliente) END,
+                                rut = CASE WHEN %s != '' THEN %s ELSE rut END,
+                                email = CASE WHEN (email IS NULL OR email = '') THEN %s ELSE email END,
+                                direccion = CASE WHEN %s != '' THEN %s ELSE direccion END,
+                                ciudad = CASE WHEN %s != '' THEN %s ELSE ciudad END,
+                                region = CASE WHEN %s != '' THEN %s ELSE region END,
+                                tipo_sugerido = %s,
+                                order_json = %s,
+                                billing_json = %s,
+                                giro = CASE WHEN %s != '' AND %s != '(boleta)' THEN %s
+                                            WHEN (giro IS NULL OR giro = '') THEN %s
+                                            ELSE giro END
+                            WHERE id = %s
+                            """,
+                            (
+                                cliente_final, cliente_final, cliente_final,
+                                rut_final, rut_final,
+                                email_final,
+                                direccion_final, direccion_final,
+                                ciudad_final, ciudad_final,
+                                region_final, region_final,
+                                tipo_sugerido,
+                                json.dumps(order, ensure_ascii=False),
+                                json.dumps(billing, ensure_ascii=False),
+                                giro_final, giro_final, giro_final, giro_final,
+                                oid,
+                            ),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE ventas
+                            SET cliente = COALESCE(NULLIF(cliente, 'Cliente ML'), %s, cliente),
+                                rut = CASE WHEN (rut IS NULL OR rut = '') THEN %s ELSE rut END,
+                                email = CASE WHEN (email IS NULL OR email = '') THEN %s ELSE email END,
+                                direccion = CASE WHEN (direccion IS NULL OR direccion = '') THEN %s ELSE direccion END,
+                                ciudad = CASE WHEN (ciudad IS NULL OR ciudad = '') THEN %s ELSE ciudad END,
+                                region = CASE WHEN (region IS NULL OR region = '') THEN %s ELSE region END,
+                                tipo_sugerido = %s,
+                                order_json = %s,
+                                billing_json = %s,
+                                giro = CASE
+                                    WHEN (giro IS NULL OR giro = '' OR giro = '(boleta)') THEN %s
+                                    ELSE giro
+                                END
+                            WHERE id = %s
+                            """,
+                            (
+                                cliente_final, rut_final, email_final, direccion_final,
+                                ciudad_final, region_final, tipo_sugerido,
+                                json.dumps(order, ensure_ascii=False),
+                                json.dumps(billing, ensure_ascii=False),
+                                giro_final, oid,
+                            ),
+                        )
                 conn.commit()
                 logger.info(f"[{oid}] Venta actualizada (estado={existing['estado']})")
                 return
 
-            # Extraer tipo de envio desde shipment
-            tipo_envio_ml = extract_logistic_type(order)
+            # Extraer tipo de envio desde shipment (con proteccion contra recursion)
+            try:
+                tipo_envio_ml = extract_logistic_type(order)
+            except Exception as e:
+                logger.warning(f"[{oid}] No se pudo extraer logistic_type: {e}")
+                tipo_envio_ml = ""
 
             cur.execute(
                 """
@@ -465,21 +497,22 @@ def format_address_dict(address: dict) -> str:
     return ", ".join(filter(None, parts))
 
 
-def flatten_strings(obj) -> list[str]:
+def flatten_strings(obj) -> list:
     results = []
 
-    def walk(x):
+    def walk(x, depth=0):
+        if depth > 20:  # proteccion contra recursion profunda
+            return
         if isinstance(x, dict):
             for v in x.values():
-                walk(v)
+                walk(v, depth+1)
         elif isinstance(x, list):
             for v in x:
-                walk(v)
+                walk(v, depth+1)
         elif isinstance(x, str):
             s = " ".join(x.split()).strip()
             if s:
                 results.append(s)
-
     walk(obj)
     return results
 
@@ -1431,7 +1464,8 @@ def reprocesar_venta_desde_ml(order_id: str):
     if tipo_sugerido == "Boleta" and not giro:
         giro = DEFAULT_BOLETA_ACTIVITY
 
-    save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email, ciudad, region)
+    save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email, ciudad, region,
+               forzar_actualizacion=True)
 
     items, item_count, total_bruto = summarize_order_items(order)
 
