@@ -1290,6 +1290,12 @@ def wc_get_meta(order: dict, key: str) -> str:
 
 
 def wc_extract_tipodoc(order: dict) -> str:
+    # Si llenó giro o RUT empresa -> Factura sin importar billing_tipodoc
+    giro = wc_get_meta(order, WC_FIELD_GIRO).strip()
+    rut_empresa = wc_get_meta(order, WC_FIELD_RUT_EMPRESA).strip()
+    if giro or rut_empresa:
+        return "Factura"
+    # Fallback: revisar el campo tipodoc explícito
     tipodoc_raw = wc_get_meta(order, WC_FIELD_TIPODOC).strip().lower()
     if "factura" in tipodoc_raw:
         return "Factura"
@@ -2095,10 +2101,18 @@ def crear_nota_credito(oid: str, body: dict):
         if move["state"] != "posted":
             raise HTTPException(status_code=400, detail=f"Documento {move['name']} no esta publicado (estado: {move['state']})")
         from datetime import date
+        # Odoo 17-18 usa refund_method, Odoo 19 renombro a refund_type
+        reversal_fields = odoo_exec(ctx, "account.move.reversal", "fields_get", [], {"attributes": ["string"]})
         reversal_vals = {
-            "move_ids": [move_id], "date": date.today().isoformat(),
-            "reason": motivo, "journal_id": False, "refund_method": "cancel",
+            "move_ids": [(6, 0, [move_id])],
+            "date": date.today().isoformat(),
+            "reason": motivo,
+            "journal_id": False,
         }
+        if "refund_method" in reversal_fields:
+            reversal_vals["refund_method"] = "cancel"
+        elif "refund_type" in reversal_fields:
+            reversal_vals["refund_type"] = "cancel"
         wizard_id = odoo_exec(ctx, "account.move.reversal", "create", [reversal_vals])
         result = odoo_exec(ctx, "account.move.reversal", "reverse_moves", [[wizard_id]])
         nc_move_id = None
