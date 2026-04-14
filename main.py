@@ -12,6 +12,9 @@ import psycopg2
 import psycopg2.extras
 import json
 import re
+import hmac
+import hashlib
+import base64
 from datetime import datetime
 from typing import Optional, Any
 from dataclasses import dataclass
@@ -129,6 +132,7 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS pack_id TEXT",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS tipo_envio_ml TEXT DEFAULT ''",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS nc_motivo TEXT DEFAULT ''",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fuente TEXT DEFAULT 'mercadolibre'",
             ]:
                 cur.execute(stmt)
         conn.commit()
@@ -235,8 +239,8 @@ def save_venta(
             cur.execute(
                 """
                 INSERT INTO ventas
-                    (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, order_json, billing_json, tipo_envio_ml)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, %s)
+                    (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, order_json, billing_json, tipo_envio_ml, fuente)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, %s, 'mercadolibre')
                 ON CONFLICT (id) DO NOTHING
                 """,
                 (
@@ -261,7 +265,7 @@ def save_venta(
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
-    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml"
+    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml, fuente"
     with get_db() as conn:
         with conn.cursor() as cur:
             if estado:
@@ -907,6 +911,18 @@ def get_ml_billing_raw(order_id: str) -> dict:
     return ml_get(f"https://api.mercadolibre.com/orders/{order_id}/billing_info")
 
 
+def get_ml_billing_raw_safe(order_id: str) -> dict:
+    """Obtiene billing_info con reintento automatico si viene vacio."""
+    billing = get_ml_billing_raw_safe(order_id)
+    if not billing or billing == {}:
+        logger.warning(f"[{order_id}] billing_info vacio, reintentando en 3s...")
+        time.sleep(3)
+        billing = get_ml_billing_raw_safe(order_id)
+    if not billing or billing == {}:
+        logger.warning(f"[{order_id}] billing_info sigue vacio tras reintento")
+    return billing
+
+
 # =========================
 # ODOO
 # =========================
@@ -1285,7 +1301,7 @@ def process_webhook_order(order_id: str):
             all_items = merge_order_items(all_orders)
 
             # Usar el billing de la orden original
-            billing_raw = get_ml_billing_raw(order_id)
+            billing_raw = get_ml_billing_raw_safe(order_id)
             billing_info = get_billing_info(billing_raw)
 
             rut = extract_rut(billing_info)
@@ -1324,7 +1340,7 @@ def process_webhook_order(order_id: str):
             logger.info(f"[{order_id}] Estado no valido para facturar ({ml_status}), ignorado")
             return
 
-        billing_raw = get_ml_billing_raw(order_id)
+        billing_raw = get_ml_billing_raw_safe(order_id)
         billing_info = get_billing_info(billing_raw)
 
         rut = extract_rut(billing_info)
@@ -1394,7 +1410,7 @@ def reprocesar_venta_desde_ml(order_id: str):
         first_real_order_id = str(order.get("id", order_id))
 
     # Billing siempre con ID de orden real (no pack_id)
-    billing_raw = get_ml_billing_raw(first_real_order_id)
+    billing_raw = get_ml_billing_raw_safe(first_real_order_id)
     billing_info = get_billing_info(billing_raw)
 
     rut = extract_rut(billing_info)
@@ -1442,6 +1458,284 @@ def reprocesar_venta_desde_ml(order_id: str):
 # =========================
 
 webhook_queue = queue_module.Queue()
+
+
+# =========================
+# WOOCOMMERCE
+# =========================
+
+WC_DEFAULT_EMAIL = "boleta@lemulux.com"
+WC_FIELD_RUT         = "billing_rut"
+WC_FIELD_TIPODOC     = "billing_tipodoc"
+WC_FIELD_COMPANY     = "billing_company"
+WC_FIELD_RUT_EMPRESA = "billing_rut_empresa"
+WC_FIELD_GIRO        = "billing_giro"
+
+WC_ESTADOS_VALIDOS = {"processing", "completed"}
+
+WC_STATE_TO_REGION = {
+    "AI": "Aysen del Gral. Carlos Ibanez del Campo",
+    "AN": "Antofagasta",
+    "AP": "Arica y Parinacota",
+    "AR": "de la Araucania",
+    "AT": "Atacama",
+    "BI": "del BioBio",
+    "CO": "Coquimbo",
+    "LI": "del Libertador Gral. Bernardo O'Higgins",
+    "LL": "de los Lagos",
+    "LR": "Los Rios",
+    "MA": "Magallanes",
+    "ML": "del Maule",
+    "NB": "del Nuble",
+    "RM": "Metropolitana",
+    "TA": "Tarapaca",
+    "VS": "Valparaiso",
+}
+
+wc_webhook_queue = queue_module.Queue()
+
+
+def wc_webhook_worker():
+    while True:
+        try:
+            order_id = wc_webhook_queue.get(timeout=5)
+            try:
+                process_wc_order(str(order_id))
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"[WC:{order_id}] Error en worker: {e}")
+                time.sleep(5)
+            finally:
+                wc_webhook_queue.task_done()
+        except queue_module.Empty:
+            continue
+
+
+def wc_get(path: str) -> dict:
+    url = get_env("WC_URL", required=False, default="").rstrip("/") + "/wp-json/wc/v3/" + path.lstrip("/")
+    key    = get_env("WC_CONSUMER_KEY", required=False, default="")
+    secret = get_env("WC_CONSUMER_SECRET", required=False, default="")
+    if not key or not secret:
+        raise Exception("WC_CONSUMER_KEY o WC_CONSUMER_SECRET no configurados")
+    try:
+        res = requests.get(url, auth=(key, secret), timeout=30)
+        if res.status_code == 404:
+            return {}
+        res.raise_for_status()
+        return res.json()
+    except Exception as e:
+        logger.error(f"[WC] Error GET {path}: {e}")
+        raise
+
+
+def get_wc_order(order_id: str) -> dict:
+    return wc_get(f"orders/{order_id}")
+
+
+def get_wc_orders_recent(total: int = 100) -> list:
+    orders = []
+    page = 1
+    per_page = 50
+    while len(orders) < total:
+        try:
+            data = wc_get(f"orders?status=processing,completed&per_page={per_page}&page={page}&orderby=date&order=desc")
+        except Exception as e:
+            logger.warning(f"[WC] Error paginando ordenes pagina={page}: {e}")
+            break
+        if not data or not isinstance(data, list):
+            break
+        orders.extend(data)
+        if len(data) < per_page:
+            break
+        page += 1
+        time.sleep(1)
+    return orders[:total]
+
+
+def wc_get_meta(order: dict, key: str) -> str:
+    for meta in order.get("meta_data") or []:
+        if meta.get("key") == key:
+            val = meta.get("value")
+            if isinstance(val, list):
+                return ", ".join(str(v) for v in val if v)
+            return str(val).strip() if val else ""
+    return ""
+
+
+def wc_extract_tipodoc(order: dict) -> str:
+    giro = wc_get_meta(order, WC_FIELD_GIRO).strip()
+    rut_empresa = wc_get_meta(order, WC_FIELD_RUT_EMPRESA).strip()
+    if giro or rut_empresa:
+        return "Factura"
+    tipodoc_raw = wc_get_meta(order, WC_FIELD_TIPODOC).strip().lower()
+    if "factura" in tipodoc_raw:
+        return "Factura"
+    return "Boleta"
+
+
+def wc_extract_rut(order: dict, tipo: str) -> str:
+    if tipo == "Factura":
+        rut = wc_get_meta(order, WC_FIELD_RUT_EMPRESA).strip()
+    else:
+        rut = wc_get_meta(order, WC_FIELD_RUT).strip()
+    return normalize_rut(rut) if rut else ""
+
+
+def wc_extract_nombre(order: dict, tipo: str) -> str:
+    billing = order.get("billing") or {}
+    if tipo == "Factura":
+        company = (wc_get_meta(order, WC_FIELD_COMPANY) or billing.get("company") or "").strip()
+        if company:
+            return company
+    first = (billing.get("first_name") or "").strip()
+    last  = (billing.get("last_name") or "").strip()
+    return f"{first} {last}".strip() or "Cliente WC"
+
+
+def wc_extract_email(order: dict) -> str:
+    billing = order.get("billing") or {}
+    return (billing.get("email") or WC_DEFAULT_EMAIL).strip()
+
+
+def wc_extract_giro(order: dict, tipo: str) -> str:
+    if tipo == "Factura":
+        return wc_get_meta(order, WC_FIELD_GIRO).strip()
+    return DEFAULT_BOLETA_ACTIVITY
+
+
+def wc_extract_direccion(order: dict) -> str:
+    billing = order.get("billing") or {}
+    addr1 = (billing.get("address_1") or "").strip()
+    addr2 = (billing.get("address_2") or "").strip()
+    if addr1 and addr2:
+        return f"{addr1}, {addr2}"
+    return addr1 or addr2
+
+
+def wc_extract_ciudad(order: dict) -> str:
+    billing = order.get("billing") or {}
+    return (billing.get("city") or "").strip()
+
+
+def wc_extract_region(order: dict) -> str:
+    billing = order.get("billing") or {}
+    state_code = (billing.get("state") or "").strip().upper()
+    return WC_STATE_TO_REGION.get(state_code, state_code)
+
+
+def wc_build_order_items(order: dict) -> list:
+    items = []
+    for li in order.get("line_items") or []:
+        items.append({
+            "item":       {"title": li.get("name") or "Producto WC"},
+            "quantity":   float(li.get("quantity") or 1),
+            "unit_price": float(li.get("price") or 0),
+        })
+    return items
+
+
+def wc_build_fake_order(wc_order: dict) -> dict:
+    return {
+        "id":          wc_order.get("id"),
+        "status":      wc_order.get("status"),
+        "order_items": wc_build_order_items(wc_order),
+        "buyer": {
+            "email":      wc_extract_email(wc_order),
+            "first_name": (wc_order.get("billing") or {}).get("first_name", ""),
+            "last_name":  (wc_order.get("billing") or {}).get("last_name", ""),
+        },
+    }
+
+
+def process_wc_order(order_id: str):
+    try:
+        wc_order = get_wc_order(order_id)
+        if not wc_order:
+            logger.warning(f"[WC:{order_id}] Orden no encontrada")
+            return
+        wc_status = wc_order.get("status", "")
+        oid_str = f"WC-{order_id}"
+        existing = get_venta(oid_str)
+        if existing:
+            update_venta(oid_str, estado_envio=wc_status)
+            logger.info(f"[WC:{order_id}] Estado actualizado: {wc_status}")
+            return
+        if wc_status not in WC_ESTADOS_VALIDOS:
+            logger.info(f"[WC:{order_id}] Estado no valido ({wc_status}), ignorado")
+            return
+        tipo      = wc_extract_tipodoc(wc_order)
+        rut       = wc_extract_rut(wc_order, tipo)
+        nombre    = wc_extract_nombre(wc_order, tipo)
+        email     = wc_extract_email(wc_order)
+        giro      = wc_extract_giro(wc_order, tipo)
+        direccion = wc_extract_direccion(wc_order)
+        ciudad    = wc_extract_ciudad(wc_order)
+        region    = wc_extract_region(wc_order)
+        fake_order   = wc_build_fake_order(wc_order)
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM ventas WHERE id = %s", (oid_str,))
+                if cur.fetchone():
+                    return
+                cur.execute(
+                    """INSERT INTO ventas
+                        (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region,
+                         tipo_sugerido, estado, estado_envio, order_json, billing_json, fuente)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, 'woocommerce')
+                       ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        oid_str, None,
+                        (nombre or "Cliente WC").strip(),
+                        normalize_rut(rut) if rut else "",
+                        (email or WC_DEFAULT_EMAIL).strip(),
+                        (giro or "").strip(),
+                        (direccion or "").strip(),
+                        (ciudad or "").strip(),
+                        (region or "").strip(),
+                        tipo, wc_status,
+                        json.dumps(fake_order, ensure_ascii=False),
+                        json.dumps({}, ensure_ascii=False),
+                    ),
+                )
+            conn.commit()
+        logger.info(f"[WC:{order_id}] Guardada -> tipo={tipo} rut={rut or 'sin RUT'} cliente={nombre}")
+    except Exception as e:
+        logger.error(f"[WC:{order_id}] Error procesando: {e}", exc_info=True)
+
+
+def reconciliar_wc_ordenes():
+    while True:
+        time.sleep(20 * 60)
+        try:
+            ordenes = get_wc_orders_recent(total=100)
+            if not ordenes:
+                continue
+            ids_wc = [f"WC-{o['id']}" for o in ordenes if o.get("id")]
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_wc,))
+                    ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
+            faltantes = [o for o in ordenes if f"WC-{o['id']}" not in ids_en_bd]
+            if faltantes:
+                logger.warning(f"[WC] Reconciliacion: {len(faltantes)} faltantes, encolando hasta 10")
+                for o in faltantes[:10]:
+                    wc_webhook_queue.put(str(o["id"]))
+                    time.sleep(0.5)
+            else:
+                logger.info(f"[WC] Reconciliacion OK: {len(ordenes)} ordenes en BD")
+        except Exception as e:
+            logger.error(f"[WC] Error en reconciliacion: {e}")
+
+
+def verify_wc_webhook(body_bytes: bytes, signature: str) -> bool:
+    secret = get_env("WC_WEBHOOK_SECRET", required=False, default="")
+    if not secret:
+        logger.warning("[WC] WC_WEBHOOK_SECRET no configurado, omitiendo verificacion")
+        return True
+    mac = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256)
+    expected = base64.b64encode(mac.digest()).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
 
 
 def webhook_worker():
@@ -1583,15 +1877,85 @@ async def on_startup():
     logger.info("Renovacion automatica de token ML iniciada (cada 5h)")
     w = threading.Thread(target=webhook_worker, daemon=True)
     w.start()
-    logger.info("Worker de cola de webhooks iniciado")
+    logger.info("Worker de cola de webhooks ML iniciado")
     r = threading.Thread(target=reconciliar_ordenes_ml, daemon=True)
     r.start()
     logger.info("Reconciliador de ordenes ML iniciado (cada 15 min)")
+    ww = threading.Thread(target=wc_webhook_worker, daemon=True)
+    ww.start()
+    logger.info("Worker de cola WooCommerce iniciado")
+    wr = threading.Thread(target=reconciliar_wc_ordenes, daemon=True)
+    wr.start()
+    logger.info("Reconciliador WooCommerce iniciado (cada 20 min)")
 
 
 # =========================
 # ENDPOINTS
 # =========================
+
+@app.post("/wc/webhook")
+async def wc_webhook(request: Request):
+    body_bytes = await request.body()
+    signature  = request.headers.get("X-WC-Webhook-Signature", "")
+    topic      = request.headers.get("X-WC-Webhook-Topic", "")
+    if not verify_wc_webhook(body_bytes, signature):
+        logger.warning(f"[WC] Firma HMAC invalida en webhook topic={topic}")
+        return JSONResponse(status_code=401, content={"error": "Firma invalida"})
+    if topic not in ("order.created", "order.updated", "order.status_changed"):
+        return {"ok": True, "ignored": True, "topic": topic}
+    try:
+        body = json.loads(body_bytes)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Body invalido"})
+    order_id = str(body.get("id") or "")
+    status   = str(body.get("status") or "")
+    if not order_id:
+        return {"ok": True}
+    if status not in WC_ESTADOS_VALIDOS:
+        logger.info(f"[WC:{order_id}] Estado {status} ignorado")
+        return {"ok": True, "ignored": True, "status": status}
+    if order_id not in list(wc_webhook_queue.queue):
+        wc_webhook_queue.put(order_id)
+        logger.info(f"[WC] Webhook encolado: order_id={order_id} status={status}")
+    return {"ok": True, "order_id": order_id, "status": status, "queued": wc_webhook_queue.qsize()}
+
+
+@app.post("/wc/reconciliar")
+def wc_reconciliar_manual():
+    try:
+        ordenes = get_wc_orders_recent(total=100)
+        ids_wc  = [f"WC-{o['id']}" for o in ordenes if o.get("id")]
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_wc,))
+                ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
+        faltantes_ids = [str(o["id"]) for o in ordenes if f"WC-{o['id']}" not in ids_en_bd]
+        def encolar():
+            for oid in faltantes_ids:
+                wc_webhook_queue.put(oid)
+                time.sleep(1)
+            logger.info(f"[WC] Reconciliacion manual: {len(faltantes_ids)} encoladas")
+        threading.Thread(target=encolar, daemon=True).start()
+        return {
+            "ok": True, "total_wc": len(ordenes), "en_bd": len(ids_en_bd),
+            "faltantes": len(faltantes_ids), "encoladas": faltantes_ids[:5],
+            "mensaje": f"Procesando {len(faltantes_ids)} ordenes WC faltantes en background."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/wc/ingresar/{order_id}")
+def wc_ingresar_manual(order_id: str):
+    try:
+        process_wc_order(order_id)
+        venta = get_venta(f"WC-{order_id}")
+        if venta:
+            return {"ok": True, "id": f"WC-{order_id}", "cliente": venta.get("cliente"), "estado": venta.get("estado")}
+        return {"ok": True, "id": f"WC-{order_id}", "message": "Procesado, verificar en dashboard"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/")
 def root():
@@ -1964,10 +2328,13 @@ def ingresar_manual(order_id: str):
 
 @app.post("/ventas/reprocesar-todo")
 def reprocesar_todo():
-    """Reprocesa desde ML todas las ventas pendientes o con error."""
+    """Reprocesa desde ML todas las ventas pendientes o con error (solo fuente ML)."""
     todas = list_ventas("pendiente") + list_ventas("error")
     resultados = {"ok": 0, "error": 0, "errores": []}
     for venta in todas:
+        # Solo reprocesar ventas de ML
+        if (venta.get("fuente") or "mercadolibre") != "mercadolibre":
+            continue
         try:
             reprocesar_venta_desde_ml(str(venta["id"]))
             resultados["ok"] += 1
@@ -2397,6 +2764,9 @@ UI_HTML = """<!doctype html>
     .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;}
     .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px;}
     .card h3{margin:0 0 6px 0;font-size:13px;color:var(--muted);font-weight:600;}
+    .card.activa{border-color:#3b82f6;background:#0f1f3d;}
+    .card#cardML.activa{border-color:#3b82f6;background:#0a1628;}
+    .card#cardWC.activa{border-color:#22c55e;background:#052e16;}
     .card .value{font-size:26px;font-weight:700;}
     .toolbar{display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap;}
     .toolbar input{flex:1;min-width:220px;}
@@ -2433,7 +2803,7 @@ UI_HTML = """<!doctype html>
 <div class="wrap">
   <div class="topbar">
     <div>
-      <div class="title">&#x1F6D2; Bandeja de ventas ML &rarr; Odoo</div>
+      <div class="title">&#x1F6D2; Bandeja de ventas ML + WooCommerce &rarr; Odoo</div>
       <div class="subtitle">Revisa, edita, reprocesa y autoriza cada venta antes de crear el documento en Odoo.</div>
     </div>
     <div class="actions">
@@ -2443,13 +2813,26 @@ UI_HTML = """<!doctype html>
     </div>
   </div>
   <div class="grid">
-    <div class="card"><h3>Total</h3><div class="value" id="cTotal">&mdash;</div></div>
-    <div class="card"><h3>Pendientes</h3><div class="value" id="cPend">&mdash;</div></div>
-    <div class="card"><h3>Enviadas</h3><div class="value" id="cEnv">&mdash;</div></div>
-    <div class="card"><h3>Con error</h3><div class="value" id="cErr">&mdash;</div></div>
+    <div class="card" id="cardTodas" style="cursor:pointer" onclick="setFuente('')">
+      <h3>Total</h3><div class="value" id="cTotal">&mdash;</div>
+      <div style="font-size:12px;color:var(--muted);margin-top:4px">Todas las fuentes</div>
+    </div>
+    <div class="card" id="cardML" style="cursor:pointer" onclick="setFuente('mercadolibre')">
+      <h3>&#x1F6CD; Mercado Libre</h3><div class="value" id="cML">&mdash;</div>
+      <div style="font-size:12px;color:#93c5fd;margin-top:4px" id="cMLpend"></div>
+    </div>
+    <div class="card" id="cardWC" style="cursor:pointer" onclick="setFuente('woocommerce')">
+      <h3>&#x1F6D2; WooCommerce</h3><div class="value" id="cWC">&mdash;</div>
+      <div style="font-size:12px;color:#86efac;margin-top:4px" id="cWCpend"></div>
+    </div>
+    <div class="card">
+      <h3>Pendientes / Error</h3><div class="value" id="cPend">&mdash;</div>
+      <div style="font-size:12px;color:#f87171;margin-top:4px" id="cErr"></div>
+    </div>
   </div>
   <div class="toolbar">
     <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="renderTable()">
+    <input type="hidden" id="fuenteFilter" value="">
     <select id="statusFilter" onchange="renderTable()">
       <option value="pendiente">Pendiente</option>
       <option value="">Todos los estados</option>
@@ -2468,6 +2851,7 @@ UI_HTML = """<!doctype html>
     <button class="secondary" onclick="abrirIngresarVenta()" style="background:var(--blue)">+ Ingresar venta</button>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
     <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 200 ordenes en ML y agrega las que falten en el sistema">&#128279; Reconciliar ML</button>
+    <button class="secondary" onclick="reconciliarWC()" title="Consulta las ultimas 100 ordenes en WooCommerce">&#128666; Reconciliar WC</button>
     <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio (Colecta/Flex) en ventas existentes">&#128666; Actualizar envios</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
@@ -2750,6 +3134,29 @@ function badge(estado) {
   return '<span class="badge ' + (map[estado] || 'badge-default') + '">' + esc(label[estado] || estado) + '</span>';
 }
 
+function fuentebadge(fuente) {
+  if (!fuente || fuente === 'mercadolibre') {
+    return '<span style="background:#1a2744;color:#93c5fd;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;margin-left:4px">ML</span>';
+  }
+  if (fuente === 'woocommerce') {
+    return '<span style="background:#1a3a2a;color:#86efac;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;margin-left:4px">WC</span>';
+  }
+  return '<span style="background:#2a1a3a;color:#c4b5fd;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;margin-left:4px">MAN</span>';
+}
+
+function setFuente(f) {
+  var fi = document.getElementById('fuenteFilter');
+  if (fi) fi.value = f;
+  ['cardTodas','cardML','cardWC'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.classList.remove('activa');
+  });
+  var card = f === '' ? 'cardTodas' : f === 'mercadolibre' ? 'cardML' : 'cardWC';
+  var cel = document.getElementById(card);
+  if (cel) cel.classList.add('activa');
+  renderTable();
+}
+
 function enviobadge(tipo) {
   if (!tipo || tipo === '-' || tipo === 'No especificado') {
     return '<span style="font-size:12px;color:#94a3b8">-</span>';
@@ -2827,23 +3234,36 @@ function seleccionarTurno(key) {
 }
 
 function updateStats(items) {
+  var totalML  = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre'; }).length;
+  var totalWC  = ventas.filter(function(v){ return v.fuente === 'woocommerce'; }).length;
+  var pendML   = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre' && v.estado === 'pendiente'; }).length;
+  var pendWC   = ventas.filter(function(v){ return v.fuente === 'woocommerce' && v.estado === 'pendiente'; }).length;
+  var errML    = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre' && v.estado === 'error'; }).length;
+  var errWC    = ventas.filter(function(v){ return v.fuente === 'woocommerce' && v.estado === 'error'; }).length;
+  var totalPend = ventas.filter(function(v){ return v.estado === 'pendiente'; }).length;
+  var totalErr  = ventas.filter(function(v){ return v.estado === 'error'; }).length;
   document.getElementById('cTotal').textContent = ventas.length;
-  document.getElementById('cPend').textContent = ventas.filter(function(v){ return v.estado === 'pendiente'; }).length;
-  document.getElementById('cEnv').textContent = ventas.filter(function(v){ return v.estado === 'enviado'; }).length;
-  document.getElementById('cErr').textContent = ventas.filter(function(v){ return v.estado === 'error'; }).length;
+  document.getElementById('cML').textContent = totalML;
+  document.getElementById('cWC').textContent = totalWC;
+  document.getElementById('cPend').textContent = totalPend;
+  document.getElementById('cMLpend').textContent = pendML + ' pend' + (errML ? ' / ' + errML + ' err' : '');
+  document.getElementById('cWCpend').textContent = pendWC + ' pend' + (errWC ? ' / ' + errWC + ' err' : '');
+  document.getElementById('cErr').textContent = totalErr > 0 ? totalErr + ' con error' : '';
 }
 
 function filteredVentas() {
   var q = document.getElementById('searchInput').value.trim().toLowerCase();
   var s = document.getElementById('statusFilter').value;
+  var f = document.getElementById('fuenteFilter') ? document.getElementById('fuenteFilter').value : '';
   return ventas.filter(function(v) {
     var okS = !s || v.estado === s;
+    var okF = !f || (v.fuente || 'mercadolibre') === f;
     var campos = [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase();
     var okQ = !q || campos.indexOf(q) >= 0;
     var okT = !turnoActivo || getTurnoKey(v.creado_en) === turnoActivo;
-    return okS && okQ && okT;
+    return okS && okQ && okT && okF;
   });
-}
+} 
 
 function rowHtml(v) {
   var id = String(v.id || '');
@@ -2851,7 +3271,9 @@ function rowHtml(v) {
 
   var acciones = '';
   acciones += '<button class="secondary" data-action="edit" data-id="' + esc(id) + '">Editar</button> ';
-  acciones += '<button class="warn" data-action="reprocesar" data-id="' + esc(id) + '">Reprocesar</button> ';
+  if ((v.fuente || 'mercadolibre') === 'mercadolibre') {
+    acciones += '<button class="warn" data-action="reprocesar" data-id="' + esc(id) + '">Reprocesar</button> ';
+  }
   if (v.pack_id) {
     acciones += '<button class="pack-btn" data-action="verpack" data-id="' + esc(id) + '" data-pack="' + esc(v.pack_id) + '">Pack</button> ';
   }
@@ -2881,7 +3303,7 @@ function rowHtml(v) {
       (v.productos && v.productos.length ? '<ul class="compact">' + v.productos.slice(0,3).map(function(p){ return '<li>' + safe(p) + '</li>'; }).join('') + '</ul>' : '') + '</td>' +
     '<td>' + safe(v.tipo_sugerido) + '</td>' +
     '<td>' + enviobadge(v.tipo_envio) + '</td>' +
-    '<td>' + badge(v.estado) +
+    '<td>' + badge(v.estado) + fuentebadge(v.fuente) +
       (v.error ? '<div class="small" style="color:#f87171;margin-top:4px">' + safe(v.error).substring(0,80) + '</div>' : '') + '</td>' +
     '<td><span>' + safe(v.estado_envio || 'paid') + '</span></td>' +
     '<td><div class="row-actions">' + acciones + '</div></td>' +
@@ -3229,26 +3651,28 @@ function reconciliarML() {
     .then(function(data) {
       if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar ML'; }
       if (data.ok) {
-        var msg = 'ML: ' + data.ordenes_ml + ' ordenes | BD: ' + data.en_bd + ' | Faltantes: ' + data.faltantes;
-        if (data.mensaje) {
-          msg += ' ' + data.mensaje;
-          setTimeout(refreshData, 10000);
-          setTimeout(refreshData, 30000);
-          setTimeout(refreshData, 60000);
-        }
-        if (data.encoladas && data.encoladas.length > 0) {
-          msg += ' - Encoladas: ' + data.encoladas.join(', ');
-          setTimeout(refreshData, 5000);
-        }
+        var msg = 'ML: ' + data.ordenes_ml + ' | BD: ' + data.en_bd + ' | Faltantes: ' + data.faltantes;
+        if (data.faltantes > 0) { msg += ' - ' + data.mensaje; setTimeout(refreshData, 10000); setTimeout(refreshData, 30000); }
         alert(msg);
-      } else {
-        alert('Error: ' + (data.detail || 'desconocido'));
-      }
+      } else { alert('Error: ' + (data.detail || 'desconocido')); }
     })
-    .catch(function(e) {
-      if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar ML'; }
-      alert('Error de conexion: ' + e.message);
-    });
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar ML'; } alert('Error: ' + e.message); });
+}
+
+function reconciliarWC() {
+  var btn = document.querySelector('[onclick="reconciliarWC()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Consultando WC...'; }
+  fetch('/wc/reconciliar', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar WC'; }
+      if (data.ok) {
+        var msg = 'WC: ' + data.total_wc + ' | BD: ' + data.en_bd + ' | Faltantes: ' + data.faltantes;
+        if (data.faltantes > 0) { msg += ' - ' + data.mensaje; setTimeout(refreshData, 8000); setTimeout(refreshData, 20000); }
+        alert(msg);
+      } else { alert('Error: ' + (data.detail || 'desconocido')); }
+    })
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar WC'; } alert('Error: ' + e.message); });
 }
 
 function reprocesarTodo() {
