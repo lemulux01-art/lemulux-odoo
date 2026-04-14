@@ -19,18 +19,11 @@ from datetime import datetime
 from typing import Optional, Any
 from dataclasses import dataclass
 
-# =========================
-# CONFIG
-# =========================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
 logger = logging.getLogger("lemulux")
-
-import sys
-sys.setrecursionlimit(500)  # limite conservador para detectar recursion antes del crash
 
 app = FastAPI(title="lemulux-odoo")
 
@@ -41,11 +34,10 @@ TOKEN_REFRESH_INTERVAL = 5 * 60 * 60
 DB_RETRIES = 20
 DB_RETRY_SECONDS = 3
 
-# Confirmados en tu Odoo
 ODOO_JOURNAL_FACTURA_ID = 10
 ODOO_JOURNAL_BOLETA_ID = 21
-ODOO_DOC_TYPE_FACTURA_ID = 1   # (33) Factura Electrónica
-ODOO_DOC_TYPE_BOLETA_ID = 5    # (39) Boleta Electrónica
+ODOO_DOC_TYPE_FACTURA_ID = 1
+ODOO_DOC_TYPE_BOLETA_ID = 5
 ODOO_PAYMENT_TERM_CONTADO_ID = 1
 
 ODOO_STANDARD_NARRATION = (
@@ -139,7 +131,7 @@ def init_db():
             ]:
                 cur.execute(stmt)
         conn.commit()
-    logger.info("✅ Tabla ventas verificada en PostgreSQL")
+    logger.info("Tabla ventas verificada en PostgreSQL")
 
 
 def wait_for_db():
@@ -147,11 +139,11 @@ def wait_for_db():
     for attempt in range(1, DB_RETRIES + 1):
         try:
             init_db()
-            logger.info("✅ Conexión a PostgreSQL lista")
+            logger.info("Conexion a PostgreSQL lista")
             return True
         except Exception as e:
             last_error = e
-            logger.warning(f"⏳ PostgreSQL no disponible ({attempt}/{DB_RETRIES}): {e}")
+            logger.warning(f"PostgreSQL no disponible ({attempt}/{DB_RETRIES}): {e}")
             time.sleep(DB_RETRY_SECONDS)
     raise RuntimeError(f"No se pudo inicializar PostgreSQL: {last_error}")
 
@@ -171,9 +163,7 @@ def save_venta(
     order_items_override: list = None,
     forzar_actualizacion: bool = False,
 ):
-    # Si hay pack_id, usar ese como ID de la venta para consolidar
     oid = str(pack_id) if pack_id else str(order["id"])
-    # Permitir pasar items consolidados de múltiples órdenes
     if order_items_override is not None:
         order = {**order, "order_items": order_items_override}
     email_final = (email or ML_DEFAULT_EMAIL).strip()
@@ -198,7 +188,6 @@ def save_venta(
                     )
                 else:
                     if forzar_actualizacion:
-                        # Al reprocesar: actualizar RUT y giro siempre si el nuevo tiene valor
                         cur.execute(
                             """
                             UPDATE ventas
@@ -261,31 +250,19 @@ def save_venta(
                 logger.info(f"[{oid}] Venta actualizada (estado={existing['estado']})")
                 return
 
-            # Extraer tipo de envio desde shipment (con proteccion contra recursion)
-            try:
-                tipo_envio_ml = extract_logistic_type(order)
-            except Exception as e:
-                logger.warning(f"[{oid}] No se pudo extraer logistic_type: {e}")
-                tipo_envio_ml = ""
+            tipo_envio_ml = extract_logistic_type(order)
 
             cur.execute(
                 """
                 INSERT INTO ventas
-                    (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, order_json, billing_json, tipo_envio_ml, fuente)
+                    (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region,
+                     tipo_sugerido, estado, estado_envio, order_json, billing_json, tipo_envio_ml, fuente)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, %s, 'mercadolibre')
                 ON CONFLICT (id) DO NOTHING
                 """,
                 (
-                    oid,
-                    pack_id or None,
-                    cliente_final,
-                    rut_final,
-                    email_final,
-                    giro_final,
-                    direccion_final,
-                    ciudad_final,
-                    region_final,
-                    tipo_sugerido,
+                    oid, pack_id or None, cliente_final, rut_final, email_final,
+                    giro_final, direccion_final, ciudad_final, region_final, tipo_sugerido,
                     order.get("status", "paid"),
                     json.dumps(order, ensure_ascii=False),
                     json.dumps(billing, ensure_ascii=False),
@@ -293,7 +270,7 @@ def save_venta(
                 ),
             )
         conn.commit()
-    logger.info(f"[{oid}] Guardada → tipo={tipo_sugerido} rut={rut_final or 'sin RUT'} cliente={cliente_final}")
+    logger.info(f"[{oid}] Guardada -> tipo={tipo_sugerido} rut={rut_final or 'sin RUT'} cliente={cliente_final}")
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
@@ -343,18 +320,16 @@ class VentaUpdate(BaseModel):
 
 
 # =========================
-# EXTRACCIÓN ML
+# EXTRACCION ML
 # =========================
 
 def get_billing_info(billing_response: dict) -> dict:
     buyer_billing = safe_get(billing_response, "buyer", "billing_info", default={})
     if isinstance(buyer_billing, dict) and buyer_billing:
         return buyer_billing
-
     root_billing = billing_response.get("billing_info") or {}
     if isinstance(root_billing, dict) and root_billing:
         return root_billing
-
     return billing_response or {}
 
 
@@ -362,17 +337,14 @@ def extract_rut(billing_info: dict) -> str:
     number = safe_get(billing_info, "identification", "number", default="")
     if number:
         return normalize_rut(str(number))
-
     for item in billing_info.get("additional_info") or []:
         item_type = (item.get("type") or "").upper()
         if item_type in ("DOC_NUMBER", "RUT", "DOCUMENT_NUMBER"):
             return normalize_rut(str(item.get("value", "")))
-
     for key in ("rut", "vat", "doc_number", "document_number"):
         val = billing_info.get(key)
         if val:
             return normalize_rut(str(val))
-
     return ""
 
 
@@ -381,37 +353,29 @@ def extract_name(billing_info: dict, order: dict) -> str:
         val = billing_info.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
-
     taxes = billing_info.get("taxes") or {}
     for key in ("business_name", "company_name", "legal_name"):
         val = taxes.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
-
     for item in billing_info.get("additional_info") or []:
         item_type = (item.get("type") or "").upper()
         if item_type in ("BUSINESS_NAME", "COMPANY_NAME", "RAZON_SOCIAL", "SOCIAL_REASON", "LEGAL_NAME"):
             val = item.get("value")
             if isinstance(val, str) and val.strip():
                 return val.strip()
-
     name = (billing_info.get("name") or "").strip()
     last_name = (billing_info.get("last_name") or "").strip()
     if name and last_name:
         return f"{name} {last_name}"
     if name:
         return name
-
     buyer = order.get("buyer") or {}
     full_name = " ".join(
-        x for x in [
-            buyer.get("first_name", "").strip(),
-            buyer.get("last_name", "").strip(),
-        ] if x
+        x for x in [buyer.get("first_name", "").strip(), buyer.get("last_name", "").strip()] if x
     ).strip()
     if full_name:
         return full_name
-
     return buyer.get("nickname") or "Cliente ML"
 
 
@@ -421,25 +385,21 @@ def extract_activity(billing_info: dict, order: dict) -> str:
         val = taxes.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
-
     for key in ("economic_activity", "activity", "giro", "business_activity"):
         val = billing_info.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
-
     for item in billing_info.get("additional_info") or []:
         item_type = (item.get("type") or "").upper()
         if item_type in ("ECONOMIC_ACTIVITY", "ACTIVITY", "GIRO", "BUSINESS_ACTIVITY"):
             val = item.get("value")
             if isinstance(val, str) and val.strip():
                 return val.strip()
-
     buyer = order.get("buyer") or {}
     for key in ("giro", "economic_activity", "activity"):
         val = buyer.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
-
     return ""
 
 
@@ -457,30 +417,14 @@ def extract_email(billing_info: dict, order: dict) -> str:
 def format_address_dict(address: dict) -> str:
     if not isinstance(address, dict) or not address:
         return ""
-
     parts = []
-    street = (
-        address.get("street_name")
-        or address.get("address_line")
-        or address.get("line")
-        or ""
-    )
+    street = (address.get("street_name") or address.get("address_line") or address.get("line") or "")
     number = address.get("street_number") or address.get("number") or ""
     comment = address.get("comment") or address.get("reference") or ""
-    municipality = (
-        address.get("municipality_name")
-        or safe_get(address, "municipality", "name", default="")
-    )
-    city = (
-        address.get("city_name")
-        or safe_get(address, "city", "name", default="")
-    )
-    state = (
-        address.get("state_name")
-        or safe_get(address, "state", "name", default="")
-    )
+    municipality = (address.get("municipality_name") or safe_get(address, "municipality", "name", default=""))
+    city = (address.get("city_name") or safe_get(address, "city", "name", default=""))
+    state = (address.get("state_name") or safe_get(address, "state", "name", default=""))
     zip_code = address.get("zip_code") or address.get("zipcode") or ""
-
     if street:
         parts.append(f"{street} {number}".strip())
     if comment:
@@ -493,22 +437,18 @@ def format_address_dict(address: dict) -> str:
         parts.append(state)
     if zip_code:
         parts.append(zip_code)
-
     return ", ".join(filter(None, parts))
 
 
 def flatten_strings(obj) -> list:
     results = []
-
-    def walk(x, depth=0):
-        if depth > 20:  # proteccion contra recursion profunda
-            return
+    def walk(x):
         if isinstance(x, dict):
             for v in x.values():
-                walk(v, depth+1)
+                walk(v)
         elif isinstance(x, list):
             for v in x:
-                walk(v, depth+1)
+                walk(v)
         elif isinstance(x, str):
             s = " ".join(x.split()).strip()
             if s:
@@ -520,81 +460,55 @@ def flatten_strings(obj) -> list:
 def looks_like_chilean_address(text: str) -> bool:
     if not text or len(text) < 10:
         return False
-
     t = " ".join(text.split()).strip()
     tl = t.lower()
-
-    banned = [
-        "rut",
-        "giro",
-        "actividad",
-        "economic activity",
-        "razon social",
-        "razón social",
-        "business name",
-        "company name",
-        "boleta",
-        "factura",
-        "consumidor final",
-    ]
+    banned = ["rut", "giro", "actividad", "economic activity", "razon social",
+              "razon social", "business name", "company name", "boleta", "factura", "consumidor final"]
     if any(b in tl for b in banned):
         return False
-
     has_number = bool(re.search(r"\b\d{2,5}\b", t))
     has_street_word = bool(re.search(
-        r"\b(calle|av\.?|avenida|pasaje|camino|ruta|general|manuel|los|las|el|la|encomenderos|montt|ohiggins|vicuña|providencia|apoquindo)\b",
-        tl
-    ))
+        r"\b(calle|av\.?|avenida|pasaje|camino|ruta|general|manuel|los|las|el|la|encomenderos|montt|ohiggins|vicuna|providencia|apoquindo)\b", tl))
     has_location_hint = bool(re.search(
-        r"\b(santiago|las condes|providencia|maipu|maipú|ñuñoa|nunoa|coronel|biob[ií]o|metropolitana|valparaiso|valpara[ií]so|concepcion|concepción|temuco|antofagasta)\b",
-        tl
-    ))
-
+        r"\b(santiago|las condes|providencia|maipu|maipu|nunoa|nunoa|coronel|biobio|metropolitana|valparaiso|valparaiso|concepcion|concepcion|temuco|antofagasta)\b", tl))
     return has_number and (has_street_word or has_location_hint)
 
 
 def score_address_candidate(text: str) -> int:
     t = text.lower()
     score = 0
-
     if re.search(r"\b\d{2,5}\b", t):
         score += 3
     if re.search(r"\b(of|oficina|depto|departamento|casa|piso|torre|edif|edificio)\b", t):
         score += 3
-    if re.search(r"\b(santiago|las condes|providencia|coronel|biob[ií]o|metropolitana)\b", t):
+    if re.search(r"\b(santiago|las condes|providencia|coronel|biobio|metropolitana)\b", t):
         score += 3
     if re.search(r"\b(calle|av|avenida|pasaje|camino|ruta|general|manuel|encomenderos)\b", t):
         score += 2
-
     return score
 
 
-# Mapeo STATE_CODE ML → nombre región Odoo Chile
 ML_STATE_CODE_TO_REGION = {
-    "CL-AI": "Aysén del Gral. Carlos Ibáñez del Campo",
+    "CL-AI": "Aysen del Gral. Carlos Ibanez del Campo",
     "CL-AN": "Antofagasta",
     "CL-AP": "Arica y Parinacota",
     "CL-AR": "de la Araucania",
     "CL-AT": "Atacama",
-    "CL-BI": "del BíoBio",
+    "CL-BI": "del BioBio",
     "CL-CO": "Coquimbo",
     "CL-LI": "del Libertador Gral. Bernardo O'Higgins",
     "CL-LL": "de los Lagos",
-    "CL-LR": "Los Ríos",
+    "CL-LR": "Los Rios",
     "CL-MA": "Magallanes",
     "CL-ML": "del Maule",
-    "CL-NB": "del Ñuble",
+    "CL-NB": "del Nuble",
     "CL-RM": "Metropolitana",
-    "CL-TA": "Tarapacá",
-    "CL-VS": "Valparaíso",
+    "CL-TA": "Tarapaca",
+    "CL-VS": "Valparaiso",
 }
 
 
 def extract_from_additional_info(billing_info: dict) -> dict:
-    """
-    Extrae campos clave desde additional_info de MLC.
-    Retorna dict con: street, number, neighborhood, city, state_name, state_code, zip_code
-    """
     fields = {}
     for item in billing_info.get("additional_info") or []:
         t = (item.get("type") or "").upper()
@@ -605,21 +519,15 @@ def extract_from_additional_info(billing_info: dict) -> dict:
 
 
 def extract_direccion_from_additional_info(billing_info: dict) -> str:
-    """
-    Construye la dirección desde additional_info de MLC.
-    Estructura real MLC: STREET_NAME, STREET_NUMBER, CITY_NAME, STATE_NAME, NEIGHBORHOOD
-    """
     fields = extract_from_additional_info(billing_info)
     if not fields:
         return ""
-
     parts = []
     street = fields.get("STREET_NAME", "")
     number = fields.get("STREET_NUMBER", "")
     neighborhood = fields.get("NEIGHBORHOOD", "")
     city = fields.get("CITY_NAME", "")
     state = fields.get("STATE_NAME", "")
-
     if street:
         parts.append(f"{street} {number}".strip())
     if neighborhood and neighborhood.lower() != city.lower():
@@ -628,86 +536,62 @@ def extract_direccion_from_additional_info(billing_info: dict) -> str:
         parts.append(city)
     if state:
         parts.append(state)
-
     return ", ".join(filter(None, parts))
 
 
 def extract_ciudad_from_billing(billing_info: dict) -> str:
-    """Extrae la ciudad/comuna desde billing_info."""
     fields = extract_from_additional_info(billing_info)
     return (
-        fields.get("CITY_NAME")
-        or fields.get("NEIGHBORHOOD")
-        or safe_get(billing_info, "address", "city_name", default="")
-        or ""
+        fields.get("CITY_NAME") or fields.get("NEIGHBORHOOD") or
+        safe_get(billing_info, "address", "city_name", default="") or ""
     )
 
 
 def extract_region_from_billing(billing_info: dict) -> str:
-    """Extrae la región desde billing_info, mapeando STATE_CODE al nombre Odoo."""
     fields = extract_from_additional_info(billing_info)
-
-    # Preferir mapeo por código (más preciso)
     state_code = fields.get("STATE_CODE", "").upper()
     if state_code and state_code in ML_STATE_CODE_TO_REGION:
         return ML_STATE_CODE_TO_REGION[state_code]
-
-    # Fallback al nombre de estado
     return (
-        fields.get("STATE_NAME")
-        or safe_get(billing_info, "address", "state_name", default="")
-        or ""
+        fields.get("STATE_NAME") or
+        safe_get(billing_info, "address", "state_name", default="") or ""
     )
 
 
 def enrich_from_shipment(order: dict, rut: str, cliente: str, direccion: str, ciudad: str, region: str):
-    """
-    Cuando el billing_info viene vacio, intenta completar los datos faltantes
-    desde el receiver_address del shipment.
-    Retorna (rut, cliente, direccion, ciudad, region) enriquecidos.
-    """
+    """Cuando billing_info viene vacio, completa datos faltantes desde el receiver_address del shipment."""
     shipping = order.get("shipping") or {}
     shipping_id = shipping.get("id")
     if not shipping_id:
         return rut, cliente, direccion, ciudad, region
-
     try:
         shipment = get_ml_shipment(shipping_id)
         ra = shipment.get("receiver_address") or {}
-
         if not cliente or cliente == "Cliente ML":
             receiver_name = ra.get("receiver_name") or ""
             if receiver_name:
                 cliente = receiver_name.title()
-
         if not direccion:
             addr = ra.get("address_line") or ""
             if addr:
                 direccion = addr
-
         if not ciudad:
             ciudad = (ra.get("city") or {}).get("name") or ""
-
         if not region:
             state_id = (ra.get("state") or {}).get("id") or ""
             if state_id and state_id in ML_STATE_CODE_TO_REGION:
                 region = ML_STATE_CODE_TO_REGION[state_id]
             else:
                 region = (ra.get("state") or {}).get("name") or ""
-
     except Exception as e:
         logger.warning(f"enrich_from_shipment: no se pudo obtener shipment {shipping_id}: {e}")
-
     return rut, cliente, direccion, ciudad, region
 
 
-def extract_direccion(order: dict, billing_info: dict, billing_raw: dict | None = None) -> str:
-    # 1. Primero desde additional_info (estructura real MLC)
+def extract_direccion(order: dict, billing_info: dict, billing_raw: dict = None) -> str:
     direccion = extract_direccion_from_additional_info(billing_info)
     if direccion:
         return direccion
-
-    # 2. Desde address como objeto dict
     candidates = [
         billing_info.get("address") or {},
         safe_get(order, "buyer", "address", default={}),
@@ -718,85 +602,61 @@ def extract_direccion(order: dict, billing_info: dict, billing_raw: dict | None 
         direccion = format_address_dict(c)
         if direccion:
             return direccion
-
-    # 3. Fallback: buscar strings que parezcan dirección
     blobs = []
     blobs.extend(flatten_strings(order))
     blobs.extend(flatten_strings(billing_info))
     if billing_raw:
         blobs.extend(flatten_strings(billing_raw))
-
     seen = set()
     uniq = []
     for s in blobs:
         if s not in seen:
             seen.add(s)
             uniq.append(s)
-
     filtered = [s for s in uniq if looks_like_chilean_address(s)]
     if filtered:
         filtered.sort(key=score_address_candidate, reverse=True)
         return filtered[0].strip()
-
     return ""
 
 
 def detect_tipo(order: dict, billing_info: dict) -> str:
-    # 1. Señal más directa: cust_type de ML
     cust_type = (safe_get(billing_info, "attributes", "cust_type", default="") or "").upper()
     if cust_type == "BU":
         return "Factura"
     if cust_type == "CO":
         return "Boleta"
-
-    # 2. Descripción del tipo de contribuyente
-    taxpayer_desc = (
-        safe_get(billing_info, "taxes", "taxpayer_type", "description", default="") or ""
-    ).strip().lower()
-    if taxpayer_desc and any(x in taxpayer_desc for x in [
-        "responsable", "empresa", "negocio", "iva", "juridica"
-    ]):
+    taxpayer_desc = (safe_get(billing_info, "taxes", "taxpayer_type", "description", default="") or "").strip().lower()
+    if taxpayer_desc and any(x in taxpayer_desc for x in ["responsable", "empresa", "negocio", "iva", "juridica"]):
         return "Factura"
-
-    # 3. Tiene giro/actividad economica — señal mas confiable de empresa
     if extract_activity(billing_info, order):
         return "Factura"
-
-    # 4. Tiene razon social explicita en campos de empresa
     for key in ("business_name", "company_name", "razon_social", "social_reason", "legal_name"):
         val = billing_info.get(key)
         if isinstance(val, str) and val.strip():
             return "Factura"
-
-    # 5. Nombre contiene palabras clave de empresa (SPA, LTDA, etc)
     nombre = extract_name(billing_info, order) or ""
     nombre_upper = nombre.upper()
-    empresa_keywords = [
-        " SPA", " LTDA", "S.A.", " SA ", "LIMITADA", "EIRL", " INC",
-        " CORP", "COMERCIAL ", "CONSTRUCTORA", "CONSULTORA",
-        "INVERSIONES", "HOLDING", "SOCIEDAD ", " CIA", " CIA."
-    ]
+    empresa_keywords = [" SPA", " LTDA", "S.A.", " SA ", "LIMITADA", "EIRL", " INC",
+                        " CORP", "COMERCIAL ", "CONSTRUCTORA", "CONSULTORA",
+                        "INVERSIONES", "HOLDING", "SOCIEDAD ", " CIA", " CIA."]
     if any(kw in nombre_upper for kw in empresa_keywords):
         return "Factura"
-
     return "Boleta"
 
 
-def summarize_order_items(order: dict) -> tuple[list[str], int, float]:
+def summarize_order_items(order: dict) -> tuple:
     items_summary = []
     item_count = 0
     total_bruto = 0.0
-
     for item in order.get("order_items", []):
         qty = float(item.get("quantity", 0) or 0)
         title = safe_get(item, "item", "title", default="Producto ML")
         unit_price = float(item.get("unit_price", 0) or 0)
         subtotal = qty * unit_price
-
         item_count += int(qty)
         total_bruto += subtotal
         items_summary.append(f"{title} x{int(qty)}")
-
     return items_summary, item_count, round(total_bruto, 2)
 
 
@@ -823,21 +683,22 @@ def refresh_ml_token() -> bool:
             os.environ["ML_ACCESS_TOKEN"] = data["access_token"]
         if data.get("refresh_token"):
             os.environ["ML_REFRESH_TOKEN"] = data["refresh_token"]
-        logger.info("✅ Token ML renovado")
+        logger.info("Token ML renovado")
         return True
     except Exception as e:
-        logger.error(f"❌ Error renovando token ML: {e}")
+        logger.error(f"Error renovando token ML: {e}")
         return False
 
 
 def schedule_token_refresh():
     while True:
         time.sleep(TOKEN_REFRESH_INTERVAL)
-        logger.info("⏰ Renovación programada del token ML...")
+        logger.info("Renovacion programada del token ML...")
         refresh_ml_token()
 
 
-_consecutive_429 = 0  # contador global de 429 consecutivos
+_consecutive_429 = 0
+
 
 def ml_get(url: str) -> dict:
     global _consecutive_429
@@ -847,29 +708,23 @@ def ml_get(url: str) -> dict:
         except requests.RequestException as e:
             logger.error(f"Error de red en {url}: {e}")
             raise
-
         if res.status_code == 401:
             logger.warning(f"401 en {url}, renovando token...")
             if not refresh_ml_token():
                 raise Exception("Token ML invalido y no se pudo renovar")
             continue
-
         if res.status_code == 429:
             _consecutive_429 += 1
-            # Backoff exponencial basado en 429 consecutivos
             wait = min(5 * (attempt + 1) + (_consecutive_429 * 2), 60)
             logger.warning(f"429 en {url}, reintento en {wait}s (consecutivos: {_consecutive_429})")
             time.sleep(wait)
             continue
-
         if res.status_code == 404:
             _consecutive_429 = 0
             return {}
-
         res.raise_for_status()
-        _consecutive_429 = 0  # reset al tener exito
+        _consecutive_429 = 0
         return res.json()
-
     raise Exception(f"ML devolvio demasiados errores para {url}")
 
 
@@ -878,7 +733,6 @@ def get_ml_order(order_id: str) -> dict:
 
 
 def get_ml_shipment(shipping_id) -> dict:
-    """Obtiene datos del envio incluyendo logistic_type."""
     if not shipping_id:
         return {}
     try:
@@ -888,12 +742,6 @@ def get_ml_shipment(shipping_id) -> dict:
 
 
 def extract_logistic_type(order: dict) -> str:
-    """Extrae el tipo de logistica desde el shipment de ML.
-    Logica confirmada con datos reales:
-    - sender_address.types contiene 'self_service_partner' -> Flex
-    - sender_address.types contiene 'milkrun' -> Colecta
-    - logistic_type == 'fulfillment' -> Full
-    """
     shipping = order.get("shipping") or {}
     shipping_id = shipping.get("id")
     if not shipping_id:
@@ -901,30 +749,22 @@ def extract_logistic_type(order: dict) -> str:
     shipment = get_ml_shipment(shipping_id)
     if not shipment:
         return ""
-
     logistic_type = shipment.get("logistic_type", "")
-
     if logistic_type == "fulfillment":
         return "Full"
-
     sender_types = (shipment.get("sender_address") or {}).get("types") or []
-
     if "self_service_partner" in sender_types:
         return "Flex"
-
     if "milkrun" in sender_types or logistic_type == "cross_docking":
         return "Colecta"
-
     return logistic_type or ""
 
 
 def get_ml_pack(pack_id: str) -> dict:
-    """Retorna todas las órdenes de un pack."""
     return ml_get(f"https://api.mercadolibre.com/packs/{pack_id}")
 
 
 def get_venta_by_pack(pack_id: str) -> Optional[dict]:
-    """Busca una venta existente por pack_id."""
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM ventas WHERE pack_id = %s LIMIT 1", (str(pack_id),))
@@ -933,7 +773,6 @@ def get_venta_by_pack(pack_id: str) -> Optional[dict]:
 
 
 def merge_order_items(orders: list) -> list:
-    """Consolida los items de múltiples órdenes en una sola lista."""
     all_items = []
     for order in orders:
         all_items.extend(order.get("order_items", []))
@@ -945,12 +784,12 @@ def get_ml_billing_raw(order_id: str) -> dict:
 
 
 def get_ml_billing_raw_safe(order_id: str) -> dict:
-    """Obtiene billing_info con reintento automatico si viene vacio."""
-    billing = get_ml_billing_raw_safe(order_id)
+    """Obtiene billing_info con reintento automatico si viene vacio (ej: tras renovacion de token)."""
+    billing = get_ml_billing_raw(order_id)
     if not billing or billing == {}:
         logger.warning(f"[{order_id}] billing_info vacio, reintentando en 3s...")
         time.sleep(3)
-        billing = get_ml_billing_raw_safe(order_id)
+        billing = get_ml_billing_raw(order_id)
     if not billing or billing == {}:
         logger.warning(f"[{order_id}] billing_info sigue vacio tras reintento")
     return billing
@@ -985,12 +824,12 @@ def odoo_exec(ctx: OdooCtx, model: str, method: str, args: list, kwargs: dict = 
     return ctx.models.execute_kw(ctx.db, ctx.uid, ctx.password, model, method, args, kwargs or {})
 
 
-def get_partner_fields(ctx: OdooCtx) -> set[str]:
+def get_partner_fields(ctx: OdooCtx) -> set:
     fields = odoo_exec(ctx, "res.partner", "fields_get", [], {"attributes": ["string"]})
     return set(fields.keys())
 
 
-def get_move_fields(ctx: OdooCtx) -> set[str]:
+def get_move_fields(ctx: OdooCtx) -> set:
     fields = odoo_exec(ctx, "account.move", "fields_get", [], {"attributes": ["string"]})
     return set(fields.keys())
 
@@ -1012,124 +851,69 @@ def get_rut_id_type(ctx: OdooCtx) -> Optional[int]:
 
 
 def get_tax_19(ctx: OdooCtx) -> Optional[int]:
-    ids = odoo_exec(
-        ctx,
-        "account.tax",
-        "search",
-        [[["type_tax_use", "=", "sale"], ["amount", "=", 19], ["active", "=", True]]],
-        {"limit": 1},
-    )
+    ids = odoo_exec(ctx, "account.tax", "search",
+        [[["type_tax_use", "=", "sale"], ["amount", "=", 19], ["active", "=", True]]], {"limit": 1})
     return ids[0] if ids else None
 
 
 def get_activity_field_name(ctx: OdooCtx) -> Optional[str]:
     fields = get_partner_fields(ctx)
-    for candidate in (
-        "l10n_cl_activity_description",
-        "activity_description",
-        "x_studio_giro",
-        "x_giro",
-        "giro",
-    ):
+    for candidate in ("l10n_cl_activity_description", "activity_description", "x_studio_giro", "x_giro", "giro"):
         if candidate in fields:
             return candidate
     return None
 
 
 def rut_con_guion(rut_norm: str) -> str:
-    """Convierte RUT normalizado a formato con guion: 123456789 → 12345678-9"""
     if not rut_norm or len(rut_norm) < 2:
         return rut_norm
     return rut_norm[:-1] + "-" + rut_norm[-1]
 
 
 def find_partner_by_rut(ctx: OdooCtx, rut: str) -> Optional[int]:
-    """
-    Busca partner por RUT en Odoo.
-    Los RUT en Odoo siempre tienen guion (ej: 12345678-9),
-    por lo que normalizamos el RUT entrante y buscamos con guion.
-    """
     rut_norm = normalize_rut(rut)
     if not rut_norm:
         return None
-
     rut_odoo = rut_con_guion(rut_norm)
-    ids = odoo_exec(
-        ctx,
-        "res.partner",
-        "search",
-        [[["vat", "=", rut_odoo]]],
-        {"limit": 1},
-    )
+    ids = odoo_exec(ctx, "res.partner", "search", [[["vat", "=", rut_odoo]]], {"limit": 1})
     return ids[0] if ids else None
 
 
 def find_partner_by_ml_order(ctx: OdooCtx, order_id: str) -> Optional[int]:
-    ids = odoo_exec(
-        ctx,
-        "res.partner",
-        "search",
-        [[["comment", "ilike", f"ML_ORDER:{order_id}"]]],
-        {"limit": 1},
-    )
+    ids = odoo_exec(ctx, "res.partner", "search",
+        [[["comment", "ilike", f"ML_ORDER:{order_id}"]]], {"limit": 1})
     return ids[0] if ids else None
 
 
 def get_state_id(ctx: OdooCtx, region_name: str) -> Optional[int]:
-    """Busca el state_id de Odoo por nombre de región chilena."""
     if not region_name:
         return None
     ids = odoo_exec(ctx, "res.country.state", "search",
-        [[["name", "ilike", region_name], ["country_id.code", "=", "CL"]]],
-        {"limit": 1})
+        [[["name", "ilike", region_name], ["country_id.code", "=", "CL"]]], {"limit": 1})
     return ids[0] if ids else None
 
 
-def upsert_partner(
-    ctx: OdooCtx,
-    order_id: str,
-    nombre: str,
-    rut: str,
-    email: str,
-    giro: str,
-    direccion: str,
-    es_empresa: bool,
-    tipo: str,
-    ciudad: str = "",
-    region: str = "",
-) -> int:
+def upsert_partner(ctx, order_id, nombre, rut, email, giro, direccion, es_empresa, tipo, ciudad="", region="") -> int:
     partner_fields = get_partner_fields(ctx)
     activity_field = get_activity_field_name(ctx)
     chile_id = get_chile_country_id(ctx)
     rut_type_id = get_rut_id_type(ctx)
-
     taxpayer_type = "1" if es_empresa else "4"
-
     rut_odoo = rut_con_guion(normalize_rut(rut)) if rut else ""
     partner_id = find_partner_by_rut(ctx, rut) or find_partner_by_ml_order(ctx, order_id)
-    logger.info(f"upsert_partner: rut_odoo='{rut_odoo}' → partner_id={'encontrado:' + str(partner_id) if partner_id else 'no encontrado → se creará nuevo'}")
-
+    logger.info(f"upsert_partner: rut_odoo='{rut_odoo}' -> partner_id={'encontrado:' + str(partner_id) if partner_id else 'no encontrado'}")
     giro_a_usar = giro.strip()
     if tipo == "Boleta" and not giro_a_usar:
         giro_a_usar = DEFAULT_BOLETA_ACTIVITY
-
-    vals = {
-        "name": nombre,
-        "email": email,
-        "comment": f"ML_ORDER:{order_id}",
-    }
-
+    vals = {"name": nombre, "email": email, "comment": f"ML_ORDER:{order_id}"}
     if rut:
-        # Odoo Chile almacena RUT con guion — normalizar al guardar
         vals["vat"] = rut_con_guion(rut)
     if "l10n_cl_dte_email" in partner_fields:
         vals["l10n_cl_dte_email"] = email
     if direccion and "street" in partner_fields:
         vals["street"] = direccion
-    # Ciudad/comuna → campo "city" en Odoo
     if ciudad and "city" in partner_fields:
         vals["city"] = ciudad
-    # Región → state_id en Odoo
     if region and "state_id" in partner_fields:
         state_id = get_state_id(ctx, region)
         if state_id:
@@ -1144,59 +928,40 @@ def upsert_partner(
         vals["l10n_cl_sii_taxpayer_type"] = taxpayer_type
     if rut and rut_type_id and "l10n_latam_identification_type_id" in partner_fields:
         vals["l10n_latam_identification_type_id"] = rut_type_id
-
     if activity_field:
         if tipo == "Factura":
             if giro_a_usar:
                 vals[activity_field] = giro_a_usar
         else:
             vals[activity_field] = giro_a_usar or DEFAULT_BOLETA_ACTIVITY
-
     if partner_id:
         odoo_exec(ctx, "res.partner", "write", [[partner_id], vals])
-        logger.info(f"Partner actualizado: id={partner_id} ciudad={ciudad} region={region}")
+        logger.info(f"Partner actualizado: id={partner_id}")
         return partner_id
-
     partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
-    logger.info(f"Partner creado: id={partner_id} empresa={es_empresa} ciudad={ciudad}")
+    logger.info(f"Partner creado: id={partner_id} empresa={es_empresa}")
     return partner_id
 
 
 # =========================
-# CREACIÓN DOCUMENTO ODOO
+# CREACION DOCUMENTO ODOO
 # =========================
 
 def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
-    ids = odoo_exec(
-        ctx,
-        "account.move",
-        "search",
-        [[["ref", "=", str(order_id)], ["state", "in", ["draft", "posted", "cancel"]]]],
-        {"limit": 1},
-    )
+    ids = odoo_exec(ctx, "account.move", "search",
+        [[["ref", "=", str(order_id)], ["state", "in", ["draft", "posted", "cancel"]]]], {"limit": 1})
     return ids[0] if ids else None
 
 
-def create_document(
-    order: dict,
-    billing_raw: dict,
-    tipo: str,
-    email: str,
-    giro: str,
-    cliente_override: Optional[str] = None,
-    rut_override: Optional[str] = None,
-    direccion_override: Optional[str] = None,
-    ciudad_override: Optional[str] = None,
-    region_override: Optional[str] = None,
-) -> tuple[int, int]:
+def create_document(order, billing_raw, tipo, email, giro,
+                    cliente_override=None, rut_override=None, direccion_override=None,
+                    ciudad_override=None, region_override=None) -> tuple:
     ctx = odoo_connect()
     order_id = str(order["id"])
-
     existing = find_existing_move(ctx, order_id)
     if existing:
         logger.info(f"[{order_id}] Documento ya existe: move_id={existing}")
         return existing, 0
-
     billing_info = get_billing_info(billing_raw)
     rut = normalize_rut(rut_override) if rut_override else extract_rut(billing_info)
     nombre = (cliente_override or extract_name(billing_info, order) or "Cliente ML").strip()
@@ -1206,40 +971,23 @@ def create_document(
     email = (email or ML_DEFAULT_EMAIL).strip()
     giro = (giro or "").strip()
     es_empresa = tipo == "Factura"
-
     if tipo == "Factura" and (not nombre or not rut or not direccion or not giro):
-        raise Exception("Para Factura se requiere razón social, RUT, dirección y giro")
-
+        raise Exception("Para Factura se requiere razon social, RUT, direccion y giro")
     if tipo == "Boleta" and not giro:
         giro = DEFAULT_BOLETA_ACTIVITY
-
-    partner_id = upsert_partner(
-        ctx=ctx,
-        order_id=order_id,
-        nombre=nombre,
-        rut=rut,
-        email=email,
-        giro=giro,
-        direccion=direccion,
-        es_empresa=es_empresa,
-        tipo=tipo,
-        ciudad=ciudad,
-        region=region,
-    )
-
+    partner_id = upsert_partner(ctx=ctx, order_id=order_id, nombre=nombre, rut=rut,
+                                email=email, giro=giro, direccion=direccion,
+                                es_empresa=es_empresa, tipo=tipo, ciudad=ciudad, region=region)
     journal_id = get_journal(ctx, tipo)
     if not journal_id:
-        raise Exception(f"No se encontró diario Odoo para {tipo}")
-
+        raise Exception(f"No se encontro diario Odoo para {tipo}")
     doc_type_id = ODOO_DOC_TYPE_FACTURA_ID if tipo == "Factura" else ODOO_DOC_TYPE_BOLETA_ID
     tax_id = get_tax_19(ctx)
-
     lines = []
     for item in order.get("order_items", []):
         qty = float(item.get("quantity", 0) or 0)
         unit_price_gross = float(item.get("unit_price", 0) or 0)
         price = round(unit_price_gross / IVA_RATE, 2)
-
         line_vals = {
             "name": safe_get(item, "item", "title", default="Producto ML"),
             "quantity": qty,
@@ -1248,10 +996,8 @@ def create_document(
         if tax_id:
             line_vals["tax_ids"] = [(6, 0, [tax_id])]
         lines.append((0, 0, line_vals))
-
     if not lines:
-        raise Exception("La orden no tiene líneas")
-
+        raise Exception("La orden no tiene lineas")
     move_vals = {
         "move_type": "out_invoice",
         "partner_id": partner_id,
@@ -1263,32 +1009,29 @@ def create_document(
         "narration": ODOO_STANDARD_NARRATION,
         "journal_id": journal_id,
     }
-
     move_fields = get_move_fields(ctx)
     move_vals = {k: v for k, v in move_vals.items() if k in move_fields}
-
     move_id = odoo_exec(ctx, "account.move", "create", [move_vals])
     odoo_exec(ctx, "account.move", "action_post", [[move_id]])
-    logger.info(f"[{order_id}] ✅ Documento creado: move_id={move_id} tipo={tipo}")
+    logger.info(f"[{order_id}] Documento creado: move_id={move_id} tipo={tipo}")
     return move_id, partner_id
 
 
 # =========================
-# PROCESAMIENTO WEBHOOK
+# PROCESAMIENTO WEBHOOK ML
 # =========================
 
 ML_ESTADO_ENVIO = {
     "payment_required": "Pendiente de pago",
     "payment_in_process": "Pago en proceso",
-    "paid":              "Pagado",
-    "ready_to_ship":     "Listo para envio",
-    "shipped":           "En camino",
-    "delivered":         "Entregado",
-    "cancelled":         "Cancelado",
-    "invalid":           "Invalido",
+    "paid": "Pagado",
+    "ready_to_ship": "Listo para envio",
+    "shipped": "En camino",
+    "delivered": "Entregado",
+    "cancelled": "Cancelado",
+    "invalid": "Invalido",
 }
 
-# Estados que se consideran "pagados" para ingreso al sistema
 ML_ESTADOS_VALIDOS = {"paid", "ready_to_ship", "shipped", "delivered"}
 
 
@@ -1298,45 +1041,30 @@ def process_webhook_order(order_id: str):
         if not order:
             logger.warning(f"[{order_id}] Orden no encontrada en ML")
             return
-
         ml_status = order.get("status", "")
         estado_envio = ML_ESTADO_ENVIO.get(ml_status, ml_status)
         pack_id = str(order.get("pack_id") or "")
-
-        # --- CASO CON PACK: consolidar todas las órdenes del pack ---
         if pack_id:
-            # Verificar si el pack ya existe en bandeja
             existing_pack = get_venta_by_pack(pack_id)
             if existing_pack:
                 update_venta(existing_pack["id"], estado_envio=estado_envio)
-                logger.info(f"[pack:{pack_id}] Estado envío actualizado: {estado_envio}")
+                logger.info(f"[pack:{pack_id}] Estado envio actualizado: {estado_envio}")
                 return
-
-            # Solo crear si está en estado válido (pagado o posterior)
             if ml_status not in ML_ESTADOS_VALIDOS:
-                logger.info(f"[pack:{pack_id}] Estado no valido para facturar ({ml_status}), ignorado")
+                logger.info(f"[pack:{pack_id}] Estado no valido ({ml_status}), ignorado")
                 return
-
-            # Obtener todas las órdenes del pack
             pack_data = get_ml_pack(pack_id)
             pack_order_ids = [str(o["id"]) for o in (pack_data.get("orders") or [])]
-
             if not pack_order_ids:
                 pack_order_ids = [order_id]
-
-            # Consolidar items de todas las órdenes
             all_orders = []
             for oid_pack in pack_order_ids:
                 o = get_ml_order(oid_pack) if oid_pack != order_id else order
                 if o:
                     all_orders.append(o)
-
             all_items = merge_order_items(all_orders)
-
-            # Usar el billing de la orden original
             billing_raw = get_ml_billing_raw_safe(order_id)
             billing_info = get_billing_info(billing_raw)
-
             rut = extract_rut(billing_info)
             cliente = extract_name(billing_info, order)
             giro = extract_activity(billing_info, order)
@@ -1345,37 +1073,23 @@ def process_webhook_order(order_id: str):
             region = extract_region_from_billing(billing_info)
             email = extract_email(billing_info, order)
             tipo_sugerido = detect_tipo(order, billing_info)
-
-            # Si faltan datos clave, completar desde shipment
-            if not rut or not cliente or cliente == "Cliente ML" or not direccion:
-                rut, cliente, direccion, ciudad, region = enrich_from_shipment(
-                    order, rut, cliente, direccion, ciudad, region
-                )
-
             if tipo_sugerido == "Boleta" and not giro:
                 giro = DEFAULT_BOLETA_ACTIVITY
-
-            # Guardar con pack_id como ID y todos los items consolidados
             save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro,
                       direccion, email, ciudad, region,
                       pack_id=pack_id, order_items_override=all_items)
-            logger.info(f"[pack:{pack_id}] ✅ Pack consolidado: {len(all_orders)} órdenes, {len(all_items)} items")
+            logger.info(f"[pack:{pack_id}] Pack consolidado: {len(all_orders)} ordenes, {len(all_items)} items")
             return
-
-        # --- CASO SIN PACK: orden simple ---
         existing = get_venta(order_id)
         if existing:
             update_venta(order_id, estado_envio=estado_envio)
-            logger.info(f"[{order_id}] Estado envío actualizado: {estado_envio}")
+            logger.info(f"[{order_id}] Estado envio actualizado: {estado_envio}")
             return
-
         if ml_status not in ML_ESTADOS_VALIDOS:
-            logger.info(f"[{order_id}] Estado no valido para facturar ({ml_status}), ignorado")
+            logger.info(f"[{order_id}] Estado no valido ({ml_status}), ignorado")
             return
-
         billing_raw = get_ml_billing_raw_safe(order_id)
         billing_info = get_billing_info(billing_raw)
-
         rut = extract_rut(billing_info)
         cliente = extract_name(billing_info, order)
         giro = extract_activity(billing_info, order)
@@ -1384,33 +1098,24 @@ def process_webhook_order(order_id: str):
         region = extract_region_from_billing(billing_info)
         email = extract_email(billing_info, order)
         tipo_sugerido = detect_tipo(order, billing_info)
-
-        # Si faltan datos clave, completar desde shipment
         if not rut or not cliente or cliente == "Cliente ML" or not direccion:
             rut, cliente, direccion, ciudad, region = enrich_from_shipment(
                 order, rut, cliente, direccion, ciudad, region
             )
-            if not rut or not direccion:
-                logger.warning(f"[{order_id}] Datos incompletos tras enrich: rut={rut} direccion={direccion}")
 
         if tipo_sugerido == "Boleta" and not giro:
             giro = DEFAULT_BOLETA_ACTIVITY
-
-        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro,
-                  direccion, email, ciudad, region)
-        logger.info(f"[{order_id}] ✅ Guardada: {tipo_sugerido} estado={estado_envio}")
+        save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email, ciudad, region)
+        logger.info(f"[{order_id}] Guardada: {tipo_sugerido} estado={estado_envio}")
     except Exception as e:
         logger.error(f"[{order_id}] Error procesando webhook: {e}", exc_info=True)
 
 
 def reprocesar_venta_desde_ml(order_id: str):
     venta = get_venta(order_id)
-
     order = get_ml_order(order_id)
-    first_real_order_id = order_id  # ID de orden real para billing
-
+    first_real_order_id = order_id
     if not order:
-        # Es un pack_id — buscar ordenes reales
         pack_data = get_ml_pack(order_id)
         pack_order_ids = [str(o["id"]) for o in (pack_data.get("orders") or [])]
         if not pack_order_ids:
@@ -1441,11 +1146,8 @@ def reprocesar_venta_desde_ml(order_id: str):
         order = {**order, "order_items": all_items}
     else:
         first_real_order_id = str(order.get("id", order_id))
-
-    # Billing siempre con ID de orden real (no pack_id)
     billing_raw = get_ml_billing_raw_safe(first_real_order_id)
     billing_info = get_billing_info(billing_raw)
-
     rut = extract_rut(billing_info)
     cliente = extract_name(billing_info, order)
     giro = extract_activity(billing_info, order)
@@ -1454,44 +1156,122 @@ def reprocesar_venta_desde_ml(order_id: str):
     region = extract_region_from_billing(billing_info)
     email = extract_email(billing_info, order)
     tipo_sugerido = detect_tipo(order, billing_info)
-
-    # Si faltan datos clave, completar desde shipment
+    if tipo_sugerido == "Boleta" and not giro:
+        giro = DEFAULT_BOLETA_ACTIVITY
     if not rut or not cliente or cliente == "Cliente ML" or not direccion:
         rut, cliente, direccion, ciudad, region = enrich_from_shipment(
             order, rut, cliente, direccion, ciudad, region
         )
 
-    if tipo_sugerido == "Boleta" and not giro:
-        giro = DEFAULT_BOLETA_ACTIVITY
-
     save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email, ciudad, region,
                forzar_actualizacion=True)
-
     items, item_count, total_bruto = summarize_order_items(order)
-
     return {
-        "id": str(order_id),
-        "cliente": cliente,
-        "rut": rut,
-        "email": email,
-        "giro": giro,
-        "direccion": direccion,
-        "tipo_sugerido": tipo_sugerido,
-        "items": items,
-        "item_count": item_count,
-        "total_bruto": total_bruto,
+        "id": str(order_id), "cliente": cliente, "rut": rut, "email": email,
+        "giro": giro, "direccion": direccion, "tipo_sugerido": tipo_sugerido,
+        "items": items, "item_count": item_count, "total_bruto": total_bruto,
     }
 
 
 # =========================
-# STARTUP
-# =========================
-
-# =========================
-# COLA DE WEBHOOKS
+# COLA WEBHOOKS ML
 # =========================
 
 webhook_queue = queue_module.Queue()
+
+
+def webhook_worker():
+    global _consecutive_429
+    while True:
+        try:
+            order_id = webhook_queue.get(timeout=5)
+            try:
+                process_webhook_order(order_id)
+                base_delay = 3
+                extra = min(_consecutive_429 * 2, 30)
+                time.sleep(base_delay + extra)
+            except Exception as e:
+                logger.error(f"[{order_id}] Error en webhook worker: {e}")
+                if "demasiados errores" in str(e) or "429" in str(e):
+                    time.sleep(30)
+                else:
+                    time.sleep(3)
+            finally:
+                webhook_queue.task_done()
+        except queue_module.Empty:
+            continue
+
+
+def get_ml_seller_id() -> Optional[str]:
+    try:
+        data = ml_get("https://api.mercadolibre.com/users/me")
+        return str(data.get("id", ""))
+    except Exception as e:
+        logger.error(f"No se pudo obtener seller_id: {e}")
+        return None
+
+
+def get_ml_ordenes_recientes(seller_id: str, total: int = 200) -> list:
+    estados = ["paid"]
+    todas = []
+    por_estado = total // len(estados) + 50
+    for estado in estados:
+        offset = 0
+        limit = 50
+        while len([o for o in todas if o.get("status") == estado]) < por_estado:
+            url = (f"https://api.mercadolibre.com/orders/search"
+                   f"?seller={seller_id}&order.status={estado}&sort=date_desc"
+                   f"&limit={limit}&offset={offset}")
+            try:
+                data = ml_get(url)
+            except Exception as e:
+                logger.warning(f"Error paginando ordenes ML estado={estado} offset={offset}: {e}")
+                break
+            resultados = data.get("results") or []
+            if not resultados:
+                break
+            todas.extend(resultados)
+            offset += limit
+            if len(resultados) < limit:
+                break
+            time.sleep(2)
+    visto = set()
+    unicas = []
+    for o in todas:
+        oid = str(o.get("id", ""))
+        if oid and oid not in visto:
+            visto.add(oid)
+            unicas.append(o)
+    unicas.sort(key=lambda o: o.get("date_created", ""), reverse=True)
+    return unicas[:total]
+
+
+def reconciliar_ordenes_ml():
+    while True:
+        time.sleep(15 * 60)
+        try:
+            seller_id = get_ml_seller_id()
+            if not seller_id:
+                continue
+            ordenes_ml = get_ml_ordenes_recientes(seller_id, total=200)
+            if not ordenes_ml:
+                continue
+            ids_ml = [str(o["id"]) for o in ordenes_ml]
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_ml,))
+                    ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
+            faltantes = [oid for oid in ids_ml if oid not in ids_en_bd]
+            if faltantes:
+                logger.warning(f"Reconciliacion auto ML: {len(faltantes)} faltantes, encolando hasta 10")
+                for oid in faltantes[:10]:
+                    if oid not in list(webhook_queue.queue):
+                        webhook_queue.put(oid)
+                    time.sleep(0.5)
+            else:
+                logger.info(f"Reconciliacion ML OK: {len(ordenes_ml)} ordenes todas en BD")
+        except Exception as e:
+            logger.error(f"Error en reconciliacion ML: {e}")
 
 
 # =========================
@@ -1597,10 +1377,12 @@ def wc_get_meta(order: dict, key: str) -> str:
 
 
 def wc_extract_tipodoc(order: dict) -> str:
+    # Si llenó giro o RUT empresa -> Factura sin importar billing_tipodoc
     giro = wc_get_meta(order, WC_FIELD_GIRO).strip()
     rut_empresa = wc_get_meta(order, WC_FIELD_RUT_EMPRESA).strip()
     if giro or rut_empresa:
         return "Factura"
+    # Fallback: revisar el campo tipodoc explícito
     tipodoc_raw = wc_get_meta(order, WC_FIELD_TIPODOC).strip().lower()
     if "factura" in tipodoc_raw:
         return "Factura"
@@ -1623,7 +1405,8 @@ def wc_extract_nombre(order: dict, tipo: str) -> str:
             return company
     first = (billing.get("first_name") or "").strip()
     last  = (billing.get("last_name") or "").strip()
-    return f"{first} {last}".strip() or "Cliente WC"
+    full  = f"{first} {last}".strip()
+    return full or "Cliente WC"
 
 
 def wc_extract_email(order: dict) -> str:
@@ -1660,10 +1443,12 @@ def wc_extract_region(order: dict) -> str:
 def wc_build_order_items(order: dict) -> list:
     items = []
     for li in order.get("line_items") or []:
+        qty        = float(li.get("quantity") or 1)
+        unit_price = float(li.get("price") or 0)
         items.append({
             "item":       {"title": li.get("name") or "Producto WC"},
-            "quantity":   float(li.get("quantity") or 1),
-            "unit_price": float(li.get("price") or 0),
+            "quantity":   qty,
+            "unit_price": unit_price,
         })
     return items
 
@@ -1706,17 +1491,19 @@ def process_wc_order(order_id: str):
         ciudad    = wc_extract_ciudad(wc_order)
         region    = wc_extract_region(wc_order)
         fake_order   = wc_build_fake_order(wc_order)
+        billing_fake = {}
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM ventas WHERE id = %s", (oid_str,))
                 if cur.fetchone():
                     return
                 cur.execute(
-                    """INSERT INTO ventas
+                    """
+                    INSERT INTO ventas
                         (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region,
                          tipo_sugerido, estado, estado_envio, order_json, billing_json, fuente)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, 'woocommerce')
-                       ON CONFLICT (id) DO NOTHING
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, 'woocommerce')
+                    ON CONFLICT (id) DO NOTHING
                     """,
                     (
                         oid_str, None,
@@ -1729,7 +1516,7 @@ def process_wc_order(order_id: str):
                         (region or "").strip(),
                         tipo, wc_status,
                         json.dumps(fake_order, ensure_ascii=False),
-                        json.dumps({}, ensure_ascii=False),
+                        json.dumps(billing_fake, ensure_ascii=False),
                     ),
                 )
             conn.commit()
@@ -1772,136 +1559,9 @@ def verify_wc_webhook(body_bytes: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def webhook_worker():
-    """Worker que procesa webhooks de uno en uno con delay adaptativo."""
-    global _consecutive_429
-    while True:
-        try:
-            order_id = webhook_queue.get(timeout=5)
-            try:
-                process_webhook_order(order_id)
-                # Si hubo muchos 429 recientes, esperar más entre órdenes
-                base_delay = 3
-                extra = min(_consecutive_429 * 2, 30)
-                time.sleep(base_delay + extra)
-            except Exception as e:
-                logger.error(f"[{order_id}] Error en webhook worker: {e}")
-                # Si es por 429, esperar más antes de siguiente
-                if "demasiados errores" in str(e) or "429" in str(e):
-                    time.sleep(30)
-                else:
-                    time.sleep(3)
-            finally:
-                webhook_queue.task_done()
-        except queue_module.Empty:
-            continue
-
-
-def get_ml_seller_id() -> Optional[str]:
-    """Obtiene el seller_id del token actual."""
-    try:
-        data = ml_get("https://api.mercadolibre.com/users/me")
-        return str(data.get("id", ""))
-    except Exception as e:
-        logger.error(f"No se pudo obtener seller_id: {e}")
-        return None
-
-
-
-def get_ml_ordenes_recientes(seller_id: str, total: int = 200) -> list:
-    """Obtiene las ultimas N ordenes con estados validos para facturar, paginando de 50 en 50."""
-    # ML solo permite filtrar por un estado a la vez
-    estados = ["paid"]  # ML solo soporta "paid" en orders/search
-    todas = []
-    por_estado = total // len(estados) + 50  # pedir suficientes de cada estado
-
-    for estado in estados:
-        offset = 0
-        limit = 50
-        while len([o for o in todas if o.get("status") == estado]) < por_estado:
-            url = (
-                f"https://api.mercadolibre.com/orders/search"
-                f"?seller={seller_id}&order.status={estado}&sort=date_desc"
-                f"&limit={limit}&offset={offset}"
-            )
-            try:
-                data = ml_get(url)
-            except Exception as e:
-                logger.warning(f"Error paginando ordenes ML estado={estado} offset={offset}: {e}")
-                break
-            resultados = data.get("results") or []
-            if not resultados:
-                break
-            todas.extend(resultados)
-            offset += limit
-            if len(resultados) < limit:
-                break
-            time.sleep(2)  # respetar rate limit entre paginas
-
-    # Deduplicar por ID y ordenar por fecha desc
-    visto = set()
-    unicas = []
-    for o in todas:
-        oid = str(o.get("id", ""))
-        if oid and oid not in visto:
-            visto.add(oid)
-            unicas.append(o)
-
-    unicas.sort(key=lambda o: o.get("date_created", ""), reverse=True)
-    return unicas[:total]
-
-def reconciliar_ordenes_ml():
-    """
-    Consulta las últimas ordenes pagadas en ML y verifica que estén en la BD.
-    Si falta alguna, la encola para procesamiento.
-    Se ejecuta cada 15 minutos en background.
-    """
-    while True:
-        time.sleep(15 * 60)  # cada 15 minutos
-        try:
-            seller_id = get_ml_seller_id()
-            if not seller_id:
-                continue
-
-            # Consultar órdenes pagadas de las últimas 2 horas
-            from datetime import timezone
-            ahora = datetime.now(timezone.utc)
-            desde = ahora.replace(microsecond=0).isoformat().replace("+00:00", ".000Z")
-            # ML usa date_last_updated, buscamos las recientes
-            ordenes_ml = get_ml_ordenes_recientes(seller_id, total=200)
-
-            if not ordenes_ml:
-                continue
-
-            # Obtener IDs que ya están en la BD
-            ids_ml = [str(o["id"]) for o in ordenes_ml]
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    placeholders = ",".join(["%s"] * len(ids_ml))
-                    cur.execute(
-                        f"SELECT id FROM ventas WHERE id = ANY(%s::text[])",
-                        (ids_ml,)
-                    )
-                    ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
-
-            # Encontrar órdenes que no están en la BD
-            faltantes = [oid for oid in ids_ml if oid not in ids_en_bd]
-
-            if faltantes:
-                logger.warning(f"Reconciliacion auto: {len(faltantes)} faltantes, encolando hasta 10")
-                encoladas_auto = 0
-                for oid in faltantes[:10]:
-                    if oid not in list(webhook_queue.queue):
-                        webhook_queue.put(oid)
-                        encoladas_auto += 1
-                    time.sleep(0.5)
-                logger.info(f"Reconciliacion auto: {encoladas_auto} ordenes encoladas")
-            else:
-                logger.info(f"Reconciliacion OK: {len(ordenes_ml)} ordenes ML todas en BD")
-
-        except Exception as e:
-            logger.error(f"Error en reconciliacion: {e}")
-
+# =========================
+# STARTUP
+# =========================
 
 @app.on_event("startup")
 async def on_startup():
@@ -1927,30 +1587,119 @@ async def on_startup():
 # ENDPOINTS
 # =========================
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "lemulux-odoo"}
+
+
+@app.get("/health")
+def health():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+                row = cur.fetchone()
+        return {"status": "healthy", "db": bool(row and row.get("ok") == 1)}
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
+
+
+@app.get("/debug/shipping/{oid}")
+def debug_shipping(oid: str):
+    venta = get_venta(oid)
+    order_json = {}
+    if venta and venta.get("order_json"):
+        order_json = json.loads(venta["order_json"])
+    shipping = order_json.get("shipping") or {}
+    shipping_id = shipping.get("id")
+    shipment_data = {}
+    if shipping_id:
+        try:
+            shipment_data = ml_get(f"https://api.mercadolibre.com/shipments/{shipping_id}")
+        except Exception as e:
+            shipment_data = {"error": str(e)}
+    return {
+        "order_shipping_field": shipping,
+        "shipping_id": shipping_id,
+        "shipment_data": shipment_data,
+        "logistic_type_in_order": shipping.get("logistic_type"),
+        "logistic_type_in_shipment": (shipment_data.get("logistic_type") or
+                                       shipment_data.get("shipping_option", {}).get("shipping_method_id")),
+    }
+
+
+@app.get("/debug/direccion/{oid}")
+def debug_direccion(oid: str):
+    order = get_ml_order(oid)
+    billing_raw = get_ml_billing_raw_safe(oid)
+    billing_info = get_billing_info(billing_raw)
+    return {
+        "direccion_extraida": extract_direccion(order, billing_info, billing_raw),
+        "buyer_address": safe_get(order, "buyer", "address", default={}),
+        "buyer_address_details": safe_get(order, "buyer", "address_details", default={}),
+        "shipping_receiver_address": safe_get(order, "shipping", "receiver_address", default={}),
+        "billing_address": billing_info.get("address"),
+        "billing_additional_info": billing_info.get("additional_info"),
+        "top_candidates": sorted(
+            [s for s in list(dict.fromkeys(flatten_strings(order) + flatten_strings(billing_raw))) if looks_like_chilean_address(s)],
+            key=score_address_candidate, reverse=True
+        )[:20]
+    }
+
+
+@app.post("/ml/webhook")
+async def ml_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Body invalido"})
+    topic = body.get("topic", "")
+    resource = body.get("resource", "")
+    if topic != "orders_v2" or not resource:
+        return {"ok": True, "ignored": True}
+    order_id = resource.strip("/").split("/")[-1]
+    if not order_id:
+        return {"ok": True}
+    if order_id not in list(webhook_queue.queue):
+        webhook_queue.put(order_id)
+        logger.info(f"Webhook ML encolado: {order_id} (cola: {webhook_queue.qsize()})")
+    else:
+        logger.info(f"Webhook ML duplicado ignorado: {order_id}")
+    return {"ok": True, "order_id": order_id, "queued": webhook_queue.qsize()}
+
+
 @app.post("/wc/webhook")
 async def wc_webhook(request: Request):
     body_bytes = await request.body()
     signature  = request.headers.get("X-WC-Webhook-Signature", "")
     topic      = request.headers.get("X-WC-Webhook-Topic", "")
+
     if not verify_wc_webhook(body_bytes, signature):
         logger.warning(f"[WC] Firma HMAC invalida en webhook topic={topic}")
         return JSONResponse(status_code=401, content={"error": "Firma invalida"})
+
     if topic not in ("order.created", "order.updated", "order.status_changed"):
         return {"ok": True, "ignored": True, "topic": topic}
+
     try:
         body = json.loads(body_bytes)
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Body invalido"})
+
     order_id = str(body.get("id") or "")
     status   = str(body.get("status") or "")
+
     if not order_id:
         return {"ok": True}
+
     if status not in WC_ESTADOS_VALIDOS:
         logger.info(f"[WC:{order_id}] Estado {status} ignorado")
         return {"ok": True, "ignored": True, "status": status}
+
     if order_id not in list(wc_webhook_queue.queue):
         wc_webhook_queue.put(order_id)
         logger.info(f"[WC] Webhook encolado: order_id={order_id} status={status}")
+
     return {"ok": True, "order_id": order_id, "status": status, "queued": wc_webhook_queue.qsize()}
 
 
@@ -1991,100 +1740,11 @@ def wc_ingresar_manual(order_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "lemulux-odoo"}
-
-
-@app.get("/health")
-def health():
-    try:
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 AS ok")
-                row = cur.fetchone()
-        return {"status": "healthy", "db": bool(row and row.get("ok") == 1)}
-    except Exception as e:
-        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
-
-
-@app.get("/debug/shipping/{oid}")
-def debug_shipping(oid: str):
-    """Ver datos de shipping de una orden para diagnosticar tipo de envio."""
-    venta = get_venta(oid)
-    order_json = {}
-    if venta and venta.get("order_json"):
-        order_json = json.loads(venta["order_json"])
-    shipping = order_json.get("shipping") or {}
-    shipping_id = shipping.get("id")
-    shipment_data = {}
-    if shipping_id:
-        try:
-            shipment_data = ml_get(f"https://api.mercadolibre.com/shipments/{shipping_id}")
-        except Exception as e:
-            shipment_data = {"error": str(e)}
-    return {
-        "order_shipping_field": shipping,
-        "shipping_id": shipping_id,
-        "shipment_data": shipment_data,
-        "logistic_type_in_order": shipping.get("logistic_type"),
-        "logistic_type_in_shipment": (shipment_data.get("logistic_type") or
-                                       shipment_data.get("shipping_option", {}).get("shipping_method_id")),
-    }
-
-
-@app.get("/debug/direccion/{oid}")
-def debug_direccion(oid: str):
-    order = get_ml_order(oid)
-    billing_raw = get_ml_billing_raw(oid)
-    billing_info = get_billing_info(billing_raw)
-
-    return {
-        "direccion_extraida": extract_direccion(order, billing_info, billing_raw),
-        "buyer_address": safe_get(order, "buyer", "address", default={}),
-        "buyer_address_details": safe_get(order, "buyer", "address_details", default={}),
-        "shipping_receiver_address": safe_get(order, "shipping", "receiver_address", default={}),
-        "billing_address": billing_info.get("address"),
-        "billing_additional_info": billing_info.get("additional_info"),
-        "top_candidates": sorted(
-            [s for s in list(dict.fromkeys(flatten_strings(order) + flatten_strings(billing_raw))) if looks_like_chilean_address(s)],
-            key=score_address_candidate,
-            reverse=True
-        )[:20]
-    }
-
-
-@app.post("/ml/webhook")
-async def ml_webhook(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "Body invalido"})
-
-    topic = body.get("topic", "")
-    resource = body.get("resource", "")
-    if topic != "orders_v2" or not resource:
-        return {"ok": True, "ignored": True}
-
-    order_id = resource.strip("/").split("/")[-1]
-    if not order_id:
-        return {"ok": True}
-
-    # Deduplicar — no encolar si ya está en la cola
-    if order_id not in list(webhook_queue.queue):
-        webhook_queue.put(order_id)
-        logger.info(f"Webhook encolado: {order_id} (cola: {webhook_queue.qsize()})")
-    else:
-        logger.info(f"Webhook duplicado ignorado: {order_id}")
-    return {"ok": True, "order_id": order_id, "queued": webhook_queue.qsize()}
-
-
 @app.get("/ml/oauth/callback")
 async def oauth_callback(request: Request):
     code = request.query_params.get("code")
     if not code:
-        raise HTTPException(status_code=400, detail="No se recibió code")
-
+        raise HTTPException(status_code=400, detail="No se recibio code")
     payload = {
         "grant_type": "authorization_code",
         "client_id": get_env("ML_CLIENT_ID"),
@@ -2117,7 +1777,6 @@ def ventas(estado: Optional[str] = None):
             productos, cantidad_items, total_bruto = summarize_order_items(order)
         except Exception:
             productos, cantidad_items, total_bruto = [], 0, 0.0
-        # Usar tipo_envio_ml guardado en BD; si está vacío mostrar "-"
         tipo_envio = v.get("tipo_envio_ml") or "-"
         v.pop("order_json", None)
         v.pop("billing_json", None)
@@ -2131,7 +1790,6 @@ def ventas(estado: Optional[str] = None):
     return {"items": enriched}
 
 
-
 class VentaManualPayload(BaseModel):
     tipo: str = "Boleta"
     order_id: Optional[str] = None
@@ -2142,35 +1800,22 @@ class VentaManualPayload(BaseModel):
     ciudad: Optional[str] = ""
     region: Optional[str] = ""
     giro: Optional[str] = ""
-    productos: Optional[list] = []  # lista de strings descriptivos
+    productos: Optional[list] = []
     total_bruto: Optional[float] = 0.0
     autorizar: bool = False
 
 
 @app.post("/ventas/manual")
 def ingresar_venta_manual(payload: VentaManualPayload):
-    """Ingresa una venta manualmente sin pasar por ML."""
     try:
         rut_norm = normalize_rut(payload.rut)
         oid = payload.order_id or f"MANUAL-{int(datetime.now().timestamp())}"
         giro_final = payload.giro or (DEFAULT_BOLETA_ACTIVITY if payload.tipo == "Boleta" else "")
-
-        # Construir order_json simulado con los productos
         items = []
         for p in (payload.productos or []):
-            items.append({
-                "item": {"title": p},
-                "quantity": 1,
-                "unit_price": 0
-            })
-        order_fake = {
-            "id": oid,
-            "status": "paid",
-            "order_items": items,
-            "buyer": {"email": payload.email}
-        }
+            items.append({"item": {"title": p}, "quantity": 1, "unit_price": 0})
+        order_fake = {"id": oid, "status": "paid", "order_items": items, "buyer": {"email": payload.email}}
         billing_fake = {}
-
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM ventas WHERE id = %s", (str(oid),))
@@ -2179,46 +1824,32 @@ def ingresar_venta_manual(payload: VentaManualPayload):
                 cur.execute(
                     """INSERT INTO ventas
                         (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region,
-                         tipo_sugerido, estado, estado_envio, order_json, billing_json)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', 'paid', %s, %s)
+                         tipo_sugerido, estado, estado_envio, order_json, billing_json, fuente)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', 'paid', %s, %s, 'manual')
                     """,
                     (
-                        str(oid), None,
-                        payload.cliente.strip(),
-                        rut_norm,
-                        payload.email.strip(),
-                        giro_final,
-                        (payload.direccion or "").strip(),
-                        (payload.ciudad or "").strip(),
-                        (payload.region or "").strip(),
-                        payload.tipo,
+                        str(oid), None, payload.cliente.strip(), rut_norm,
+                        payload.email.strip(), giro_final,
+                        (payload.direccion or "").strip(), (payload.ciudad or "").strip(),
+                        (payload.region or "").strip(), payload.tipo,
                         json.dumps(order_fake, ensure_ascii=False),
                         json.dumps(billing_fake, ensure_ascii=False),
                     )
                 )
             conn.commit()
-
         logger.info(f"Venta manual ingresada: id={oid} cliente={payload.cliente} tipo={payload.tipo}")
-
         if payload.autorizar:
             move_id, partner_id = create_document(
-                order=order_fake,
-                billing_raw=billing_fake,
-                tipo=payload.tipo,
-                email=payload.email,
-                giro=giro_final,
-                cliente_override=payload.cliente,
-                rut_override=rut_norm,
-                direccion_override=payload.direccion,
-                ciudad_override=payload.ciudad,
+                order=order_fake, billing_raw=billing_fake, tipo=payload.tipo,
+                email=payload.email, giro=giro_final,
+                cliente_override=payload.cliente, rut_override=rut_norm,
+                direccion_override=payload.direccion, ciudad_override=payload.ciudad,
                 region_override=payload.region,
             )
             update_venta(str(oid), estado="enviado", move_id=move_id,
                         partner_id=partner_id, error=None, enviado_en=datetime.now())
             return {"ok": True, "id": oid, "move_id": move_id, "autorizado": True}
-
         return {"ok": True, "id": oid, "autorizado": False}
-
     except HTTPException:
         raise
     except Exception as e:
@@ -2226,22 +1857,15 @@ def ingresar_venta_manual(payload: VentaManualPayload):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
 @app.post("/ventas/actualizar-envio")
 def actualizar_tipo_envio():
-    """Actualiza tipo_envio_ml en todas las ventas consultando ML en tiempo real."""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                # Procesar todas, no solo las vacias - para corregir clasificaciones erroneas
-                cur.execute(
-                    "SELECT id, order_json FROM ventas WHERE estado != 'enviado' ORDER BY creado_en DESC LIMIT 100"
-                )
+                cur.execute("SELECT id, order_json FROM ventas WHERE estado != 'enviado' AND (fuente IS NULL OR fuente = 'mercadolibre') ORDER BY creado_en DESC LIMIT 100")
                 rows = cur.fetchall()
-
         if not rows:
             return {"ok": True, "actualizadas": 0, "mensaje": "No hay ventas para procesar"}
-
         def procesar_en_background():
             actualizadas = 0
             errores = 0
@@ -2256,88 +1880,58 @@ def actualizar_tipo_envio():
                         if tipo_envio:
                             with get_db() as conn2:
                                 with conn2.cursor() as cur2:
-                                    cur2.execute(
-                                        "UPDATE ventas SET tipo_envio_ml = %s WHERE id = %s",
-                                        (tipo_envio, oid)
-                                    )
+                                    cur2.execute("UPDATE ventas SET tipo_envio_ml = %s WHERE id = %s", (tipo_envio, oid))
                                 conn2.commit()
                             actualizadas += 1
-                            logger.info(f"[{oid}] tipo_envio actualizado: {tipo_envio}")
                         time.sleep(1)
                     except Exception as e:
                         logger.warning(f"Error actualizando envio {row['id']}: {e}")
                         errores += 1
                         time.sleep(3)
-                logger.info(f"Actualizacion envio: lote {i//lote+1} completado. Esperando cola...")
-                # Esperar a que la cola de webhooks baje antes del siguiente lote
                 wait = 0
                 while webhook_queue.qsize() > 5 and wait < 120:
                     time.sleep(5)
                     wait += 5
-            logger.info(f"Actualizacion tipo_envio completa: {actualizadas} OK, {errores} errores de {len(rows)}")
-
+            logger.info(f"Actualizacion tipo_envio: {actualizadas} OK, {errores} errores")
         t = threading.Thread(target=procesar_en_background, daemon=True)
         t.start()
-
-        return {
-            "ok": True,
-            "procesando": len(rows),
-            "mensaje": f"Actualizando tipo de envio en {len(rows)} ventas en background. Recarga el dashboard en ~2 minutos."
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"ok": True, "procesando": len(rows), "mensaje": f"Actualizando tipo de envio en {len(rows)} ventas en background."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ventas/reconciliar")
 def reconciliar_manual():
-    """Fuerza reconciliacion con ML. Encola todas las faltantes en background con delays."""
     try:
         seller_id = get_ml_seller_id()
         if not seller_id:
             raise HTTPException(status_code=500, detail="No se pudo obtener seller_id de ML")
-
         ordenes_ml = get_ml_ordenes_recientes(seller_id, total=200)
         ids_ml = [str(o["id"]) for o in ordenes_ml]
-
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_ml,))
                 ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
-
         faltantes = [oid for oid in ids_ml if oid not in ids_en_bd]
-
         if not faltantes:
             return {"ok": True, "ordenes_ml": len(ordenes_ml), "en_bd": len(ids_en_bd), "faltantes": 0, "encoladas": []}
-
-        # Lanzar en background para no bloquear el request
         def encolar_en_lotes(lista):
             lote = 10
             for i in range(0, len(lista), lote):
                 chunk = lista[i:i+lote]
-                encoladas_chunk = 0
                 for oid in chunk:
                     if oid not in list(webhook_queue.queue):
                         webhook_queue.put(oid)
-                        encoladas_chunk += 1
-                logger.info(f"Reconciliacion: encolado lote {i//lote+1} ({encoladas_chunk} ordenes). Cola: {webhook_queue.qsize()}")
-                # Esperar a que la cola baje antes del siguiente lote
                 wait = 0
                 while webhook_queue.qsize() > 5 and wait < 120:
                     time.sleep(5)
                     wait += 5
-
         t = threading.Thread(target=encolar_en_lotes, args=(faltantes,), daemon=True)
         t.start()
-
-        logger.info(f"Reconciliacion manual: {len(ordenes_ml)} ML, {len(faltantes)} faltantes, procesando en background")
         return {
-            "ok": True,
-            "ordenes_ml": len(ordenes_ml),
-            "en_bd": len(ids_en_bd),
+            "ok": True, "ordenes_ml": len(ordenes_ml), "en_bd": len(ids_en_bd),
             "faltantes": len(faltantes),
-            "mensaje": f"Procesando {len(faltantes)} ventas faltantes en background (lotes de 10). Apareceran progresivamente en el dashboard.",
+            "mensaje": f"Procesando {len(faltantes)} ventas faltantes en background.",
             "encoladas": faltantes[:5]
         }
     except HTTPException:
@@ -2348,7 +1942,6 @@ def reconciliar_manual():
 
 @app.post("/ventas/ingresar/{order_id}")
 def ingresar_manual(order_id: str):
-    """Fuerza la ingesta de una orden ML aunque no haya llegado el webhook."""
     try:
         process_webhook_order(order_id)
         venta = get_venta(order_id)
@@ -2362,11 +1955,9 @@ def ingresar_manual(order_id: str):
 
 @app.post("/ventas/reprocesar-todo")
 def reprocesar_todo():
-    """Reprocesa desde ML todas las ventas pendientes o con error (solo fuente ML)."""
     todas = list_ventas("pendiente") + list_ventas("error")
     resultados = {"ok": 0, "error": 0, "errores": []}
     for venta in todas:
-        # Solo reprocesar ventas de ML
         if (venta.get("fuente") or "mercadolibre") != "mercadolibre":
             continue
         try:
@@ -2384,51 +1975,37 @@ class AgruparPayload(BaseModel):
 
 @app.post("/ventas/agrupar")
 def agrupar_ventas(payload: AgruparPayload):
-    """Consolida múltiples ventas en una sola fila."""
     ids = [str(i) for i in payload.ids]
     if len(ids) < 2:
         raise HTTPException(status_code=400, detail="Se necesitan al menos 2 ventas para agrupar")
-
     ventas_list = []
     for oid in ids:
         v = get_venta(oid)
         if not v:
             raise HTTPException(status_code=404, detail=f"Venta {oid} no encontrada")
         if v.get("estado") == "enviado":
-            raise HTTPException(status_code=400, detail=f"La venta {oid} ya fue enviada a Odoo y no se puede agrupar")
+            raise HTTPException(status_code=400, detail=f"La venta {oid} ya fue enviada a Odoo")
         ventas_list.append(v)
-
     principal = ventas_list[0]
     secundarias = ventas_list[1:]
-
     try:
         order_principal = json.loads(principal["order_json"])
         all_items = list(order_principal.get("order_items", []))
-
         for v in secundarias:
             order_sec = json.loads(v["order_json"])
             all_items.extend(order_sec.get("order_items", []))
-
         order_consolidado = {**order_principal, "order_items": all_items}
         _, item_count, total_bruto = summarize_order_items(order_consolidado)
-
-        update_venta(principal["id"],
-            order_json=json.dumps(order_consolidado, ensure_ascii=False))
-
+        update_venta(principal["id"], order_json=json.dumps(order_consolidado, ensure_ascii=False))
         for v in secundarias:
-            update_venta(v["id"], estado="rechazado",
-                error=f"Agrupada en venta {principal['id']}")
-
+            update_venta(v["id"], estado="rechazado", error=f"Agrupada en venta {principal['id']}")
         return {
-            "ok": True,
-            "venta_principal": principal["id"],
+            "ok": True, "venta_principal": principal["id"],
             "agrupadas": [v["id"] for v in secundarias],
-            "total_items": item_count,
-            "total_bruto": total_bruto,
+            "total_items": item_count, "total_bruto": total_bruto,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 class ClientePayload(BaseModel):
@@ -2444,7 +2021,6 @@ class ClientePayload(BaseModel):
 
 @app.post("/clientes/crear")
 def crear_cliente(payload: ClientePayload):
-    """Crea un partner directamente en Odoo con los datos proporcionados."""
     try:
         ctx = odoo_connect()
         chile_id = get_chile_country_id(ctx)
@@ -2453,21 +2029,14 @@ def crear_cliente(payload: ClientePayload):
         rut_norm = normalize_rut(payload.rut)
         rut_odoo = rut_con_guion(rut_norm) if rut_norm else False
         taxpayer_type = "1" if payload.es_empresa else "4"
-
-        # Verificar si ya existe
         existing = find_partner_by_rut(ctx, payload.rut)
         if existing:
             raise HTTPException(status_code=409, detail=f"Ya existe un cliente con ese RUT (id={existing})")
-
         vals = {
-            "name": payload.nombre.strip(),
-            "vat": rut_odoo,
-            "email": payload.email.strip(),
-            "l10n_cl_dte_email": payload.email.strip(),
-            "customer_rank": 1,
-            "company_type": "company" if payload.es_empresa else "person",
-            "is_company": payload.es_empresa,
-            "country_id": chile_id,
+            "name": payload.nombre.strip(), "vat": rut_odoo,
+            "email": payload.email.strip(), "l10n_cl_dte_email": payload.email.strip(),
+            "customer_rank": 1, "company_type": "company" if payload.es_empresa else "person",
+            "is_company": payload.es_empresa, "country_id": chile_id,
             "l10n_cl_sii_taxpayer_type": taxpayer_type,
         }
         if payload.direccion:
@@ -2482,11 +2051,8 @@ def crear_cliente(payload: ClientePayload):
             vals["l10n_latam_identification_type_id"] = rut_type_id
         if activity_field and payload.giro:
             vals[activity_field] = payload.giro.strip()
-        elif payload.es_empresa and payload.giro:
-            vals["x_giro"] = payload.giro.strip()
-
         partner_id = odoo_exec(ctx, "res.partner", "create", [vals])
-        logger.info(f"Cliente creado manualmente: id={partner_id} nombre={payload.nombre}")
+        logger.info(f"Cliente creado: id={partner_id} nombre={payload.nombre}")
         return {"ok": True, "partner_id": partner_id, "nombre": payload.nombre}
     except HTTPException:
         raise
@@ -2500,7 +2066,6 @@ def venta_detalle(oid: str):
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
-
     order = json.loads(venta.get("order_json") or "{}")
     products, item_count, total_bruto = summarize_order_items(order)
     venta["productos"] = products
@@ -2514,19 +2079,15 @@ def actualizar_venta(oid: str, payload: VentaUpdate):
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
-
     updates = {k: v for k, v in payload.dict().items() if v is not None}
     if "rut" in updates:
         updates["rut"] = normalize_rut(updates["rut"])
     if "tipo_sugerido" in updates and updates["tipo_sugerido"] not in ["Boleta", "Factura"]:
         raise HTTPException(status_code=400, detail="tipo_sugerido debe ser Boleta o Factura")
-
     if updates.get("tipo_sugerido") == "Boleta" and not updates.get("giro") and not venta.get("giro"):
         updates["giro"] = DEFAULT_BOLETA_ACTIVITY
-
     if updates.get("tipo_sugerido") == "Boleta" and "giro" in updates and not updates["giro"]:
         updates["giro"] = DEFAULT_BOLETA_ACTIVITY
-
     update_venta(oid, **updates)
     return {"ok": True, "id": oid, "updated": updates}
 
@@ -2546,35 +2107,20 @@ def reprocesar_venta(oid: str):
 
 @app.get("/ventas/{oid}/pack")
 def ver_pack(oid: str):
-    """Retorna el detalle de todas las órdenes del pack asociado a esta venta."""
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
-
     pack_id = venta.get("pack_id")
     if not pack_id:
-        # Sin pack_id — mostrar solo la orden propia
         try:
             order = json.loads(venta.get("order_json") or "{}")
             items, item_count, total = summarize_order_items(order)
-            return {
-                "pack_id": None,
-                "ordenes": [{
-                    "id": venta["id"],
-                    "cliente": venta.get("cliente"),
-                    "total": total,
-                    "items": items,
-                    "item_count": item_count,
-                }]
-            }
+            return {"pack_id": None, "ordenes": [{"id": venta["id"], "cliente": venta.get("cliente"), "total": total, "items": items, "item_count": item_count}]}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-
-    # Con pack_id — consultar ML para obtener todas las órdenes
     try:
         pack_data = get_ml_pack(pack_id)
         order_ids = [str(o["id"]) for o in (pack_data.get("orders") or [])]
-
         ordenes = []
         total_pack = 0.0
         for order_id in order_ids:
@@ -2583,19 +2129,8 @@ def ver_pack(oid: str):
                 continue
             items, item_count, total = summarize_order_items(order)
             total_pack += total
-            ordenes.append({
-                "id": order_id,
-                "status": order.get("status"),
-                "total": total,
-                "items": items,
-                "item_count": item_count,
-            })
-
-        return {
-            "pack_id": pack_id,
-            "total_pack": round(total_pack, 2),
-            "ordenes": ordenes,
-        }
+            ordenes.append({"id": order_id, "status": order.get("status"), "total": total, "items": items, "item_count": item_count})
+        return {"pack_id": pack_id, "total_pack": round(total_pack, 2), "ordenes": ordenes}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2605,17 +2140,13 @@ def autorizar_venta(oid: str):
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
-
     if venta.get("move_id") and venta.get("estado") == "enviado":
         return {"ok": True, "id": oid, "move_id": venta["move_id"], "message": "Ya enviada"}
-
     try:
         order = json.loads(venta["order_json"])
         billing = json.loads(venta["billing_json"])
-
         move_id, partner_id = create_document(
-            order=order,
-            billing_raw=billing,
+            order=order, billing_raw=billing,
             tipo=venta.get("tipo_sugerido") or "Boleta",
             email=venta.get("email") or ML_DEFAULT_EMAIL,
             giro=venta.get("giro") or "",
@@ -2625,14 +2156,9 @@ def autorizar_venta(oid: str):
             ciudad_override=venta.get("ciudad"),
             region_override=venta.get("region"),
         )
-        update_venta(
-            oid,
-            estado="enviado",
-            move_id=move_id,
-            partner_id=partner_id if partner_id else None,
-            error=None,
-            enviado_en=datetime.now(),
-        )
+        update_venta(oid, estado="enviado", move_id=move_id,
+                    partner_id=partner_id if partner_id else None,
+                    error=None, enviado_en=datetime.now())
         return {"ok": True, "id": oid, "move_id": move_id, "partner_id": partner_id}
     except Exception as e:
         logger.error(f"[{oid}] Error al autorizar: {e}", exc_info=True)
@@ -2642,7 +2168,6 @@ def autorizar_venta(oid: str):
 
 @app.post("/ventas/{oid}/nota-credito")
 def crear_nota_credito(oid: str, body: dict):
-    """Crea una Nota de Credito completa en Odoo como reversal del documento original."""
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
@@ -2651,79 +2176,56 @@ def crear_nota_credito(oid: str, body: dict):
     move_id = venta.get("move_id")
     if not move_id:
         raise HTTPException(status_code=400, detail="La venta no tiene documento en Odoo")
-
     motivo = (body.get("motivo") or "").strip()
     if not motivo:
         raise HTTPException(status_code=400, detail="El motivo es obligatorio")
-
     try:
         ctx = odoo_connect()
-
-        # Verificar que el documento existe y está publicado
         moves = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "name"]})
         if not moves:
             raise HTTPException(status_code=404, detail=f"Documento {move_id} no encontrado en Odoo")
         move = moves[0]
         if move["state"] != "posted":
-            raise HTTPException(status_code=400, detail=f"Documento {move['name']} no está publicado (estado: {move['state']})")
-
-        # Crear el reversal (NC completa)
+            raise HTTPException(status_code=400, detail=f"Documento {move['name']} no esta publicado (estado: {move['state']})")
         from datetime import date
+        # Odoo 17-18 usa refund_method, Odoo 19 renombro a refund_type
+        reversal_fields = odoo_exec(ctx, "account.move.reversal", "fields_get", [], {"attributes": ["string"]})
         reversal_vals = {
-            "move_ids": [move_id],
+            "move_ids": [(6, 0, [move_id])],
             "date": date.today().isoformat(),
             "reason": motivo,
-            "journal_id": False,  # usar mismo journal
-            "refund_method": "cancel",  # NC completa
+            "journal_id": False,
         }
-        # account.move.reversal wizard
+        if "refund_method" in reversal_fields:
+            reversal_vals["refund_method"] = "cancel"
+        elif "refund_type" in reversal_fields:
+            reversal_vals["refund_type"] = "cancel"
         wizard_id = odoo_exec(ctx, "account.move.reversal", "create", [reversal_vals])
         result = odoo_exec(ctx, "account.move.reversal", "reverse_moves", [[wizard_id]])
-
-        # Obtener el move_id de la NC creada
         nc_move_id = None
         if isinstance(result, dict):
             domain = result.get("domain")
             if domain:
-                # Buscar la NC recién creada
                 ncs = odoo_exec(ctx, "account.move", "search", [domain])
                 if ncs:
                     nc_move_id = ncs[0]
             res_id = result.get("res_id")
             if res_id:
                 nc_move_id = res_id
-
-        # Si no se encontró por wizard, buscar por reversed_entry_id
         if not nc_move_id:
-            ncs = odoo_exec(ctx, "account.move", "search",
-                           [[["reversed_entry_id", "=", move_id]]], {"limit": 1})
+            ncs = odoo_exec(ctx, "account.move", "search", [[["reversed_entry_id", "=", move_id]]], {"limit": 1})
             if ncs:
                 nc_move_id = ncs[0]
-
-        # Publicar la NC si quedó en borrador
         if nc_move_id:
             nc_state = odoo_exec(ctx, "account.move", "read", [[nc_move_id]], {"fields": ["state"]})[0]["state"]
             if nc_state == "draft":
                 odoo_exec(ctx, "account.move", "action_post", [[nc_move_id]])
-            logger.info(f"[{oid}] NC creada y publicada: move_id={nc_move_id}")
-
-        # Actualizar estado en BD
+            logger.info(f"[{oid}] NC creada: move_id={nc_move_id}")
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE ventas SET estado='nota_credito', nc_motivo=%s WHERE id=%s",
-                    (motivo, oid)
-                )
+                cur.execute("UPDATE ventas SET estado='nota_credito', nc_motivo=%s WHERE id=%s", (motivo, oid))
             conn.commit()
-
-        return {
-            "ok": True,
-            "id": oid,
-            "nc_move_id": nc_move_id,
-            "motivo": motivo,
-            "mensaje": f"Nota de credito creada y publicada en Odoo"
-        }
-
+        return {"ok": True, "id": oid, "nc_move_id": nc_move_id, "motivo": motivo, "mensaje": "Nota de credito creada en Odoo"}
     except HTTPException:
         raise
     except Exception as e:
@@ -2733,7 +2235,6 @@ def crear_nota_credito(oid: str, body: dict):
 
 @app.post("/ventas/{oid}/anular")
 def anular_venta(oid: str):
-    """Anula el documento en Odoo (si existe) y resetea la venta a pendiente para reemitir."""
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
@@ -2742,7 +2243,6 @@ def anular_venta(oid: str):
     if move_id:
         try:
             ctx = odoo_connect()
-            # Intentar cancelar el asiento en Odoo
             moves = odoo_exec(ctx, "account.move", "search", [[["id", "=", move_id]]])
             if moves:
                 state = odoo_exec(ctx, "account.move", "read", [moves], {"fields": ["state"]})[0]["state"]
@@ -2752,12 +2252,10 @@ def anular_venta(oid: str):
                 elif state == "cancel":
                     odoo_result = f"Documento {move_id} ya estaba cancelado"
                 else:
-                    odoo_result = f"Documento {move_id} en estado {state} - cancelar manualmente en Odoo"
+                    odoo_result = f"Documento {move_id} en estado {state}"
         except Exception as e:
             odoo_result = f"No se pudo cancelar en Odoo: {e}"
             logger.warning(f"[{oid}] Error cancelando en Odoo: {e}")
-
-    # Resetear la venta a pendiente para que se pueda reemitir
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2766,11 +2264,12 @@ def anular_venta(oid: str):
             )
         conn.commit()
     logger.info(f"[{oid}] Venta anulada y reseteada a pendiente. Odoo: {odoo_result}")
-    return {"ok": True, "id": oid, "odoo": odoo_result, "message": "Venta reseteada a pendiente - puede reemitir"}
+    return {"ok": True, "id": oid, "odoo": odoo_result, "message": "Venta reseteada a pendiente"}
+
 
 
 # =========================
-# DASHBOARD
+# DASHBOARD UI
 # =========================
 
 UI_HTML = """<!doctype html>
@@ -2866,7 +2365,6 @@ UI_HTML = """<!doctype html>
   </div>
   <div class="toolbar">
     <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="renderTable()">
-    <input type="hidden" id="fuenteFilter" value="">
     <select id="statusFilter" onchange="renderTable()">
       <option value="pendiente">Pendiente</option>
       <option value="">Todos los estados</option>
@@ -2874,6 +2372,7 @@ UI_HTML = """<!doctype html>
       <option value="error">Error</option>
       <option value="rechazado">Rechazado</option>
     </select>
+    <input type="hidden" id="fuenteFilter" value="">
     <select id="horaCorte" onchange="recalcularTurnos()">
       <option value="14">Corte 14:00</option>
       <option value="15">Corte 15:00</option>
@@ -2884,16 +2383,16 @@ UI_HTML = """<!doctype html>
     <button class="success" onclick="abrirCrearCliente()">+ Crear cliente</button>
     <button class="secondary" onclick="abrirIngresarVenta()" style="background:var(--blue)">+ Ingresar venta</button>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
-    <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 200 ordenes en ML y agrega las que falten en el sistema">&#128279; Reconciliar ML</button>
+    <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 200 ordenes en ML">&#128279; Reconciliar ML</button>
     <button class="secondary" onclick="reconciliarWC()" title="Consulta las ultimas 100 ordenes en WooCommerce">&#128666; Reconciliar WC</button>
-    <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio (Colecta/Flex) en ventas existentes">&#128666; Actualizar envios</button>
+    <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio en ventas ML">&#128666; Actualizar envios</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
   <div id="selInfo" style="display:none;margin-bottom:10px;font-size:13px;color:var(--muted)"><span id="selCount"></span></div>
   <div id="tableWrap"><div class="empty">Cargando...</div></div>
 </div>
 
-<!-- Modal Calendario de turnos -->
+<!-- Modal Calendario -->
 <div class="modal" id="calModal">
   <div class="modal-card" style="max-width:520px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
@@ -2916,7 +2415,7 @@ UI_HTML = """<!doctype html>
   </div>
 </div>
 
-<!-- Modal Nota de Credito -->
+<!-- Modal NC -->
 <div class="modal" id="ncModal">
   <div class="modal-card" style="max-width:500px">
     <div class="topbar" style="margin-bottom:0">
@@ -2948,6 +2447,7 @@ UI_HTML = """<!doctype html>
     </div>
   </div>
 </div>
+
 <!-- Modal Crear Cliente -->
 <div class="modal" id="clienteModal">
   <div class="modal-card" style="max-width:560px">
@@ -2956,59 +2456,36 @@ UI_HTML = """<!doctype html>
       <button class="secondary" onclick="cerrarCrearCliente()">Cerrar</button>
     </div>
     <div class="modal-grid">
-      <div class="full">
-        <label>Tipo</label>
+      <div class="full"><label>Tipo</label>
         <select id="cliTipo" onchange="toggleCliGiro()">
           <option value="persona">Persona natural (Boleta)</option>
           <option value="empresa">Empresa (Factura)</option>
-        </select>
-      </div>
-      <div class="full">
-        <label>Nombre / Razon social</label>
-        <input id="cliNombre" placeholder="Nombre completo o razon social">
-      </div>
-      <div>
-        <label>RUT</label>
-        <input id="cliRut" placeholder="12345678-9">
-      </div>
-      <div>
-        <label>Email DTE</label>
-        <input id="cliEmail" placeholder="correo@ejemplo.com">
-      </div>
-      <div class="full">
-        <label>Direccion</label>
-        <input id="cliDireccion" placeholder="Calle y numero">
-      </div>
-      <div>
-        <label>Ciudad / Comuna</label>
-        <input id="cliCiudad" placeholder="Las Condes">
-      </div>
-      <div>
-        <label>Region</label>
-        <select id="cliRegion">
-          <option value="">-- Seleccionar --</option>
-          <option value="Metropolitana">Metropolitana (RM)</option>
-          <option value="Valparaiso">Valparaiso</option>
-          <option value="del BioBio">del BioBio</option>
-          <option value="de la Araucania">de la Araucania</option>
-          <option value="Antofagasta">Antofagasta</option>
-          <option value="Coquimbo">Coquimbo</option>
-          <option value="del Libertador Gral. Bernardo O'Higgins">O'Higgins</option>
-          <option value="del Maule">del Maule</option>
-          <option value="de los Lagos">de los Lagos</option>
-          <option value="Tarapaca">Tarapaca</option>
-          <option value="Atacama">Atacama</option>
-          <option value="Arica y Parinacota">Arica y Parinacota</option>
-          <option value="Aysen del Gral. Carlos Ibanez del Campo">Aysen</option>
-          <option value="Magallanes">Magallanes</option>
-          <option value="Los Rios">Los Rios</option>
-          <option value="del Nuble">del Nuble</option>
-        </select>
-      </div>
-      <div class="full" id="cliGiroGroup" style="display:none">
-        <label>Giro / Actividad economica</label>
-        <input id="cliGiro" placeholder="Comercio al por menor">
-      </div>
+        </select></div>
+      <div class="full"><label>Nombre / Razon social</label><input id="cliNombre" placeholder="Nombre completo o razon social"></div>
+      <div><label>RUT</label><input id="cliRut" placeholder="12345678-9"></div>
+      <div><label>Email DTE</label><input id="cliEmail" placeholder="correo@ejemplo.com"></div>
+      <div class="full"><label>Direccion</label><input id="cliDireccion" placeholder="Calle y numero"></div>
+      <div><label>Ciudad / Comuna</label><input id="cliCiudad" placeholder="Las Condes"></div>
+      <div><label>Region</label><select id="cliRegion">
+        <option value="">-- Seleccionar --</option>
+        <option value="Metropolitana">Metropolitana (RM)</option>
+        <option value="Valparaiso">Valparaiso</option>
+        <option value="del BioBio">del BioBio</option>
+        <option value="de la Araucania">de la Araucania</option>
+        <option value="Antofagasta">Antofagasta</option>
+        <option value="Coquimbo">Coquimbo</option>
+        <option value="del Libertador Gral. Bernardo O'Higgins">O'Higgins</option>
+        <option value="del Maule">del Maule</option>
+        <option value="de los Lagos">de los Lagos</option>
+        <option value="Tarapaca">Tarapaca</option>
+        <option value="Atacama">Atacama</option>
+        <option value="Arica y Parinacota">Arica y Parinacota</option>
+        <option value="Aysen del Gral. Carlos Ibanez del Campo">Aysen</option>
+        <option value="Magallanes">Magallanes</option>
+        <option value="Los Rios">Los Rios</option>
+        <option value="del Nuble">del Nuble</option>
+      </select></div>
+      <div class="full" id="cliGiroGroup" style="display:none"><label>Giro / Actividad economica</label><input id="cliGiro" placeholder="Comercio al por menor"></div>
     </div>
     <div id="cliError" style="color:#f87171;font-size:13px;margin-top:12px;display:none"></div>
     <div class="modal-actions">
@@ -3017,6 +2494,8 @@ UI_HTML = """<!doctype html>
     </div>
   </div>
 </div>
+
+<!-- Modal Editar -->
 <div class="modal" id="editModal">
   <div class="modal-card">
     <div class="topbar" style="margin-bottom:0">
@@ -3024,7 +2503,7 @@ UI_HTML = """<!doctype html>
       <button class="secondary" onclick="closeModal()">Cerrar</button>
     </div>
     <div class="modal-grid">
-      <div><label>ID venta ML</label><input id="editId" disabled></div>
+      <div><label>ID venta</label><input id="editId" disabled></div>
       <div><label>Tipo documento</label><select id="editTipo" onchange="toggleGiro()"><option value="Boleta">Boleta</option><option value="Factura">Factura</option></select></div>
       <div><label>Email DTE</label><input id="editEmail"></div>
       <div><label>RUT</label><input id="editRut"></div>
@@ -3051,7 +2530,7 @@ UI_HTML = """<!doctype html>
         <option value="del Nuble">del Nuble</option>
       </select></div>
       <div class="full" id="giroGroup" style="display:none"><label>Giro (solo factura)</label><input id="editGiro"></div>
-      <div><label>Total bruto ML</label><input id="editTotal" disabled></div>
+      <div><label>Total bruto</label><input id="editTotal" disabled></div>
       <div><label>Cantidad items</label><input id="editItemsCount" disabled></div>
       <div class="full"><label>Productos vendidos</label><textarea id="editProducts" disabled></textarea></div>
     </div>
@@ -3063,6 +2542,8 @@ UI_HTML = """<!doctype html>
     </div>
   </div>
 </div>
+
+<!-- Modal Pack -->
 <div class="modal" id="packModal">
   <div class="modal-card" style="max-width:680px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
@@ -3072,76 +2553,44 @@ UI_HTML = """<!doctype html>
     <div id="packModalBody"></div>
   </div>
 </div>
-<!-- Modal Ingresar Venta Manual -->
+
+<!-- Modal Venta Manual -->
 <div class="modal" id="ventaManualModal">
   <div class="modal-card" style="max-width:700px">
     <div class="topbar" style="margin-bottom:0">
       <div><div class="title" style="font-size:20px">+ Ingresar venta manual</div>
-      <div class="subtitle">Crea una venta directamente sin pasar por ML</div></div>
+      <div class="subtitle">Crea una venta directamente sin pasar por ML o WooCommerce</div></div>
       <button class="secondary" onclick="cerrarIngresarVenta()">Cerrar</button>
     </div>
     <div class="modal-grid" style="margin-top:16px">
-      <div>
-        <label>Tipo documento</label>
-        <select id="vmTipo" onchange="toggleVmGiro()">
-          <option value="Boleta">Boleta</option>
-          <option value="Factura">Factura</option>
-        </select>
-      </div>
-      <div>
-        <label>ID orden ML (opcional)</label>
-        <input id="vmOrderId" placeholder="ej: 2000012419074761">
-      </div>
-      <div class="full">
-        <label>Nombre / Razon social</label>
-        <input id="vmCliente" placeholder="Nombre completo o razon social">
-      </div>
-      <div>
-        <label>RUT</label>
-        <input id="vmRut" placeholder="12345678-9">
-      </div>
-      <div>
-        <label>Email DTE</label>
-        <input id="vmEmail" placeholder="correo@ejemplo.com" value="boleta@lemulux.com">
-      </div>
-      <div class="full">
-        <label>Direccion</label>
-        <input id="vmDireccion" placeholder="Calle y numero">
-      </div>
-      <div>
-        <label>Ciudad / Comuna</label>
-        <input id="vmCiudad" placeholder="Las Condes">
-      </div>
-      <div>
-        <label>Region</label>
-        <select id="vmRegion">
-          <option value="">-- Seleccionar --</option>
-          <option value="Metropolitana">Metropolitana (RM)</option>
-          <option value="Valparaiso">Valparaiso</option>
-          <option value="del BioBio">del BioBio</option>
-          <option value="de la Araucania">de la Araucania</option>
-          <option value="Antofagasta">Antofagasta</option>
-          <option value="Coquimbo">Coquimbo</option>
-          <option value="del Libertador Gral. Bernardo O'Higgins">O'Higgins</option>
-          <option value="del Maule">del Maule</option>
-          <option value="de los Lagos">de los Lagos</option>
-          <option value="Tarapaca">Tarapaca</option>
-          <option value="Atacama">Atacama</option>
-          <option value="Arica y Parinacota">Arica y Parinacota</option>
-          <option value="Aysen del Gral. Carlos Ibanez del Campo">Aysen</option>
-          <option value="Magallanes">Magallanes</option>
-          <option value="Los Rios">Los Rios</option>
-          <option value="del Nuble">del Nuble</option>
-        </select>
-      </div>
-      <div class="full" id="vmGiroGroup" style="display:none">
-        <label>Giro / Actividad economica</label>
-        <input id="vmGiro" placeholder="Comercio al por menor">
-      </div>
-      <div class="full">
-        <label>Productos (uno por linea, formato: Descripcion x cantidad $precio_unitario)</label>
-        <textarea id="vmProductos" style="min-height:120px" placeholder="Foco Led 24w x2 $9990&#10;Tubo Led T8 x1 $4990"></textarea>
-      </div>
+      <div><label>Tipo documento</label><select id="vmTipo" onchange="toggleVmGiro()"><option value="Boleta">Boleta</option><option value="Factura">Factura</option></select></div>
+      <div><label>ID orden (opcional)</label><input id="vmOrderId" placeholder="ej: 2000012419074761"></div>
+      <div class="full"><label>Nombre / Razon social</label><input id="vmCliente" placeholder="Nombre completo o razon social"></div>
+      <div><label>RUT</label><input id="vmRut" placeholder="12345678-9"></div>
+      <div><label>Email DTE</label><input id="vmEmail" placeholder="correo@ejemplo.com" value="boleta@lemulux.com"></div>
+      <div class="full"><label>Direccion</label><input id="vmDireccion" placeholder="Calle y numero"></div>
+      <div><label>Ciudad / Comuna</label><input id="vmCiudad" placeholder="Las Condes"></div>
+      <div><label>Region</label><select id="vmRegion">
+        <option value="">-- Seleccionar --</option>
+        <option value="Metropolitana">Metropolitana (RM)</option>
+        <option value="Valparaiso">Valparaiso</option>
+        <option value="del BioBio">del BioBio</option>
+        <option value="de la Araucania">de la Araucania</option>
+        <option value="Antofagasta">Antofagasta</option>
+        <option value="Coquimbo">Coquimbo</option>
+        <option value="del Libertador Gral. Bernardo O'Higgins">O'Higgins</option>
+        <option value="del Maule">del Maule</option>
+        <option value="de los Lagos">de los Lagos</option>
+        <option value="Tarapaca">Tarapaca</option>
+        <option value="Atacama">Atacama</option>
+        <option value="Arica y Parinacota">Arica y Parinacota</option>
+        <option value="Aysen del Gral. Carlos Ibanez del Campo">Aysen</option>
+        <option value="Magallanes">Magallanes</option>
+        <option value="Los Rios">Los Rios</option>
+        <option value="del Nuble">del Nuble</option>
+      </select></div>
+      <div class="full" id="vmGiroGroup" style="display:none"><label>Giro / Actividad economica</label><input id="vmGiro" placeholder="Comercio al por menor"></div>
+      <div class="full"><label>Productos (uno por linea)</label><textarea id="vmProductos" style="min-height:120px" placeholder="Foco Led 24w x2&#10;Tubo Led T8 x1"></textarea></div>
     </div>
     <div id="vmError" style="color:#f87171;font-size:13px;margin-top:12px;display:none"></div>
     <div class="modal-actions">
@@ -3176,19 +2625,6 @@ function fuentebadge(fuente) {
     return '<span style="background:#1a3a2a;color:#86efac;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;margin-left:4px">WC</span>';
   }
   return '<span style="background:#2a1a3a;color:#c4b5fd;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;margin-left:4px">MAN</span>';
-}
-
-function setFuente(f) {
-  var fi = document.getElementById('fuenteFilter');
-  if (fi) fi.value = f;
-  ['cardTodas','cardML','cardWC'].forEach(function(id) {
-    var el = document.getElementById(id);
-    if (el) el.classList.remove('activa');
-  });
-  var card = f === '' ? 'cardTodas' : f === 'mercadolibre' ? 'cardML' : 'cardWC';
-  var cel = document.getElementById(card);
-  if (cel) cel.classList.add('activa');
-  renderTable();
 }
 
 function enviobadge(tipo) {
@@ -3267,6 +2703,17 @@ function seleccionarTurno(key) {
   renderTable();
 }
 
+function setFuente(f) {
+  document.getElementById('fuenteFilter').value = f;
+  ['cardTodas','cardML','cardWC'].forEach(function(id) {
+    document.getElementById(id).classList.remove('activa');
+  });
+  if (f === '') document.getElementById('cardTodas').classList.add('activa');
+  else if (f === 'mercadolibre') document.getElementById('cardML').classList.add('activa');
+  else if (f === 'woocommerce') document.getElementById('cardWC').classList.add('activa');
+  renderTable();
+}
+
 function updateStats(items) {
   var totalML  = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre'; }).length;
   var totalWC  = ventas.filter(function(v){ return v.fuente === 'woocommerce'; }).length;
@@ -3288,7 +2735,7 @@ function updateStats(items) {
 function filteredVentas() {
   var q = document.getElementById('searchInput').value.trim().toLowerCase();
   var s = document.getElementById('statusFilter').value;
-  var f = document.getElementById('fuenteFilter') ? document.getElementById('fuenteFilter').value : '';
+  var f = document.getElementById('fuenteFilter').value;
   return ventas.filter(function(v) {
     var okS = !s || v.estado === s;
     var okF = !f || (v.fuente || 'mercadolibre') === f;
@@ -3297,12 +2744,11 @@ function filteredVentas() {
     var okT = !turnoActivo || getTurnoKey(v.creado_en) === turnoActivo;
     return okS && okQ && okT && okF;
   });
-} 
+}
 
 function rowHtml(v) {
   var id = String(v.id || '');
   var fecha = v.creado_en ? new Date(v.creado_en + 'Z').toLocaleString('es-CL', {timeZone:'America/Santiago'}) : '-';
-
   var acciones = '';
   acciones += '<button class="secondary" data-action="edit" data-id="' + esc(id) + '">Editar</button> ';
   if ((v.fuente || 'mercadolibre') === 'mercadolibre') {
@@ -3316,11 +2762,8 @@ function rowHtml(v) {
   }
   if (v.estado === 'enviado') {
     acciones += '<button class="bad" data-action="anular" data-id="' + esc(id) + '">Anular</button>';
-  }
-  if (v.estado === 'enviado') {
     acciones += '<button class="bad" style="background:#92400e;border-color:#92400e" data-action="notacredito" data-id="' + esc(id) + '">N/C</button>';
   }
-
   return '<tr id="row-' + esc(id) + '">' +
     '<td><input type="checkbox" class="cb-row" data-id="' + esc(id) + '" onchange="onCheckboxChange()"></td>' +
     '<td>' + safe(fecha) + '<div class="small">' + safe(id) + '</div>' +
@@ -3352,17 +2795,15 @@ function renderTable() {
     wrap.innerHTML = '<div class="empty">No hay ventas para mostrar.</div>';
     return;
   }
-
   var html = '<table><thead><tr>';
   html += '<th style="width:32px"><input type="checkbox" class="cb-row" id="cbTodos" onchange="toggleTodos(this)"></th>';
-  html += '<th>Fecha / ID ML</th><th>Cliente</th><th>RUT</th>';
+  html += '<th>Fecha / ID</th><th>Cliente</th><th>RUT</th>';
   html += '<th>Direccion / Ciudad / Region</th><th>Total / Items</th>';
-  html += '<th>Tipo</th><th>Envio</th><th>Estado doc.</th><th>Estado envio ML</th><th>Acciones</th>';
+  html += '<th>Tipo</th><th>Envio</th><th>Estado / Fuente</th><th>Estado envio</th><th>Acciones</th>';
   html += '</tr></thead><tbody>';
   for (var i = 0; i < items.length; i++) { html += rowHtml(items[i]); }
   html += '</tbody></table>';
   wrap.innerHTML = html;
-
   wrap.querySelectorAll('[data-action]').forEach(function(el) {
     el.addEventListener('click', function(e) {
       e.preventDefault();
@@ -3410,10 +2851,7 @@ function refreshSilente() {
           }
         }
       }
-      if (cambio) {
-        ventas = nuevas;
-        renderTable();
-      }
+      if (cambio) { ventas = nuevas; renderTable(); }
     })
     .catch(function() {});
 }
@@ -3440,10 +2878,7 @@ function abrirNC(id) {
   _ncCurrentId = String(id);
   document.getElementById('ncModalSub').textContent = 'Venta ' + id;
   document.getElementById('ncModalInfo').innerHTML =
-    '<strong>' + esc(v.cliente) + '</strong><br>' +
-    'RUT: ' + esc(v.rut) + '<br>' +
-    'Total: ' + money(v.total_bruto) + '<br>' +
-    'Tipo: ' + esc(v.tipo_sugerido);
+    '<strong>' + esc(v.cliente) + '</strong><br>RUT: ' + esc(v.rut) + '<br>Total: ' + money(v.total_bruto) + '<br>Tipo: ' + esc(v.tipo_sugerido);
   document.getElementById('ncMotivo').value = '';
   document.getElementById('ncOtro').value = '';
   document.getElementById('ncOtroGroup').style.display = 'none';
@@ -3466,11 +2901,7 @@ function confirmarNC() {
   var motivo = document.getElementById('ncMotivo').value;
   if (motivo === 'otro') motivo = document.getElementById('ncOtro').value.trim();
   var errDiv = document.getElementById('ncError');
-  if (!motivo) {
-    errDiv.textContent = 'Debes seleccionar o ingresar un motivo';
-    errDiv.style.display = 'block';
-    return;
-  }
+  if (!motivo) { errDiv.textContent = 'Debes seleccionar o ingresar un motivo'; errDiv.style.display = 'block'; return; }
   errDiv.textContent = 'Creando nota de credito en Odoo...';
   errDiv.style.display = 'block';
   errDiv.style.color = '#94a3b8';
@@ -3480,19 +2911,10 @@ function confirmarNC() {
     body: JSON.stringify({motivo: motivo})
   }).then(function(r){ return r.json(); })
     .then(function(data) {
-      if (data.ok) {
-        cerrarNC();
-        alert('Nota de credito creada en Odoo. Motivo: ' + motivo);
-        refreshData();
-      } else {
-        errDiv.style.color = '#f87171';
-        errDiv.textContent = 'Error: ' + (data.detail || 'desconocido');
-      }
+      if (data.ok) { cerrarNC(); alert('Nota de credito creada en Odoo. Motivo: ' + motivo); refreshData(); }
+      else { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + (data.detail || 'desconocido'); }
     })
-    .catch(function(e) {
-      errDiv.style.color = '#f87171';
-      errDiv.textContent = 'Error de conexion: ' + e.message;
-    });
+    .catch(function(e) { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + e.message; });
 }
 
 function anular(id) {
@@ -3500,12 +2922,8 @@ function anular(id) {
   fetch('/ventas/' + id + '/anular', {method:'POST'})
     .then(function(r){ return r.json(); })
     .then(function(data) {
-      if (data.ok) {
-        alert('Venta anulada. ' + (data.odoo || '') + ' Ahora puede editar y reautorizar.');
-        refreshData();
-      } else {
-        alert('Error: ' + (data.detail || 'desconocido'));
-      }
+      if (data.ok) { alert('Venta anulada. ' + (data.odoo || '') + ' Ahora puede editar y reautorizar.'); refreshData(); }
+      else { alert('Error: ' + (data.detail || 'desconocido')); }
     });
 }
 
@@ -3521,7 +2939,7 @@ function openEdit(id) {
   }
   if (!v) return;
   currentId = String(id);
-  document.getElementById('modalSub').textContent = 'Venta ' + v.id;
+  document.getElementById('modalSub').textContent = 'Venta ' + v.id + (v.fuente === 'woocommerce' ? ' (WooCommerce)' : v.fuente === 'manual' ? ' (Manual)' : ' (ML)');
   document.getElementById('editId').value = v.id || '';
   document.getElementById('editTipo').value = v.tipo_sugerido || 'Boleta';
   document.getElementById('editEmail').value = v.email || '';
@@ -3543,9 +2961,7 @@ function openEdit(id) {
       document.getElementById('editItemsCount').value = det.cantidad_items || 0;
       document.getElementById('editProducts').value = (det.productos || []).join(String.fromCharCode(10));
     })
-    .catch(function() {
-      document.getElementById('editProducts').value = 'Error cargando productos';
-    });
+    .catch(function() { document.getElementById('editProducts').value = 'Error cargando productos'; });
 }
 
 function closeModal() {
@@ -3615,7 +3031,7 @@ function onCheckboxChange() {
   } else {
     btn.style.display = 'none';
     info.style.display = seleccionadas.length === 1 ? 'block' : 'none';
-    count.textContent = seleccionadas.length === 1 ? '1 venta seleccionada - selecciona al menos 1 mas para agrupar' : '';
+    count.textContent = seleccionadas.length === 1 ? '1 venta seleccionada' : '';
   }
 }
 
@@ -3631,12 +3047,7 @@ function getSeleccionadas() {
 function agruparSeleccionadas() {
   var ids = getSeleccionadas();
   if (ids.length < 2) { alert('Selecciona al menos 2 ventas para agrupar'); return; }
-  var resumen = ids.map(function(id) {
-    var v = null;
-    for (var i = 0; i < ventas.length; i++) { if (String(ventas[i].id) === id) { v = ventas[i]; break; } }
-    return v ? ('* ' + (v.cliente || id) + ' - ' + id) : id;
-  }).join(String.fromCharCode(10));
-  if (!confirm('Agrupar ' + ids.length + ' ventas en una sola boleta/factura? La primera sera la principal: ' + resumen + ' Esta accion no se puede deshacer.')) return;
+  if (!confirm('Agrupar ' + ids.length + ' ventas en una sola boleta/factura?')) return;
   fetch('/ventas/agrupar', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -3644,7 +3055,7 @@ function agruparSeleccionadas() {
   }).then(function(r){ return r.json(); })
     .then(function(data) {
       if (data.ok) {
-        alert('Ventas agrupadas en ' + data.venta_principal + '. Items: ' + data.total_items + '. Total: ' + money(data.total_bruto));
+        alert('Ventas agrupadas en ' + data.venta_principal + '. Items: ' + data.total_items);
         document.getElementById('btnAgrupar').style.display = 'none';
         document.getElementById('selInfo').style.display = 'none';
         refreshData();
@@ -3661,20 +3072,10 @@ function actualizarEnvio() {
     .then(function(r){ return r.json(); })
     .then(function(data) {
       if (btn) { btn.disabled = false; btn.textContent = 'Actualizar envios'; }
-      if (data.ok) {
-        alert(data.mensaje);
-        if (data.procesando > 0) {
-          setTimeout(refreshData, 30000);
-          setTimeout(refreshData, 90000);
-        }
-      } else {
-        alert('Error: ' + (data.detail || 'desconocido'));
-      }
+      if (data.ok) { alert(data.mensaje); if (data.procesando > 0) { setTimeout(refreshData, 30000); setTimeout(refreshData, 90000); } }
+      else { alert('Error: ' + (data.detail || 'desconocido')); }
     })
-    .catch(function(e) {
-      if (btn) { btn.disabled = false; btn.textContent = 'Actualizar envios'; }
-      alert('Error: ' + e.message);
-    });
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Actualizar envios'; } alert('Error: ' + e.message); });
 }
 
 function reconciliarML() {
@@ -3739,30 +3140,21 @@ function verPack(id, packId) {
       for (var i = 0; i < ordenes.length; i++) {
         var o = ordenes[i];
         html += '<div style="background:#1f2937;border:1px solid #334155;border-radius:10px;padding:14px;margin-bottom:10px;">';
-        html += '<div style="display:flex;justify-content:space-between;margin-bottom:8px;">';
-        html += '<strong>Order ID: ' + safe(o.id) + '</strong>';
-        html += '<span style="color:#94a3b8">' + safe(o.status) + ' - ' + o.item_count + ' item(s) - <strong>' + money(o.total) + '</strong></span>';
-        html += '</div><ul style="margin:0;padding-left:18px;">';
-        (o.items || []).forEach(function(item) {
-          html += '<li style="font-size:13px;color:#94a3b8;margin-bottom:3px;">' + safe(item) + '</li>';
-        });
+        html += '<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><strong>Order ID: ' + safe(o.id) + '</strong>';
+        html += '<span style="color:#94a3b8">' + safe(o.status) + ' - ' + o.item_count + ' item(s) - <strong>' + money(o.total) + '</strong></span></div>';
+        html += '<ul style="margin:0;padding-left:18px;">';
+        (o.items || []).forEach(function(item) { html += '<li style="font-size:13px;color:#94a3b8;margin-bottom:3px;">' + safe(item) + '</li>'; });
         html += '</ul></div>';
       }
       if (!ordenes.length) html = '<p style="color:#94a3b8">No se encontraron ordenes.</p>';
       document.getElementById('packModalBody').innerHTML = html;
     })
-    .catch(function(e) {
-      document.getElementById('packModalBody').innerHTML = '<p style="color:#f87171">Error: ' + e.message + '</p>';
-    });
+    .catch(function(e) { document.getElementById('packModalBody').innerHTML = '<p style="color:#f87171">Error: ' + e.message + '</p>'; });
 }
 
 function closePackModal() {
   document.getElementById('packModal').classList.remove('open');
 }
-
-// ========================
-// CALENDARIO DE TURNOS
-// ========================
 
 function abrirCalendario() {
   document.getElementById('horaCorte2').value = document.getElementById('horaCorte').value;
@@ -3792,9 +3184,7 @@ function renderCalendario() {
     return;
   }
   var dias = ['Dom','Lun','Mar','Mie','Jue','Vie','Sab'];
-  var html = dias.map(function(d) {
-    return '<div style="font-size:11px;color:#94a3b8;padding:4px 0;font-weight:700">' + d + '</div>';
-  }).join('');
+  var html = dias.map(function(d) { return '<div style="font-size:11px;color:#94a3b8;padding:4px 0;font-weight:700">' + d + '</div>'; }).join('');
   var first = keys[keys.length-1];
   var last = keys[0];
   var p = first.split('-');
@@ -3817,23 +3207,15 @@ function renderCalendario() {
     var clickAttr = cnt > 0 ? ' data-turno="' + key + '"' : '';
     html += '<div class="cal-day" style="border-radius:8px;padding:6px 2px;background:' + bg + ';border:' + border + ';cursor:' + cursor + '"' + clickAttr + '>';
     html += '<div style="font-size:13px;font-weight:600">' + parseInt(d) + '</div>';
-    if (cnt > 0) {
-      html += '<div style="font-size:11px;color:' + (isActive ? 'white' : '#22c55e') + '">' + cnt + '</div>';
-    }
+    if (cnt > 0) { html += '<div style="font-size:11px;color:' + (isActive ? 'white' : '#22c55e') + '">' + cnt + '</div>'; }
     html += '</div>';
     cur = new Date(cur.getTime() + 86400000);
   }
   grid.innerHTML = html;
   grid.querySelectorAll('[data-turno]').forEach(function(el) {
-    el.addEventListener('click', function() {
-      seleccionarTurno(el.dataset.turno);
-    });
+    el.addEventListener('click', function() { seleccionarTurno(el.dataset.turno); });
   });
 }
-
-// ========================
-// CREAR CLIENTE EN ODOO
-// ========================
 
 function toggleCliGiro() {
   var esEmpresa = document.getElementById('cliTipo').value === 'empresa';
@@ -3874,86 +3256,46 @@ function buildVentaManualPayload(autorizar) {
   var productosRaw = document.getElementById('vmProductos').value.trim();
   var productos = productosRaw ? productosRaw.split(String.fromCharCode(10)).map(function(l){ return l.trim(); }).filter(Boolean) : [];
   return {
-    tipo: tipo,
-    order_id: document.getElementById('vmOrderId').value.trim() || null,
-    cliente: nombre,
-    rut: rut,
-    email: email,
+    tipo: tipo, order_id: document.getElementById('vmOrderId').value.trim() || null,
+    cliente: nombre, rut: rut, email: email,
     direccion: document.getElementById('vmDireccion').value.trim(),
     ciudad: document.getElementById('vmCiudad').value.trim(),
     region: document.getElementById('vmRegion').value,
     giro: tipo === 'Factura' ? document.getElementById('vmGiro').value.trim() : '',
-    productos: productos,
-    autorizar: autorizar
+    productos: productos, autorizar: autorizar
   };
 }
 
 function guardarVentaManual() {
   var payload = buildVentaManualPayload(false);
   var errDiv = document.getElementById('vmError');
-  if (!payload) {
-    errDiv.textContent = 'Nombre, RUT y email son obligatorios';
-    errDiv.style.display = 'block';
-    return;
-  }
-  errDiv.textContent = 'Guardando...';
-  errDiv.style.display = 'block';
-  errDiv.style.color = '#94a3b8';
-  fetch('/ventas/manual', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  }).then(function(r){ return r.json(); })
+  if (!payload) { errDiv.textContent = 'Nombre, RUT y email son obligatorios'; errDiv.style.display = 'block'; return; }
+  errDiv.textContent = 'Guardando...'; errDiv.style.display = 'block'; errDiv.style.color = '#94a3b8';
+  fetch('/ventas/manual', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) })
+    .then(function(r){ return r.json(); })
     .then(function(data) {
-      if (data.ok) {
-        cerrarIngresarVenta();
-        alert('Venta ingresada: ' + data.id);
-        refreshData();
-      } else {
-        errDiv.style.color = '#f87171';
-        errDiv.textContent = 'Error: ' + (data.detail || 'desconocido');
-      }
+      if (data.ok) { cerrarIngresarVenta(); alert('Venta ingresada: ' + data.id); refreshData(); }
+      else { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + (data.detail || 'desconocido'); }
     })
-    .catch(function(e) {
-      errDiv.style.color = '#f87171';
-      errDiv.textContent = 'Error de conexion: ' + e.message;
-    });
+    .catch(function(e) { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + e.message; });
 }
 
 function guardarYAutorizarManual() {
   var payload = buildVentaManualPayload(true);
   var errDiv = document.getElementById('vmError');
-  if (!payload) {
-    errDiv.textContent = 'Nombre, RUT y email son obligatorios';
-    errDiv.style.display = 'block';
-    return;
-  }
-  errDiv.textContent = 'Guardando y autorizando en Odoo...';
-  errDiv.style.display = 'block';
-  errDiv.style.color = '#94a3b8';
-  fetch('/ventas/manual', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  }).then(function(r){ return r.json(); })
+  if (!payload) { errDiv.textContent = 'Nombre, RUT y email son obligatorios'; errDiv.style.display = 'block'; return; }
+  errDiv.textContent = 'Guardando y autorizando en Odoo...'; errDiv.style.display = 'block'; errDiv.style.color = '#94a3b8';
+  fetch('/ventas/manual', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) })
+    .then(function(r){ return r.json(); })
     .then(function(data) {
       if (data.ok) {
         cerrarIngresarVenta();
-        if (data.autorizado) {
-          alert('Venta autorizada en Odoo: move_id=' + data.move_id);
-        } else {
-          alert('Venta ingresada: ' + data.id);
-        }
+        if (data.autorizado) { alert('Venta autorizada en Odoo: move_id=' + data.move_id); }
+        else { alert('Venta ingresada: ' + data.id); }
         refreshData();
-      } else {
-        errDiv.style.color = '#f87171';
-        errDiv.textContent = 'Error: ' + (data.detail || 'desconocido');
-      }
+      } else { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + (data.detail || 'desconocido'); }
     })
-    .catch(function(e) {
-      errDiv.style.color = '#f87171';
-      errDiv.textContent = 'Error de conexion: ' + e.message;
-    });
+    .catch(function(e) { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + e.message; });
 }
 
 function abrirCrearCliente() {
@@ -3979,68 +3321,32 @@ function crearClienteOdoo() {
   var rut = document.getElementById('cliRut').value.trim();
   var email = document.getElementById('cliEmail').value.trim();
   var errDiv = document.getElementById('cliError');
-  if (!nombre || !rut || !email) {
-    errDiv.textContent = 'Nombre, RUT y email son obligatorios';
-    errDiv.style.display = 'block';
-    errDiv.style.color = '#f87171';
-    return;
-  }
+  if (!nombre || !rut || !email) { errDiv.textContent = 'Nombre, RUT y email son obligatorios'; errDiv.style.display = 'block'; errDiv.style.color = '#f87171'; return; }
   var esEmpresa = document.getElementById('cliTipo').value === 'empresa';
   var payload = {
-    nombre: nombre,
-    rut: rut,
-    email: email,
+    nombre: nombre, rut: rut, email: email,
     direccion: document.getElementById('cliDireccion').value.trim(),
     ciudad: document.getElementById('cliCiudad').value.trim(),
     region: document.getElementById('cliRegion').value,
     giro: esEmpresa ? document.getElementById('cliGiro').value.trim() : '',
     es_empresa: esEmpresa
   };
-  errDiv.textContent = 'Creando...';
-  errDiv.style.display = 'block';
-  errDiv.style.color = '#94a3b8';
-  fetch('/clientes/crear', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  }).then(function(r){ return r.json(); })
+  errDiv.textContent = 'Creando...'; errDiv.style.display = 'block'; errDiv.style.color = '#94a3b8';
+  fetch('/clientes/crear', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) })
+    .then(function(r){ return r.json(); })
     .then(function(data) {
-      if (data.ok) {
-        cerrarCrearCliente();
-        alert('Cliente creado en Odoo: ' + data.nombre + ' (id=' + data.partner_id + ')');
-      } else {
-        errDiv.style.color = '#f87171';
-        errDiv.textContent = 'Error: ' + (data.detail || 'desconocido');
-      }
+      if (data.ok) { cerrarCrearCliente(); alert('Cliente creado en Odoo: ' + data.nombre + ' (id=' + data.partner_id + ')'); }
+      else { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + (data.detail || 'desconocido'); }
     })
-    .catch(function(e) {
-      errDiv.style.color = '#f87171';
-      errDiv.textContent = 'Error de conexion: ' + e.message;
-    });
+    .catch(function(e) { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + e.message; });
 }
 
-// ========================
-// EVENTOS Y ARRANQUE
-// ========================
-
-document.getElementById('editModal').addEventListener('click', function(e) {
-  if (e.target.id === 'editModal') closeModal();
-});
-document.getElementById('packModal').addEventListener('click', function(e) {
-  if (e.target.id === 'packModal') closePackModal();
-});
-document.getElementById('calModal').addEventListener('click', function(e) {
-  if (e.target.id === 'calModal') cerrarCalendario();
-});
-document.getElementById('clienteModal').addEventListener('click', function(e) {
-  if (e.target.id === 'clienteModal') cerrarCrearCliente();
-});
-document.getElementById('ncModal').addEventListener('click', function(e) {
-  if (e.target.id === 'ncModal') cerrarNC();
-});
-document.getElementById('ventaManualModal').addEventListener('click', function(e) {
-  if (e.target.id === 'ventaManualModal') cerrarIngresarVenta();
-});
+document.getElementById('editModal').addEventListener('click', function(e) { if (e.target.id === 'editModal') closeModal(); });
+document.getElementById('packModal').addEventListener('click', function(e) { if (e.target.id === 'packModal') closePackModal(); });
+document.getElementById('calModal').addEventListener('click', function(e) { if (e.target.id === 'calModal') cerrarCalendario(); });
+document.getElementById('clienteModal').addEventListener('click', function(e) { if (e.target.id === 'clienteModal') cerrarCrearCliente(); });
+document.getElementById('ncModal').addEventListener('click', function(e) { if (e.target.id === 'ncModal') cerrarNC(); });
+document.getElementById('ventaManualModal').addEventListener('click', function(e) { if (e.target.id === 'ventaManualModal') cerrarIngresarVenta(); });
 
 refreshData();
 setInterval(function() {
@@ -4051,15 +3357,10 @@ setInterval(function() {
 }, 30000);
 '''
 
-
-
-
-
 @app.get("/ui/app.js")
 def ui_js():
     from fastapi.responses import Response
     return Response(content=UI_JS, media_type="application/javascript; charset=utf-8")
-
 
 @app.get("/ui", response_class=HTMLResponse)
 def ui_bandeja():
