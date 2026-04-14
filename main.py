@@ -698,34 +698,50 @@ def schedule_token_refresh():
 
 
 _consecutive_429 = 0
+_ml_lock = threading.Lock()   # serializa todos los requests a ML entre threads
+_ml_last_request = 0.0        # timestamp del ultimo request exitoso
 
 
 def ml_get(url: str) -> dict:
-    global _consecutive_429
-    for attempt in range(6):
-        try:
-            res = requests.get(url, headers=ml_headers(), timeout=30)
-        except requests.RequestException as e:
-            logger.error(f"Error de red en {url}: {e}")
-            raise
-        if res.status_code == 401:
-            logger.warning(f"401 en {url}, renovando token...")
-            if not refresh_ml_token():
-                raise Exception("Token ML invalido y no se pudo renovar")
-            continue
-        if res.status_code == 429:
-            _consecutive_429 += 1
-            wait = min(5 * (attempt + 1) + (_consecutive_429 * 2), 60)
-            logger.warning(f"429 en {url}, reintento en {wait}s (consecutivos: {_consecutive_429})")
-            time.sleep(wait)
-            continue
-        if res.status_code == 404:
+    global _consecutive_429, _ml_last_request
+    with _ml_lock:
+        # Respetar minimo 500ms entre requests para no saturar el rate limit
+        elapsed = time.time() - _ml_last_request
+        min_gap = 0.5 + min(_consecutive_429 * 0.5, 5.0)
+        if elapsed < min_gap:
+            time.sleep(min_gap - elapsed)
+
+        for attempt in range(6):
+            try:
+                res = requests.get(url, headers=ml_headers(), timeout=30)
+            except requests.RequestException as e:
+                logger.error(f"Error de red en {url}: {e}")
+                raise
+
+            if res.status_code == 401:
+                logger.warning(f"401 en {url}, renovando token...")
+                if not refresh_ml_token():
+                    raise Exception("Token ML invalido y no se pudo renovar")
+                continue
+
+            if res.status_code == 429:
+                _consecutive_429 += 1
+                wait = min(10 * (attempt + 1) + (_consecutive_429 * 3), 90)
+                logger.warning(f"429 en {url}, esperando {wait}s (consecutivos: {_consecutive_429})")
+                time.sleep(wait)
+                continue
+
+            if res.status_code == 404:
+                _consecutive_429 = 0
+                _ml_last_request = time.time()
+                return {}
+
+            res.raise_for_status()
             _consecutive_429 = 0
-            return {}
-        res.raise_for_status()
-        _consecutive_429 = 0
-        return res.json()
-    raise Exception(f"ML devolvio demasiados errores para {url}")
+            _ml_last_request = time.time()
+            return res.json()
+
+        raise Exception(f"ML devolvio demasiados errores para {url}")
 
 
 def get_ml_order(order_id: str) -> dict:
@@ -1248,7 +1264,13 @@ def get_ml_ordenes_recientes(seller_id: str, total: int = 200) -> list:
 
 def reconciliar_ordenes_ml():
     while True:
-        time.sleep(15 * 60)
+        # Si hay 429 recientes, esperar mas antes de reconciliar
+        base_wait = 15 * 60
+        extra = min(_consecutive_429 * 60, 10 * 60)
+        time.sleep(base_wait + extra)
+        if _consecutive_429 > 3:
+            logger.info(f"Reconciliacion ML pospuesta: {_consecutive_429} 429s recientes, esperando recuperacion")
+            continue
         try:
             seller_id = get_ml_seller_id()
             if not seller_id:
@@ -1957,15 +1979,19 @@ def ingresar_manual(order_id: str):
 def reprocesar_todo():
     todas = list_ventas("pendiente") + list_ventas("error")
     resultados = {"ok": 0, "error": 0, "errores": []}
-    for venta in todas:
-        if (venta.get("fuente") or "mercadolibre") != "mercadolibre":
-            continue
+    ml_ventas = [v for v in todas if (v.get("fuente") or "mercadolibre") == "mercadolibre"]
+    logger.info(f"Reprocesar todo: {len(ml_ventas)} ventas ML a procesar")
+    for i, venta in enumerate(ml_ventas):
         try:
             reprocesar_venta_desde_ml(str(venta["id"]))
             resultados["ok"] += 1
         except Exception as e:
             resultados["error"] += 1
             resultados["errores"].append({"id": venta["id"], "error": str(e)[:200]})
+        # Pausa entre ventas para no saturar ML
+        # El lock de ml_get ya serializa, pero damos espacio al webhook worker
+        if i < len(ml_ventas) - 1:
+            time.sleep(2 + min(_consecutive_429, 5))
     return resultados
 
 
