@@ -15,6 +15,7 @@ import re
 import hmac
 import hashlib
 import base64
+import html as html_module
 from datetime import datetime
 from typing import Optional, Any
 from dataclasses import dataclass
@@ -1603,6 +1604,12 @@ async def on_startup():
     wr = threading.Thread(target=reconciliar_wc_ordenes, daemon=True)
     wr.start()
     logger.info("Reconciliador WooCommerce iniciado (cada 20 min)")
+    fw = threading.Thread(target=fl_webhook_worker, daemon=True)
+    fw.start()
+    logger.info("Worker de cola Falabella iniciado")
+    fr = threading.Thread(target=reconciliar_fl_ordenes, daemon=True)
+    fr.start()
+    logger.info("Reconciliador Falabella iniciado (cada 25 min)")
 
 
 # =========================
@@ -2298,6 +2305,502 @@ def anular_venta(oid: str):
 # DASHBOARD UI
 # =========================
 
+
+# =========================
+# ENDPOINTS FALABELLA
+# =========================
+
+@app.post("/fl/webhook")
+async def fl_webhook_endpoint(request: Request):
+    """Recibe webhooks de Falabella Seller Center."""
+    body_bytes = await request.body()
+    signature  = request.headers.get("X-Hub-Signature", "")
+    topic      = request.headers.get("X-Webhook-Event", "")
+
+    if not verify_fl_webhook(body_bytes, signature):
+        logger.warning(f"[FL] Firma invalida en webhook topic={topic}")
+        return JSONResponse(status_code=401, content={"error": "Firma invalida"})
+
+    try:
+        body = json.loads(body_bytes)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Body invalido"})
+
+    # El payload de Falabella webhooks viene con el OrderId
+    order_id = str(body.get("orderId") or body.get("OrderId") or body.get("order_id") or "")
+    if not order_id:
+        return {"ok": True, "ignored": True}
+
+    if order_id not in list(fl_webhook_queue.queue):
+        fl_webhook_queue.put(order_id)
+        logger.info(f"[FL] Webhook encolado: order_id={order_id}")
+
+    return {"ok": True, "order_id": order_id, "queued": fl_webhook_queue.qsize()}
+
+
+@app.post("/fl/reconciliar")
+def fl_reconciliar_manual():
+    """Fuerza reconciliacion con Falabella: consulta ultimas 100 ordenes."""
+    try:
+        ordenes = fl_get_orders_recent(limit=100)
+        ids_fl  = [f"FL-{o['OrderId']}" for o in ordenes if o.get("OrderId")]
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_fl,))
+                ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
+        faltantes_ids = [str(o["OrderId"]) for o in ordenes if f"FL-{o['OrderId']}" not in ids_en_bd]
+        def encolar():
+            for oid in faltantes_ids:
+                fl_webhook_queue.put(oid)
+                time.sleep(1)
+        threading.Thread(target=encolar, daemon=True).start()
+        return {
+            "ok": True, "total_fl": len(ordenes), "en_bd": len(ids_en_bd),
+            "faltantes": len(faltantes_ids), "encoladas": faltantes_ids[:5],
+            "mensaje": f"Procesando {len(faltantes_ids)} ordenes Falabella faltantes en background."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/fl/ingresar/{order_id}")
+def fl_ingresar_manual(order_id: str):
+    """Fuerza la ingesta de una orden Falabella por su ID."""
+    try:
+        process_fl_order(order_id)
+        venta = get_venta(f"FL-{order_id}")
+        if venta:
+            return {"ok": True, "id": f"FL-{order_id}", "cliente": venta.get("cliente"), "estado": venta.get("estado")}
+        return {"ok": True, "id": f"FL-{order_id}", "message": "Procesado, verificar en dashboard"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/fl/debug/{order_id}")
+def fl_debug_order(order_id: str):
+    """Muestra los datos crudos de una orden Falabella para diagnostico."""
+    try:
+        order = fl_get_order(order_id)
+        items = fl_get_order_items(order_id)
+        extra_str = order.get("ExtraBillingAttributes") or ""
+        billing   = fl_parse_extra_billing(extra_str)
+        tipo      = fl_extract_tipo(order)
+        return {
+            "order_id":    order_id,
+            "tipo":        tipo,
+            "rut":         fl_extract_rut(order, tipo, billing),
+            "nombre":      fl_extract_nombre(order, tipo, billing),
+            "giro":        fl_extract_giro(tipo, billing),
+            "email":       fl_extract_email(tipo, billing, order),
+            "direccion":   fl_extract_direccion(tipo, billing, order),
+            "ciudad":      fl_extract_ciudad(tipo, billing, order),
+            "region":      fl_extract_region(tipo, billing, order),
+            "InvoiceRequired": order.get("InvoiceRequired"),
+            "ExtraBillingAttributes": billing,
+            "NationalRegistrationNumber": order.get("NationalRegistrationNumber"),
+            "raw_order":   order,
+            "items_count": len(items),
+            "items":       items[:3],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================
+# FALABELLA SELLER CENTER
+# =========================
+
+FL_BASE_URL      = "https://sellercenter-api.falabella.com"
+FL_DEFAULT_EMAIL = "boleta@lemulux.com"
+FL_ESTADOS_VALIDOS = {"pending", "ready_to_ship", "shipped", "delivered", "processing"}
+
+WC_STATE_TO_REGION_FL = {
+    "AI": "Aysen del Gral. Carlos Ibanez del Campo",
+    "AN": "Antofagasta", "AP": "Arica y Parinacota",
+    "AR": "de la Araucania", "AT": "Atacama", "BI": "del BioBio",
+    "CO": "Coquimbo", "LI": "del Libertador Gral. Bernardo O'Higgins",
+    "LL": "de los Lagos", "LR": "Los Rios", "MA": "Magallanes",
+    "ML": "del Maule", "NB": "del Nuble", "RM": "Metropolitana",
+    "TA": "Tarapaca", "VS": "Valparaiso",
+}
+
+fl_webhook_queue = queue_module.Queue()
+
+
+def fl_sign(params: dict) -> str:
+    """Genera firma HMAC-SHA256 para Falabella Seller Center."""
+    api_key = get_env("FL_API_KEY")
+    sorted_params = sorted(params.items())
+    query_string = "&".join(f"{k}={v}" for k, v in sorted_params)
+    return hmac.new(api_key.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def fl_get(action: str, extra_params: dict = None) -> dict:
+    """Llama a la API de Falabella Seller Center con firma HMAC."""
+    with _ml_lock:
+        elapsed = time.time() - _ml_last_request
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
+
+        # GetOrder/GetOrderItems usan Version=2.0, el resto usa 1.0
+        version = "2.0" if action in ("GetOrder", "GetOrderItems") else "1.0"
+        params = {
+            "Action":    action,
+            "Format":    "JSON",
+            "Timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+            "UserID":    get_env("FL_USER_ID"),
+            "Version":   version,
+        }
+        if extra_params:
+            params.update(extra_params)
+
+        params["Signature"] = fl_sign(params)
+
+        try:
+            res = requests.get(
+                FL_BASE_URL,
+                params=params,
+                headers={"User-Agent": f"{get_env('FL_USER_ID')}/Python/3", "accept": "application/json"},
+                timeout=30,
+            )
+            if res.status_code == 429:
+                logger.warning(f"[FL] 429 en {action}, esperando 30s")
+                time.sleep(30)
+                params["Timestamp"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S+00:00")
+                params["Signature"] = fl_sign(params)
+                res = requests.get(FL_BASE_URL, params=params,
+                    headers={"User-Agent": f"{get_env('FL_USER_ID')}/Python/3", "accept": "application/json"},
+                    timeout=30)
+            res.raise_for_status()
+            return res.json()
+        except Exception as e:
+            logger.error(f"[FL] Error en {action}: {e}")
+            raise
+
+
+def fl_get_order(order_id: str) -> dict:
+    """GetOrder v2 — devuelve datos del cliente + billing + items."""
+    data = fl_get("GetOrder", {"OrderId": str(order_id)})
+    try:
+        return data["SuccessResponse"]["Body"]["Orders"]["Order"]
+    except (KeyError, TypeError):
+        return {}
+
+
+def fl_get_order_items(order_id: str) -> list:
+    """GetOrderItems — devuelve los productos de la orden."""
+    data = fl_get("GetOrderItems", {"OrderId": str(order_id)})
+    try:
+        items = data["SuccessResponse"]["Body"]["OrderItems"]["OrderItem"]
+        if isinstance(items, dict):
+            items = [items]
+        return items
+    except (KeyError, TypeError):
+        return []
+
+
+def fl_get_orders_recent(created_after: str = None, limit: int = 100) -> list:
+    """GetOrders — listado de ordenes recientes para reconciliacion."""
+    if not created_after:
+        from datetime import timedelta
+        created_after = (datetime.utcnow() - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    data = fl_get("GetOrders", {
+        "CreatedAfter": created_after,
+        "Limit": str(limit),
+        "SortBy": "created_at",
+        "SortDirection": "DESC",
+    })
+    try:
+        orders = data["SuccessResponse"]["Body"]["Orders"]["Order"]
+        if isinstance(orders, dict):
+            orders = [orders]
+        return orders
+    except (KeyError, TypeError):
+        return []
+
+
+def fl_parse_extra_billing(extra_str: str) -> dict:
+    """Parsea ExtraBillingAttributes que viene como JSON string."""
+    if not extra_str:
+        return {}
+    try:
+        if isinstance(extra_str, dict):
+            return extra_str
+        return json.loads(extra_str)
+    except Exception:
+        return {}
+
+
+def fl_extract_tipo(order: dict) -> str:
+    """InvoiceRequired=true -> Factura, false/ausente -> Boleta."""
+    val = str(order.get("InvoiceRequired", "false")).lower()
+    return "Factura" if val in ("true", "1") else "Boleta"
+
+
+def fl_extract_rut(order: dict, tipo: str, billing: dict) -> str:
+    """RUT desde LegalId+CustomerVerifierDigit (factura) o NationalRegistrationNumber (boleta)."""
+    if tipo == "Factura":
+        legal_id = str(billing.get("LegalId") or "").strip()
+        verifier  = str(billing.get("CustomerVerifierDigit") or "").strip()
+        if legal_id:
+            # LegalId a veces ya incluye el digito verificador con guion
+            if "-" in legal_id:
+                rut_raw = legal_id
+            elif verifier:
+                rut_raw = f"{legal_id}-{verifier}"
+            else:
+                rut_raw = legal_id
+            return normalize_rut(rut_raw)
+    # Boleta: NationalRegistrationNumber ya viene con guion (ej: "16316358-6")
+    rut = str(order.get("NationalRegistrationNumber") or "").strip()
+    return normalize_rut(rut) if rut else ""
+
+
+def fl_extract_nombre(order: dict, tipo: str, billing: dict) -> str:
+    if tipo == "Factura":
+        name = html_module.unescape(str(billing.get("ReceiverLegalName") or "")).strip()
+        if name:
+            return name
+    first = html_module.unescape(str(order.get("CustomerFirstName") or "")).strip()
+    last  = html_module.unescape(str(order.get("CustomerLastName") or "")).strip()
+    return f"{first} {last}".strip() or "Cliente FL"
+
+
+def fl_extract_giro(tipo: str, billing: dict) -> str:
+    if tipo == "Factura":
+        regimen = html_module.unescape(str(billing.get("ReceiverTypeRegimen") or "")).strip()
+        return regimen or ""
+    return DEFAULT_BOLETA_ACTIVITY
+
+
+def fl_extract_email(tipo: str, billing: dict, order: dict) -> str:
+    if tipo == "Factura":
+        email = str(billing.get("ReceiverEmail") or "").strip()
+        if email:
+            return email
+    # Fallback: AddressBilling puede tener email en algunos casos
+    addr = order.get("AddressBilling") or {}
+    if isinstance(addr, dict):
+        email = str(addr.get("Email") or "").strip()
+        if email:
+            return email
+    return FL_DEFAULT_EMAIL
+
+
+def fl_extract_direccion(tipo: str, billing: dict, order: dict) -> str:
+    if tipo == "Factura":
+        addr = html_module.unescape(str(billing.get("ReceiverAddress") or "")).strip()
+        if addr:
+            return addr
+    # Fallback: AddressShipping
+    ship = order.get("AddressShipping") or {}
+    if isinstance(ship, dict):
+        parts = [
+            html_module.unescape(str(ship.get("Address1") or "")).strip(),
+            html_module.unescape(str(ship.get("Address2") or "")).strip(),
+        ]
+        return ", ".join(p for p in parts if p)
+    return ""
+
+
+def fl_extract_ciudad(tipo: str, billing: dict, order: dict) -> str:
+    if tipo == "Factura":
+        return html_module.unescape(str(billing.get("ReceiverMunicipality") or "")).strip()
+    ship = order.get("AddressShipping") or {}
+    if isinstance(ship, dict):
+        return html_module.unescape(str(ship.get("Ward") or ship.get("City") or "")).strip()
+    return ""
+
+
+def fl_extract_region(tipo: str, billing: dict, order: dict) -> str:
+    if tipo == "Factura":
+        region = html_module.unescape(str(billing.get("ReceiverRegion") or "")).strip()
+        if region.upper() in WC_STATE_TO_REGION_FL:
+            return WC_STATE_TO_REGION_FL[region.upper()]
+        return region
+    ship = order.get("AddressShipping") or {}
+    if isinstance(ship, dict):
+        # Falabella devuelve Region como nombre completo en AddressShipping
+        region = html_module.unescape(str(ship.get("Region") or "")).strip()
+        return region
+    return ""
+
+
+def fl_build_order_items(items: list, order: dict) -> list:
+    """Convierte items de Falabella al formato interno order_items."""
+    result = []
+    for it in items:
+        name  = str(it.get("Name") or it.get("SellerSku") or "Producto FL").strip()
+        price = float(it.get("ItemPrice") or it.get("PaidPrice") or 0)
+        result.append({
+            "item":       {"title": name},
+            "quantity":   1,
+            "unit_price": price,
+        })
+    return result
+
+
+def process_fl_order(order_id: str):
+    """Procesa una orden Falabella y la guarda en tabla ventas."""
+    try:
+        oid_str = f"FL-{order_id}"
+        existing = get_venta(oid_str)
+
+        order = fl_get_order(order_id)
+        if not order:
+            logger.warning(f"[FL:{order_id}] Orden no encontrada")
+            return
+
+        fl_status = str(order.get("Statuses") or {}).lower()
+        # Normalizar status
+        status_val = order.get("Statuses")
+        if isinstance(status_val, dict):
+            status_val = list(status_val.values())[0] if status_val else "pending"
+        elif isinstance(status_val, list):
+            status_val = status_val[0] if status_val else "pending"
+        status_val = str(status_val).lower().replace(" ", "_")
+
+        if existing:
+            update_venta(oid_str, estado_envio=status_val)
+            logger.info(f"[FL:{order_id}] Estado actualizado: {status_val}")
+            return
+
+        if status_val not in FL_ESTADOS_VALIDOS:
+            logger.info(f"[FL:{order_id}] Estado {status_val} no valido para facturar, ignorado")
+            return
+
+        extra_str = order.get("ExtraBillingAttributes") or ""
+        billing   = fl_parse_extra_billing(extra_str)
+
+        tipo      = fl_extract_tipo(order)
+        rut       = fl_extract_rut(order, tipo, billing)
+        nombre    = fl_extract_nombre(order, tipo, billing)
+        giro      = fl_extract_giro(tipo, billing)
+        email     = fl_extract_email(tipo, billing, order)
+        direccion = fl_extract_direccion(tipo, billing, order)
+        ciudad    = fl_extract_ciudad(tipo, billing, order)
+        region    = fl_extract_region(tipo, billing, order)
+
+        # Obtener items de la orden
+        items_raw = []
+        try:
+            items_raw = fl_get_order_items(order_id)
+        except Exception as e:
+            logger.warning(f"[FL:{order_id}] No se pudo obtener items: {e}")
+
+        # Si no hay items, usar el total de la orden como una linea generica
+        if not items_raw:
+            price_str = str(order.get("GrandTotal") or order.get("Price") or "0")
+            price_clean = price_str.replace(",", "").replace(".", "").strip()
+            try:
+                price_val = float(price_clean)
+            except ValueError:
+                price_val = 0.0
+            order_items = [{
+                "item":       {"title": f"Orden Falabella #{order_id}"},
+                "quantity":   1,
+                "unit_price": price_val,
+            }]
+        else:
+            order_items = fl_build_order_items(items_raw, order)
+
+        fake_order = {
+            "id":          oid_str,
+            "status":      status_val,
+            "order_items": order_items,
+            "buyer": {
+                "email":      email,
+                "first_name": html_module.unescape(str(order.get("CustomerFirstName") or "")).strip(),
+                "last_name":  html_module.unescape(str(order.get("CustomerLastName") or "")).strip(),
+            },
+        }
+
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM ventas WHERE id = %s", (oid_str,))
+                if cur.fetchone():
+                    return
+                cur.execute(
+                    """
+                    INSERT INTO ventas
+                        (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region,
+                         tipo_sugerido, estado, estado_envio, order_json, billing_json, fuente)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, 'falabella')
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        oid_str, None,
+                        (nombre or "Cliente FL").strip(),
+                        normalize_rut(rut) if rut else "",
+                        (email or FL_DEFAULT_EMAIL).strip(),
+                        (giro or "").strip(),
+                        (direccion or "").strip(),
+                        (ciudad or "").strip(),
+                        (region or "").strip(),
+                        tipo, status_val,
+                        json.dumps(fake_order, ensure_ascii=False),
+                        json.dumps(billing, ensure_ascii=False),
+                    ),
+                )
+            conn.commit()
+        logger.info(f"[FL:{order_id}] Guardada -> tipo={tipo} rut={rut or 'sin RUT'} cliente={nombre}")
+
+    except Exception as e:
+        logger.error(f"[FL:{order_id}] Error procesando: {e}", exc_info=True)
+
+
+def fl_webhook_worker():
+    while True:
+        try:
+            order_id = fl_webhook_queue.get(timeout=5)
+            try:
+                process_fl_order(str(order_id))
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"[FL:{order_id}] Error en worker: {e}")
+                time.sleep(5)
+            finally:
+                fl_webhook_queue.task_done()
+        except queue_module.Empty:
+            continue
+
+
+def reconciliar_fl_ordenes():
+    """Cada 25 min verifica ordenes recientes de Falabella y encola faltantes."""
+    while True:
+        time.sleep(25 * 60)
+        try:
+            ordenes = fl_get_orders_recent(limit=100)
+            if not ordenes:
+                continue
+            ids_fl = [f"FL-{o['OrderId']}" for o in ordenes if o.get("OrderId")]
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_fl,))
+                    ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
+            faltantes = [o for o in ordenes if f"FL-{o['OrderId']}" not in ids_en_bd
+                         and str(o.get("Statuses", {}).get("Status", "")) in FL_ESTADOS_VALIDOS]
+            if faltantes:
+                logger.warning(f"[FL] Reconciliacion: {len(faltantes)} faltantes, encolando hasta 10")
+                for o in faltantes[:10]:
+                    fl_webhook_queue.put(str(o["OrderId"]))
+                    time.sleep(1)
+            else:
+                logger.info(f"[FL] Reconciliacion OK: {len(ordenes)} ordenes en BD")
+        except Exception as e:
+            logger.error(f"[FL] Error en reconciliacion: {e}")
+
+
+def verify_fl_webhook(body_bytes: bytes, signature: str) -> bool:
+    """Verifica firma HMAC del webhook de Falabella."""
+    secret = get_env("FL_WEBHOOK_SECRET", required=False, default="")
+    if not secret:
+        logger.warning("[FL] FL_WEBHOOK_SECRET no configurado, omitiendo verificacion")
+        return True
+    mac = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256)
+    expected = base64.b64encode(mac.digest()).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
 UI_HTML = """<!doctype html>
 <html lang="es">
 <head>
@@ -2326,6 +2829,7 @@ UI_HTML = """<!doctype html>
     .card.activa{border-color:#3b82f6;background:#0f1f3d;}
     .card#cardML.activa{border-color:#3b82f6;background:#0a1628;}
     .card#cardWC.activa{border-color:#22c55e;background:#052e16;}
+    .card#cardFL.activa{border-color:#f59e0b;background:#2a1a00;}
     .card .value{font-size:26px;font-weight:700;}
     .toolbar{display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap;}
     .toolbar input{flex:1;min-width:220px;}
@@ -2371,7 +2875,7 @@ UI_HTML = """<!doctype html>
       <a class="link" href="/ventas" target="_blank">API</a>
     </div>
   </div>
-  <div class="grid">
+  <div class="grid" style="grid-template-columns:repeat(5,1fr)">
     <div class="card" id="cardTodas" style="cursor:pointer" onclick="setFuente('')">
       <h3>Total</h3><div class="value" id="cTotal">&mdash;</div>
       <div style="font-size:12px;color:var(--muted);margin-top:4px">Todas las fuentes</div>
@@ -2383,6 +2887,10 @@ UI_HTML = """<!doctype html>
     <div class="card" id="cardWC" style="cursor:pointer" onclick="setFuente('woocommerce')">
       <h3>&#x1F6D2; WooCommerce</h3><div class="value" id="cWC">&mdash;</div>
       <div style="font-size:12px;color:#86efac;margin-top:4px" id="cWCpend"></div>
+    </div>
+    <div class="card" id="cardFL" style="cursor:pointer" onclick="setFuente('falabella')">
+      <h3>&#x1F7E1; Falabella</h3><div class="value" id="cFL">&mdash;</div>
+      <div style="font-size:12px;color:#fbbf24;margin-top:4px" id="cFLpend"></div>
     </div>
     <div class="card">
       <h3>Pendientes / Error</h3><div class="value" id="cPend">&mdash;</div>
@@ -2411,6 +2919,7 @@ UI_HTML = """<!doctype html>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
     <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 200 ordenes en ML">&#128279; Reconciliar ML</button>
     <button class="secondary" onclick="reconciliarWC()" title="Consulta las ultimas 100 ordenes en WooCommerce">&#128666; Reconciliar WC</button>
+    <button class="secondary" onclick="reconciliarFL()" title="Consulta las ultimas 100 ordenes en Falabella">&#127873; Reconciliar FL</button>
     <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio en ventas ML">&#128666; Actualizar envios</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
   </div>
@@ -2650,6 +3159,9 @@ function fuentebadge(fuente) {
   if (fuente === 'woocommerce') {
     return '<span style="background:#1a3a2a;color:#86efac;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;margin-left:4px">WC</span>';
   }
+  if (fuente === 'falabella') {
+    return '<span style="background:#1a2010;color:#fbbf24;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;margin-left:4px">FL</span>';
+  }
   return '<span style="background:#2a1a3a;color:#c4b5fd;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;margin-left:4px">MAN</span>';
 }
 
@@ -2731,37 +3243,44 @@ function seleccionarTurno(key) {
 
 function setFuente(f) {
   document.getElementById('fuenteFilter').value = f;
-  ['cardTodas','cardML','cardWC'].forEach(function(id) {
-    document.getElementById(id).classList.remove('activa');
+  ['cardTodas','cardML','cardWC','cardFL'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.classList.remove('activa');
   });
   if (f === '') document.getElementById('cardTodas').classList.add('activa');
   else if (f === 'mercadolibre') document.getElementById('cardML').classList.add('activa');
   else if (f === 'woocommerce') document.getElementById('cardWC').classList.add('activa');
+  else if (f === 'falabella') { var cfl = document.getElementById('cardFL'); if (cfl) cfl.classList.add('activa'); }
   renderTable();
 }
 
 function updateStats(items) {
   var totalML  = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre'; }).length;
   var totalWC  = ventas.filter(function(v){ return v.fuente === 'woocommerce'; }).length;
+  var totalFL  = ventas.filter(function(v){ return v.fuente === 'falabella'; }).length;
   var pendML   = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre' && v.estado === 'pendiente'; }).length;
   var pendWC   = ventas.filter(function(v){ return v.fuente === 'woocommerce' && v.estado === 'pendiente'; }).length;
+  var pendFL   = ventas.filter(function(v){ return v.fuente === 'falabella' && v.estado === 'pendiente'; }).length;
   var errML    = ventas.filter(function(v){ return (v.fuente || 'mercadolibre') === 'mercadolibre' && v.estado === 'error'; }).length;
   var errWC    = ventas.filter(function(v){ return v.fuente === 'woocommerce' && v.estado === 'error'; }).length;
+  var errFL    = ventas.filter(function(v){ return v.fuente === 'falabella' && v.estado === 'error'; }).length;
   var totalPend = ventas.filter(function(v){ return v.estado === 'pendiente'; }).length;
   var totalErr  = ventas.filter(function(v){ return v.estado === 'error'; }).length;
   document.getElementById('cTotal').textContent = ventas.length;
   document.getElementById('cML').textContent = totalML;
   document.getElementById('cWC').textContent = totalWC;
+  document.getElementById('cFL').textContent = totalFL;
   document.getElementById('cPend').textContent = totalPend;
   document.getElementById('cMLpend').textContent = pendML + ' pend' + (errML ? ' / ' + errML + ' err' : '');
   document.getElementById('cWCpend').textContent = pendWC + ' pend' + (errWC ? ' / ' + errWC + ' err' : '');
+  document.getElementById('cFLpend').textContent = pendFL + ' pend' + (errFL ? ' / ' + errFL + ' err' : '');
   document.getElementById('cErr').textContent = totalErr > 0 ? totalErr + ' con error' : '';
 }
 
 function filteredVentas() {
   var q = document.getElementById('searchInput').value.trim().toLowerCase();
   var s = document.getElementById('statusFilter').value;
-  var f = document.getElementById('fuenteFilter').value;
+  var f = (document.getElementById('fuenteFilter') || {value:''}).value;
   return ventas.filter(function(v) {
     var okS = !s || v.estado === s;
     var okF = !f || (v.fuente || 'mercadolibre') === f;
@@ -3134,6 +3653,22 @@ function reconciliarWC() {
       } else { alert('Error: ' + (data.detail || 'desconocido')); }
     })
     .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar WC'; } alert('Error: ' + e.message); });
+}
+
+function reconciliarFL() {
+  var btn = document.querySelector('[onclick="reconciliarFL()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Consultando FL...'; }
+  fetch('/fl/reconciliar', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar FL'; }
+      if (data.ok) {
+        var msg = 'FL: ' + data.total_fl + ' | BD: ' + data.en_bd + ' | Faltantes: ' + data.faltantes;
+        if (data.faltantes > 0) { msg += ' - ' + data.mensaje; setTimeout(refreshData, 8000); setTimeout(refreshData, 20000); }
+        alert(msg);
+      } else { alert('Error: ' + (data.detail || 'desconocido')); }
+    })
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar FL'; } alert('Error: ' + e.message); });
 }
 
 function reprocesarTodo() {
