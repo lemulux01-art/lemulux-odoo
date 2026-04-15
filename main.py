@@ -181,11 +181,29 @@ def save_venta(
             existing = cur.fetchone()
 
             if existing:
-                if existing["estado"] in ("enviado", "error"):
+                if existing["estado"] == "enviado":
+                    # Ya enviado: solo actualizar JSONs, no tocar datos tributarios
                     cur.execute(
                         "UPDATE ventas SET order_json = %s, billing_json = %s WHERE id = %s",
                         (json.dumps(order, ensure_ascii=False),
                          json.dumps(billing, ensure_ascii=False), oid),
+                    )
+                elif existing["estado"] == "error":
+                    # En error: actualizar TODOS los campos incluyendo datos tributarios
+                    cur.execute(
+                        """
+                        UPDATE ventas
+                        SET cliente = %s, rut = %s, email = %s, direccion = %s,
+                            ciudad = %s, region = %s, giro = %s, tipo_sugerido = %s,
+                            order_json = %s, billing_json = %s, error = NULL
+                        WHERE id = %s
+                        """,
+                        (
+                            cliente_final, rut_final, email_final, direccion_final,
+                            ciudad_final, region_final, giro_final, tipo_sugerido,
+                            json.dumps(order, ensure_ascii=False),
+                            json.dumps(billing, ensure_ascii=False), oid,
+                        ),
                     )
                 else:
                     if forzar_actualizacion:
@@ -965,8 +983,10 @@ def upsert_partner(ctx, order_id, nombre, rut, email, giro, direccion, es_empres
 # =========================
 
 def find_existing_move(ctx: OdooCtx, order_id: str) -> Optional[int]:
+    # Solo busca documentos activos (draft o posted), NO cancelados
+    # Asi anular_venta() + autorizar() crea documento nuevo correctamente
     ids = odoo_exec(ctx, "account.move", "search",
-        [[["ref", "=", str(order_id)], ["state", "in", ["draft", "posted", "cancel"]]]], {"limit": 1})
+        [[["ref", "=", str(order_id)], ["state", "in", ["draft", "posted"]]]], {"limit": 1})
     return ids[0] if ids else None
 
 
@@ -2434,10 +2454,16 @@ fl_webhook_queue = queue_module.Queue()
 
 
 def fl_sign(params: dict) -> str:
-    """Genera firma HMAC-SHA256 para Falabella Seller Center."""
+    """Genera firma HMAC-SHA256 para Falabella Seller Center.
+    Los valores deben ir URL-encoded antes de firmar, de lo contrario
+    el @ del UserID y el + del Timestamp generan firma incorrecta.
+    """
+    from urllib.parse import quote
     api_key = get_env("FL_API_KEY")
-    sorted_params = sorted(params.items())
-    query_string = "&".join(f"{k}={v}" for k, v in sorted_params)
+    encoded = []
+    for k, v in sorted(params.items()):
+        encoded.append(f"{quote(str(k), safe='')}={quote(str(v), safe='')}")
+    query_string = "&".join(encoded)
     return hmac.new(api_key.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -2634,16 +2660,18 @@ def fl_extract_region(tipo: str, billing: dict, order: dict) -> str:
 
 def fl_build_order_items(items: list, order: dict) -> list:
     """Convierte items de Falabella al formato interno order_items."""
-    result = []
+    # Agrupar por nombre/SKU para consolidar cantidades
+    grouped = {}
     for it in items:
         name  = str(it.get("Name") or it.get("SellerSku") or "Producto FL").strip()
         price = float(it.get("ItemPrice") or it.get("PaidPrice") or 0)
-        result.append({
-            "item":       {"title": name},
-            "quantity":   1,
-            "unit_price": price,
-        })
-    return result
+        qty   = float(it.get("Quantity") or it.get("QtyOrdered") or 1)
+        key   = name
+        if key in grouped:
+            grouped[key]["quantity"] += qty
+        else:
+            grouped[key] = {"item": {"title": name}, "quantity": qty, "unit_price": price}
+    return list(grouped.values())
 
 
 def process_fl_order(order_id: str, order_data: dict = None):
@@ -2654,22 +2682,28 @@ def process_fl_order(order_id: str, order_data: dict = None):
         oid_str = f"FL-{order_id}"
         existing = get_venta(oid_str)
 
+        datos_resumidos = False
         if order_data:
             order = order_data
+            datos_resumidos = True
+            logger.info(f"[FL:{order_id}] Usando datos de GetOrders (resumidos)")
         else:
             order = fl_get_order(order_id)
         if not order:
             logger.warning(f"[FL:{order_id}] Orden no encontrada")
             return
 
-        fl_status = str(order.get("Statuses") or {}).lower()
-        # Normalizar status
-        status_val = order.get("Statuses")
-        if isinstance(status_val, dict):
-            status_val = list(status_val.values())[0] if status_val else "pending"
-        elif isinstance(status_val, list):
-            status_val = status_val[0] if status_val else "pending"
-        status_val = str(status_val).lower().replace(" ", "_")
+        # Normalizar status de forma robusta
+        _s = order.get("Statuses")
+        if isinstance(_s, dict):
+            status_val = _s.get("Status", "pending")
+        elif isinstance(_s, list):
+            status_val = _s[0] if _s else "pending"
+        elif isinstance(_s, str):
+            status_val = _s
+        else:
+            status_val = "pending"
+        status_val = str(status_val).strip().lower().replace(" ", "_")
 
         if existing:
             update_venta(oid_str, estado_envio=status_val)
@@ -2754,7 +2788,10 @@ def process_fl_order(order_id: str, order_data: dict = None):
                     ),
                 )
             conn.commit()
-        logger.info(f"[FL:{order_id}] Guardada -> tipo={tipo} rut={rut or 'sin RUT'} cliente={nombre}")
+        if datos_resumidos and not rut:
+            logger.warning(f"[FL:{order_id}] Guardada con datos RESUMIDOS (GetOrders) sin RUT - reprocesar cuando whitelist disponible")
+        else:
+            logger.info(f"[FL:{order_id}] Guardada -> tipo={tipo} rut={rut or 'sin RUT'} cliente={nombre}")
 
     except Exception as e:
         logger.error(f"[FL:{order_id}] Error procesando: {e}", exc_info=True)
@@ -2789,8 +2826,21 @@ def reconciliar_fl_ordenes():
                 with conn.cursor() as cur:
                     cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_fl,))
                     ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
+            def fl_get_status(o):
+                """Extrae status de forma robusta sin importar el shape de Statuses."""
+                s = o.get("Statuses")
+                if isinstance(s, dict):
+                    val = s.get("Status", "")
+                elif isinstance(s, list):
+                    val = s[0] if s else ""
+                elif isinstance(s, str):
+                    val = s
+                else:
+                    val = ""
+                return str(val).strip().lower().replace(" ", "_")
+
             faltantes = [o for o in ordenes if f"FL-{o['OrderId']}" not in ids_en_bd
-                         and str(o.get("Statuses", {}).get("Status", "")) in FL_ESTADOS_VALIDOS]
+                         and fl_get_status(o) in FL_ESTADOS_VALIDOS]
             if faltantes:
                 logger.warning(f"[FL] Reconciliacion: {len(faltantes)} faltantes, procesando hasta 10")
                 for o in faltantes[:10]:
