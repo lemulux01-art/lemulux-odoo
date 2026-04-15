@@ -2348,12 +2348,18 @@ def fl_reconciliar_manual():
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_fl,))
                 ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
-        faltantes_ids = [str(o["OrderId"]) for o in ordenes if f"FL-{o['OrderId']}" not in ids_en_bd]
-        def encolar():
-            for oid in faltantes_ids:
-                fl_webhook_queue.put(oid)
-                time.sleep(1)
-        threading.Thread(target=encolar, daemon=True).start()
+        faltantes = [o for o in ordenes if f"FL-{o['OrderId']}" not in ids_en_bd]
+        faltantes_ids = [str(o["OrderId"]) for o in faltantes]
+        def procesar_faltantes():
+            for o in faltantes:
+                try:
+                    process_fl_order(str(o["OrderId"]), order_data=o)
+                    time.sleep(1)
+                except Exception as e:
+                    logger.error(f"[FL] Error en reconciliar manual {o['OrderId']}: {e}")
+                    time.sleep(2)
+            logger.info(f"[FL] Reconciliacion manual completada: {len(faltantes)} procesadas")
+        threading.Thread(target=procesar_faltantes, daemon=True).start()
         return {
             "ok": True, "total_fl": len(ordenes), "en_bd": len(ids_en_bd),
             "faltantes": len(faltantes_ids), "encoladas": faltantes_ids[:5],
@@ -2640,13 +2646,18 @@ def fl_build_order_items(items: list, order: dict) -> list:
     return result
 
 
-def process_fl_order(order_id: str):
-    """Procesa una orden Falabella y la guarda en tabla ventas."""
+def process_fl_order(order_id: str, order_data: dict = None):
+    """Procesa una orden Falabella y la guarda en tabla ventas.
+    Si order_data se provee (desde GetOrders), se usa directamente sin llamar GetOrder.
+    """
     try:
         oid_str = f"FL-{order_id}"
         existing = get_venta(oid_str)
 
-        order = fl_get_order(order_id)
+        if order_data:
+            order = order_data
+        else:
+            order = fl_get_order(order_id)
         if not order:
             logger.warning(f"[FL:{order_id}] Orden no encontrada")
             return
@@ -2781,10 +2792,15 @@ def reconciliar_fl_ordenes():
             faltantes = [o for o in ordenes if f"FL-{o['OrderId']}" not in ids_en_bd
                          and str(o.get("Statuses", {}).get("Status", "")) in FL_ESTADOS_VALIDOS]
             if faltantes:
-                logger.warning(f"[FL] Reconciliacion: {len(faltantes)} faltantes, encolando hasta 10")
+                logger.warning(f"[FL] Reconciliacion: {len(faltantes)} faltantes, procesando hasta 10")
                 for o in faltantes[:10]:
-                    fl_webhook_queue.put(str(o["OrderId"]))
-                    time.sleep(1)
+                    try:
+                        # Pasar order_data directamente desde GetOrders (evita llamar GetOrder)
+                        process_fl_order(str(o["OrderId"]), order_data=o)
+                        time.sleep(1)
+                    except Exception as e:
+                        logger.error(f"[FL] Error procesando {o['OrderId']}: {e}")
+                        time.sleep(2)
             else:
                 logger.info(f"[FL] Reconciliacion OK: {len(ordenes)} ordenes en BD")
         except Exception as e:
