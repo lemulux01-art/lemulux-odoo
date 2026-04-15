@@ -3934,6 +3934,15 @@ setInterval(function() {
 }, 30000);
 '''
 
+@app.get("/mi-ip")
+def mi_ip():
+    try:
+        res = requests.get("https://ifconfig.me", headers={"User-Agent": "curl/7"}, timeout=10)
+        return {"ip": res.text.strip()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/ui/app.js")
 def ui_js():
     from fastapi.responses import Response
