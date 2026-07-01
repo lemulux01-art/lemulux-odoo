@@ -1086,6 +1086,29 @@ def create_document(order, billing_raw, tipo, email, giro,
         if tax_id:
             line_vals["tax_ids"] = [(6, 0, [tax_id])]
         lines.append((0, 0, line_vals))
+    # Envio Mercado Libre: el costo que pago el comprador viene en payments[].shipping_cost
+    # (0.0 cuando el envio es gratis, ej. sobre $19.990). Se agrega como una linea mas en BRUTO
+    # y create_document la netea igual que los productos (Odoo guarda neto). WC/FL/manual no
+    # traen payments ni shipping_cost, por lo que aqui dan 0 y no se agrega nada (WC mete su
+    # envio por otra via en wc_build_order_items).
+    envio_bruto = 0.0
+    for p in (order.get("payments") or []):
+        try:
+            envio_bruto += float(p.get("shipping_cost") or 0)
+        except (TypeError, ValueError):
+            pass
+    if envio_bruto <= 0:
+        try:
+            envio_bruto = float(order.get("shipping_cost") or 0)
+        except (TypeError, ValueError):
+            envio_bruto = 0.0
+    if envio_bruto > 0:
+        price_envio = round(envio_bruto / IVA_RATE, 2)
+        envio_line = {"name": "Despacho", "quantity": 1, "price_unit": price_envio}
+        if tax_id:
+            envio_line["tax_ids"] = [(6, 0, [tax_id])]
+        lines.append((0, 0, envio_line))
+        logger.info(f"[{order_id}] Linea de envio agregada: bruto={envio_bruto} neto={price_envio}")
     if not lines:
         raise Exception("La orden no tiene lineas")
     move_vals = {
