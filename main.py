@@ -45,13 +45,26 @@ ODOO_PAYMENT_TERM_CONTADO_ID = 1
 # INTERRUPTOR DE AUTO-EMISION
 # =========================
 # Controla si el DTE se emite solo al ingresar la compra. Valores: "auto" | "manual".
-#   AUTO_EMIT_BOLETAS=auto    -> las boletas se emiten automaticamente
-#   AUTO_EMIT_BOLETAS=manual  -> las boletas quedan pendientes para autorizar a mano
-#   AUTO_EMIT_FACTURAS=auto   -> las facturas se emiten solo si tienen datos completos
-#   AUTO_EMIT_FACTURAS=manual -> las facturas quedan siempre pendientes
-# Todo manual = ambas en "manual". Cambiar en Railway sin tocar codigo.
-AUTO_EMIT_BOLETAS = os.getenv("AUTO_EMIT_BOLETAS", "auto").strip().lower()
-AUTO_EMIT_FACTURAS = os.getenv("AUTO_EMIT_FACTURAS", "auto").strip().lower()
+#   auto   -> boletas: se emiten siempre; facturas: solo si tienen datos completos
+#   manual -> quedan pendientes para autorizar a mano
+# Separado POR CANAL (mercadolibre / woocommerce / falabella) y por tipo (boletas / facturas).
+# Se puede cambiar EN VIVO desde el dashboard (se guarda en la BD y persiste reinicios).
+# Env vars solo dan el valor INICIAL: AUTO_EMIT_{ML|WC|FL}_{BOLETAS|FACTURAS}, y si no,
+# cae al global AUTO_EMIT_{BOLETAS|FACTURAS}, y si tampoco, "auto".
+def _auto_emit_default(src: str, tipo: str) -> str:
+    esp = os.getenv(f"AUTO_EMIT_{src}_{tipo}")
+    if esp:
+        return esp.strip().lower()
+    glob = os.getenv(f"AUTO_EMIT_{tipo}")
+    if glob:
+        return glob.strip().lower()
+    return "auto"
+
+AUTO_EMIT = {
+    "mercadolibre": {"boletas": _auto_emit_default("ML", "BOLETAS"), "facturas": _auto_emit_default("ML", "FACTURAS")},
+    "woocommerce":  {"boletas": _auto_emit_default("WC", "BOLETAS"), "facturas": _auto_emit_default("WC", "FACTURAS")},
+    "falabella":    {"boletas": _auto_emit_default("FL", "BOLETAS"), "facturas": _auto_emit_default("FL", "FACTURAS")},
+}
 
 ODOO_STANDARD_NARRATION = (
     '<p>Para futuras compras:&nbsp;</p>'
@@ -143,6 +156,9 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fuente TEXT DEFAULT 'mercadolibre'",
             ]:
                 cur.execute(stmt)
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS app_config (clave TEXT PRIMARY KEY, valor TEXT)"
+            )
         conn.commit()
     logger.info("Tabla ventas verificada en PostgreSQL")
 
@@ -332,6 +348,31 @@ def update_venta(oid: str, **kwargs):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(f"UPDATE ventas SET {fields} WHERE id = %s", values)
+        conn.commit()
+
+
+def get_config(clave: str, default: str = None) -> Optional[str]:
+    """Lee un valor de configuracion persistente (tabla app_config)."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT valor FROM app_config WHERE clave = %s", (clave,))
+                row = cur.fetchone()
+        return row["valor"] if row else default
+    except Exception as e:
+        logger.warning(f"get_config({clave}) fallo: {e}")
+        return default
+
+
+def set_config(clave: str, valor: str):
+    """Guarda/actualiza un valor de configuracion persistente."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO app_config (clave, valor) VALUES (%s, %s)
+                   ON CONFLICT (clave) DO UPDATE SET valor = EXCLUDED.valor""",
+                (clave, valor),
+            )
         conn.commit()
 
 
@@ -1117,17 +1158,19 @@ def auto_emitir_venta(oid: str):
     venta = get_venta(oid)
     if not venta or venta.get("estado") != "pendiente":
         return
+    fuente = (venta.get("fuente") or "mercadolibre").strip().lower()
+    cfg = AUTO_EMIT.get(fuente, AUTO_EMIT["mercadolibre"])
     tipo = venta.get("tipo_sugerido") or "Boleta"
     if tipo == "Factura":
-        if AUTO_EMIT_FACTURAS != "auto":
-            logger.info(f"[{oid}] Factura en modo manual (AUTO_EMIT_FACTURAS), queda pendiente")
+        if cfg.get("facturas") != "auto":
+            logger.info(f"[{oid}] Factura ({fuente}) en modo manual, queda pendiente")
             return
         if not datos_completos_para_factura(venta):
             logger.info(f"[{oid}] Auto-emision pospuesta: factura con datos incompletos, queda pendiente")
             return
     else:
-        if AUTO_EMIT_BOLETAS != "auto":
-            logger.info(f"[{oid}] Boleta en modo manual (AUTO_EMIT_BOLETAS), queda pendiente")
+        if cfg.get("boletas") != "auto":
+            logger.info(f"[{oid}] Boleta ({fuente}) en modo manual, queda pendiente")
             return
     try:
         move_id, _ = emitir_venta(oid)
@@ -1860,7 +1903,22 @@ async def on_startup():
     fr = threading.Thread(target=reconciliar_fl_ordenes, daemon=True)
     fr.start()
     logger.info("Reconciliador Falabella iniciado (cada 25 min)")
-    logger.info(f"Auto-emision -> boletas={AUTO_EMIT_BOLETAS} facturas={AUTO_EMIT_FACTURAS}")
+    # Cargar overrides persistidos del interruptor (los env vars son solo el default inicial).
+    # Migracion: si existen las claves globales viejas, se aplican como default a todos los canales...
+    old_b = get_config("auto_emit_boletas")
+    old_f = get_config("auto_emit_facturas")
+    for _fuente in AUTO_EMIT:
+        if old_b in ("auto", "manual"):
+            AUTO_EMIT[_fuente]["boletas"] = old_b
+        if old_f in ("auto", "manual"):
+            AUTO_EMIT[_fuente]["facturas"] = old_f
+    # ...y luego los valores por canal (nuevos) sobreescriben.
+    for _fuente in AUTO_EMIT:
+        for _campo in ("boletas", "facturas"):
+            _val = get_config(f"auto_emit_{_fuente}_{_campo}")
+            if _val in ("auto", "manual"):
+                AUTO_EMIT[_fuente][_campo] = _val
+    logger.info(f"Auto-emision -> {AUTO_EMIT}")
 
 
 # =========================
@@ -1886,12 +1944,35 @@ def health():
 
 @app.get("/config/auto-emision")
 def config_auto_emision():
-    """Muestra el estado actual del interruptor de auto-emision."""
+    """Muestra el estado actual del interruptor de auto-emision por canal."""
     return {
-        "boletas": AUTO_EMIT_BOLETAS,
-        "facturas": AUTO_EMIT_FACTURAS,
-        "nota": "Valores: 'auto' o 'manual'. Se cambian con las env vars AUTO_EMIT_BOLETAS / AUTO_EMIT_FACTURAS y reinicio.",
+        **AUTO_EMIT,
+        "nota": "Valores: 'auto' o 'manual' por canal/tipo. Editable en vivo desde el dashboard (POST /config/auto-emision).",
     }
+
+
+class AutoEmisionPayload(BaseModel):
+    fuente: str
+    boletas: Optional[str] = None
+    facturas: Optional[str] = None
+
+
+@app.post("/config/auto-emision")
+def set_auto_emision(payload: AutoEmisionPayload):
+    """Cambia el interruptor de auto-emision de un canal en vivo y lo persiste en la BD."""
+    fuente = (payload.fuente or "").strip().lower()
+    if fuente not in AUTO_EMIT:
+        raise HTTPException(status_code=400, detail="fuente debe ser 'mercadolibre', 'woocommerce' o 'falabella'")
+    for campo, valor in (("boletas", payload.boletas), ("facturas", payload.facturas)):
+        if valor is None:
+            continue
+        valor = valor.strip().lower()
+        if valor not in ("auto", "manual"):
+            raise HTTPException(status_code=400, detail=f"{campo} debe ser 'auto' o 'manual'")
+        AUTO_EMIT[fuente][campo] = valor
+        set_config(f"auto_emit_{fuente}_{campo}", valor)
+    logger.info(f"Auto-emision cambiada [{fuente}] -> {AUTO_EMIT[fuente]}")
+    return {"ok": True, "fuente": fuente, **AUTO_EMIT[fuente]}
 
 
 @app.get("/debug/shipping/{oid}")
@@ -3229,6 +3310,28 @@ UI_HTML = """<!doctype html>
       <div style="font-size:12px;color:#f87171;margin-top:4px" id="cErr"></div>
     </div>
   </div>
+  <div style="margin-bottom:12px;padding:12px 14px;background:var(--panel);border:1px solid var(--border);border-radius:12px">
+    <div style="font-size:13px;font-weight:700;margin-bottom:10px">&#9889; Auto-emisi&oacute;n autom&aacute;tica por canal
+      <span id="cfgEstado" style="font-weight:400;font-size:12px;color:var(--muted);margin-left:8px"></span></div>
+    <div style="display:grid;grid-template-columns:auto auto auto;gap:8px 20px;align-items:center">
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Canal</span>
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Boletas</span>
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Facturas</span>
+
+      <span style="font-size:13px">&#x1F6CD; Mercado Libre</span>
+      <select id="cfgMLBoletas" onchange="guardarAutoEmision('mercadolibre')" style="padding:6px 10px"><option value="auto">Autom&aacute;tica</option><option value="manual">Manual</option></select>
+      <select id="cfgMLFacturas" onchange="guardarAutoEmision('mercadolibre')" style="padding:6px 10px"><option value="auto">Autom&aacute;tica</option><option value="manual">Manual</option></select>
+
+      <span style="font-size:13px">&#x1F6D2; WooCommerce</span>
+      <select id="cfgWCBoletas" onchange="guardarAutoEmision('woocommerce')" style="padding:6px 10px"><option value="auto">Autom&aacute;tica</option><option value="manual">Manual</option></select>
+      <select id="cfgWCFacturas" onchange="guardarAutoEmision('woocommerce')" style="padding:6px 10px"><option value="auto">Autom&aacute;tica</option><option value="manual">Manual</option></select>
+
+      <span style="font-size:13px">&#x1F7E1; Falabella</span>
+      <select id="cfgFLBoletas" onchange="guardarAutoEmision('falabella')" style="padding:6px 10px"><option value="auto">Autom&aacute;tica</option><option value="manual">Manual</option></select>
+      <select id="cfgFLFacturas" onchange="guardarAutoEmision('falabella')" style="padding:6px 10px"><option value="auto">Autom&aacute;tica</option><option value="manual">Manual</option></select>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px">Facturas en "Autom&aacute;tica" se emiten solo si tienen raz&oacute;n social + RUT + direcci&oacute;n + giro; si no, quedan pendientes.</div>
+  </div>
   <div class="toolbar">
     <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="renderTable()">
     <select id="statusFilter" onchange="renderTable()">
@@ -3920,6 +4023,50 @@ function recalcularWC(id) {
     .catch(function(e) { alert('Error: ' + e.message); });
 }
 
+var CFG_IDS = {
+  mercadolibre: {b: 'cfgMLBoletas', f: 'cfgMLFacturas'},
+  woocommerce:  {b: 'cfgWCBoletas', f: 'cfgWCFacturas'},
+  falabella:    {b: 'cfgFLBoletas', f: 'cfgFLFacturas'}
+};
+
+function cargarAutoEmision() {
+  fetch('/config/auto-emision')
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      Object.keys(CFG_IDS).forEach(function(fuente) {
+        var cfg = d[fuente];
+        if (!cfg) return;
+        var ids = CFG_IDS[fuente];
+        if (cfg.boletas) document.getElementById(ids.b).value = cfg.boletas;
+        if (cfg.facturas) document.getElementById(ids.f).value = cfg.facturas;
+      });
+      var est = document.getElementById('cfgEstado');
+      if (est) est.textContent = '';
+    })
+    .catch(function(){});
+}
+
+function guardarAutoEmision(fuente) {
+  var ids = CFG_IDS[fuente];
+  if (!ids) return;
+  var b = document.getElementById(ids.b).value;
+  var f = document.getElementById(ids.f).value;
+  var est = document.getElementById('cfgEstado');
+  if (est) { est.textContent = 'Guardando...'; est.style.color = '#94a3b8'; }
+  fetch('/config/auto-emision', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({fuente: fuente, boletas: b, facturas: f})
+  }).then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (est) {
+        if (d.ok) { est.textContent = 'Guardado \\u2713 ' + fuente + ': boletas ' + d.boletas + ' / facturas ' + d.facturas; est.style.color = '#4ade80'; }
+        else { est.textContent = 'Error: ' + (d.detail || 'desconocido'); est.style.color = '#f87171'; }
+      }
+    })
+    .catch(function(e){ if (est) { est.textContent = 'Error: ' + e.message; est.style.color = '#f87171'; } });
+}
+
 function recalcularWCTodos() {
   var wcPend = ventas.filter(function(v){ return v.fuente === 'woocommerce' && (v.estado === 'pendiente' || v.estado === 'error'); });
   if (!wcPend.length) { alert('No hay ventas WooCommerce pendientes/con error para recalcular'); return; }
@@ -4325,6 +4472,7 @@ document.getElementById('ncModal').addEventListener('click', function(e) { if (e
 document.getElementById('ventaManualModal').addEventListener('click', function(e) { if (e.target.id === 'ventaManualModal') cerrarIngresarVenta(); });
 
 refreshData();
+cargarAutoEmision();
 setInterval(function() {
   var anyOpen = ['editModal','packModal','calModal','clienteModal'].some(function(id) {
     return document.getElementById(id).classList.contains('open');
