@@ -195,6 +195,11 @@ def save_venta(
     oid = str(pack_id) if pack_id else str(order["id"])
     if order_items_override is not None:
         order = {**order, "order_items": order_items_override}
+    # Un solo fetch del shipment: tipo de envio + costo de envio del comprador (Mercado Envios).
+    # El costo se persiste en order_json["shipping_cost"] para que summarize_order_items y
+    # create_document lo usen sin volver a llamar a ML en cada carga.
+    tipo_envio_ml, envio_costo = get_ml_shipment_info(order)
+    order = {**order, "shipping_cost": envio_costo}
     email_final = (email or ML_DEFAULT_EMAIL).strip()
     rut_final = normalize_rut(rut)
     direccion_final = (direccion or "").strip()
@@ -296,8 +301,6 @@ def save_venta(
                 conn.commit()
                 logger.info(f"[{oid}] Venta actualizada (estado={existing['estado']})")
                 return
-
-            tipo_envio_ml = extract_logistic_type(order)
 
             cur.execute(
                 """
@@ -717,6 +720,24 @@ def detect_tipo(order: dict, billing_info: dict) -> str:
     return "Boleta"
 
 
+def extract_shipping_cost(order: dict) -> float:
+    """Costo de envio BRUTO que pago el comprador. Mercado Libre lo trae en
+    payments[].shipping_cost (con fallback al shipping_cost raiz). WC/FL/manual no
+    traen payments, asi que aqui dan 0 (WC ya incluye su envio en order_items)."""
+    envio = 0.0
+    for p in (order.get("payments") or []):
+        try:
+            envio += float(p.get("shipping_cost") or 0)
+        except (TypeError, ValueError):
+            pass
+    if envio <= 0:
+        try:
+            envio = float(order.get("shipping_cost") or 0)
+        except (TypeError, ValueError):
+            envio = 0.0
+    return envio if envio > 0 else 0.0
+
+
 def summarize_order_items(order: dict) -> tuple:
     items_summary = []
     item_count = 0
@@ -729,6 +750,10 @@ def summarize_order_items(order: dict) -> tuple:
         item_count += int(qty)
         total_bruto += subtotal
         items_summary.append(f"{title} x{int(qty)}")
+    envio = extract_shipping_cost(order)
+    if envio > 0:
+        total_bruto += envio
+        items_summary.append(f"Despacho ({int(round(envio))})")
     return items_summary, item_count, round(total_bruto, 2)
 
 
@@ -829,23 +854,38 @@ def get_ml_shipment(shipping_id) -> dict:
         return {}
 
 
-def extract_logistic_type(order: dict) -> str:
+def get_ml_shipment_info(order: dict) -> tuple:
+    """Con UN solo fetch del shipment devuelve (tipo_envio, costo_envio_comprador).
+    El costo que paga el comprador (Mercado Envios) esta en shipping_option.cost — 0.0 si es
+    gratis. Confirmado en docs ML: en shipping_option, 'cost' = costo real a cargo del comprador
+    (list_cost = precio de lista). No esta en order.payments; por eso hay que leer el shipment."""
     shipping = order.get("shipping") or {}
     shipping_id = shipping.get("id")
     if not shipping_id:
-        return ""
+        return "", 0.0
     shipment = get_ml_shipment(shipping_id)
     if not shipment:
-        return ""
+        return "", 0.0
     logistic_type = shipment.get("logistic_type", "")
     if logistic_type == "fulfillment":
-        return "Full"
-    sender_types = (shipment.get("sender_address") or {}).get("types") or []
-    if "self_service_partner" in sender_types:
-        return "Flex"
-    if "milkrun" in sender_types or logistic_type == "cross_docking":
-        return "Colecta"
-    return logistic_type or ""
+        tipo = "Full"
+    else:
+        sender_types = (shipment.get("sender_address") or {}).get("types") or []
+        if "self_service_partner" in sender_types:
+            tipo = "Flex"
+        elif "milkrun" in sender_types or logistic_type == "cross_docking":
+            tipo = "Colecta"
+        else:
+            tipo = logistic_type or ""
+    try:
+        costo = float((shipment.get("shipping_option") or {}).get("cost") or 0)
+    except (TypeError, ValueError):
+        costo = 0.0
+    return tipo, (costo if costo > 0 else 0.0)
+
+
+def extract_logistic_type(order: dict) -> str:
+    return get_ml_shipment_info(order)[0]
 
 
 def get_ml_pack(pack_id: str) -> dict:
@@ -1086,22 +1126,11 @@ def create_document(order, billing_raw, tipo, email, giro,
         if tax_id:
             line_vals["tax_ids"] = [(6, 0, [tax_id])]
         lines.append((0, 0, line_vals))
-    # Envio Mercado Libre: el costo que pago el comprador viene en payments[].shipping_cost
-    # (0.0 cuando el envio es gratis, ej. sobre $19.990). Se agrega como una linea mas en BRUTO
-    # y create_document la netea igual que los productos (Odoo guarda neto). WC/FL/manual no
-    # traen payments ni shipping_cost, por lo que aqui dan 0 y no se agrega nada (WC mete su
-    # envio por otra via en wc_build_order_items).
-    envio_bruto = 0.0
-    for p in (order.get("payments") or []):
-        try:
-            envio_bruto += float(p.get("shipping_cost") or 0)
-        except (TypeError, ValueError):
-            pass
-    if envio_bruto <= 0:
-        try:
-            envio_bruto = float(order.get("shipping_cost") or 0)
-        except (TypeError, ValueError):
-            envio_bruto = 0.0
+    # Envio Mercado Libre: el costo que pago el comprador (payments[].shipping_cost) se agrega
+    # como una linea mas en BRUTO; create_document la netea igual que los productos (Odoo guarda
+    # neto). Envio gratis = 0 -> no agrega nada. WC/FL/manual no traen payments (WC mete su envio
+    # por otra via en wc_build_order_items). Mismo helper que summarize_order_items -> preview = DTE.
+    envio_bruto = extract_shipping_cost(order)
     if envio_bruto > 0:
         price_envio = round(envio_bruto / IVA_RATE, 2)
         envio_line = {"name": "Despacho", "quantity": 1, "price_unit": price_envio}
