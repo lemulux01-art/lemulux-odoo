@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 import os
@@ -1749,6 +1749,55 @@ def process_wc_order(order_id: str):
         logger.error(f"[WC:{order_id}] Error procesando: {e}", exc_info=True)
 
 
+def reprocesar_wc_venta(oid: str) -> dict:
+    """Recalcula una venta WooCommerce existente re-consultando la API de WC y
+    reconstruyendo el order_json con los montos corregidos (IVA + envio).
+    Solo actua sobre ventas NO enviadas (pendiente/error). Devuelve un resumen."""
+    venta = get_venta(oid)
+    if not venta:
+        raise Exception(f"Venta {oid} no encontrada")
+    if (venta.get("fuente") or "") != "woocommerce":
+        raise Exception(f"La venta {oid} no es de WooCommerce")
+    if venta.get("estado") == "enviado":
+        raise Exception(f"La venta {oid} ya fue emitida en Odoo; anulala antes de recalcular")
+    if venta.get("estado") not in ("pendiente", "error"):
+        raise Exception(f"La venta {oid} esta en estado '{venta.get('estado')}', no se recalcula")
+
+    order_id = oid[3:] if oid.startswith("WC-") else oid
+    wc_order = get_wc_order(order_id)
+    if not wc_order:
+        raise Exception(f"Orden WC {order_id} no encontrada en WooCommerce")
+
+    tipo      = wc_extract_tipodoc(wc_order)
+    rut       = wc_extract_rut(wc_order, tipo)
+    nombre    = wc_extract_nombre(wc_order, tipo)
+    email     = wc_extract_email(wc_order)
+    giro      = wc_extract_giro(wc_order, tipo)
+    direccion = wc_extract_direccion(wc_order)
+    ciudad    = wc_extract_ciudad(wc_order)
+    region    = wc_extract_region(wc_order)
+    fake_order = wc_build_fake_order(wc_order)  # ya con precios brutos corregidos + envio
+
+    update_venta(
+        oid,
+        estado="pendiente",
+        cliente=(nombre or "Cliente WC").strip(),
+        rut=normalize_rut(rut) if rut else "",
+        email=(email or WC_DEFAULT_EMAIL).strip(),
+        giro=(giro or "").strip(),
+        direccion=(direccion or "").strip(),
+        ciudad=(ciudad or "").strip(),
+        region=(region or "").strip(),
+        tipo_sugerido=tipo,
+        estado_envio=wc_order.get("status", ""),
+        order_json=json.dumps(fake_order, ensure_ascii=False),
+        error=None,
+    )
+    _, item_count, total_bruto = summarize_order_items(fake_order)
+    logger.info(f"[{oid}] Recalculada desde WC -> tipo={tipo} total_bruto={total_bruto} items={item_count}")
+    return {"id": oid, "cliente": nombre, "tipo": tipo, "total_bruto": total_bruto, "item_count": item_count}
+
+
 def reconciliar_wc_ordenes():
     while True:
         time.sleep(20 * 60)
@@ -1979,6 +2028,32 @@ def wc_ingresar_manual(order_id: str):
         return {"ok": True, "id": f"WC-{order_id}", "message": "Procesado, verificar en dashboard"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/wc/recalcular-pendientes")
+def wc_recalcular_pendientes():
+    """Recalcula (arregla montos IVA + envio) todas las ventas WooCommerce NO enviadas.
+    Corre en background porque hace una consulta a WooCommerce por cada venta."""
+    pendientes = [v for v in (list_ventas("pendiente") + list_ventas("error"))
+                  if (v.get("fuente") or "") == "woocommerce"]
+    ids = [str(v["id"]) for v in pendientes]
+    if not ids:
+        return {"ok": True, "total": 0, "mensaje": "No hay ventas WC pendientes/con error para recalcular"}
+    def procesar():
+        ok = 0
+        err = 0
+        for oid in ids:
+            try:
+                reprocesar_wc_venta(oid)
+                ok += 1
+            except Exception as e:
+                err += 1
+                logger.error(f"[{oid}] Error recalculando WC: {e}")
+            time.sleep(1)
+        logger.info(f"[WC] Recalculo de pendientes: {ok} OK, {err} errores")
+    threading.Thread(target=procesar, daemon=True).start()
+    return {"ok": True, "total": len(ids),
+            "mensaje": f"Recalculando {len(ids)} ventas WC en background. Revisa el dashboard en unos momentos."}
 
 
 @app.get("/ml/oauth/callback")
@@ -2371,6 +2446,17 @@ def reprocesar_venta(oid: str):
         return {"ok": True, "id": oid, "data": data}
     except Exception as e:
         logger.error(f"[{oid}] Error reprocesando: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ventas/{oid}/recalcular-wc")
+def recalcular_wc_venta_endpoint(oid: str):
+    """Recalcula una venta WooCommerce desde la web (arregla montos IVA + envio)."""
+    try:
+        data = reprocesar_wc_venta(str(oid))
+        return {"ok": True, **data}
+    except Exception as e:
+        logger.error(f"[{oid}] Error recalculando WC: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3167,6 +3253,7 @@ UI_HTML = """<!doctype html>
     <button class="secondary" onclick="reconciliarWC()" title="Consulta las ultimas 100 ordenes en WooCommerce">&#128666; Reconciliar WC</button>
     <button class="secondary" onclick="reconciliarFL()" title="Consulta las ultimas 100 ordenes en Falabella">&#127873; Reconciliar FL</button>
     <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio en ventas ML">&#128666; Actualizar envios</button>
+    <button class="warn" onclick="recalcularWCTodos()" title="Corrige montos (IVA + envio) de ventas WooCommerce pendientes">&#128260; Recalcular WC</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
     <button id="btnAutorizarMasivo" class="success" style="display:none" onclick="autorizarMasivo()">&#10003; Autorizar seleccionadas</button>
   </div>
@@ -3556,6 +3643,9 @@ function rowHtml(v) {
   if ((v.fuente || 'mercadolibre') === 'mercadolibre') {
     acciones += '<button class="warn" data-action="reprocesar" data-id="' + esc(id) + '">Reprocesar</button> ';
   }
+  if (v.fuente === 'woocommerce' && v.estado !== 'enviado') {
+    acciones += '<button class="warn" data-action="recalcwc" data-id="' + esc(id) + '">Recalcular</button> ';
+  }
   if (v.pack_id) {
     acciones += '<button class="pack-btn" data-action="verpack" data-id="' + esc(id) + '" data-pack="' + esc(v.pack_id) + '">Pack</button> ';
   }
@@ -3613,6 +3703,7 @@ function renderTable() {
       var id = el.dataset.id;
       if (action === 'edit') openEdit(id);
       else if (action === 'reprocesar') reprocesar(id);
+      else if (action === 'recalcwc') recalcularWC(id);
       else if (action === 'autorizar') autorizar(id);
       else if (action === 'anular') anular(id);
       else if (action === 'notacredito') abrirNC(id);
@@ -3816,6 +3907,33 @@ function reprocesar(id) {
 function reprocesarActual() {
   if (!currentId) return;
   reprocesar(currentId);
+}
+
+function recalcularWC(id) {
+  if (!confirm('Recalcular la venta ' + id + ' desde WooCommerce? Corrige montos (IVA + envio).')) return;
+  fetch('/ventas/' + id + '/recalcular-wc', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) { alert('Venta recalculada. Nuevo total: ' + money(data.total_bruto)); refreshData(); }
+      else { alert('Error: ' + (data.detail || 'desconocido')); }
+    })
+    .catch(function(e) { alert('Error: ' + e.message); });
+}
+
+function recalcularWCTodos() {
+  var wcPend = ventas.filter(function(v){ return v.fuente === 'woocommerce' && (v.estado === 'pendiente' || v.estado === 'error'); });
+  if (!wcPend.length) { alert('No hay ventas WooCommerce pendientes/con error para recalcular'); return; }
+  if (!confirm('Recalcular ' + wcPend.length + ' venta(s) WooCommerce pendientes/con error desde la web? (corrige montos IVA + envio)')) return;
+  var btn = document.querySelector('[onclick="recalcularWCTodos()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Recalculando...'; }
+  fetch('/wc/recalcular-pendientes', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.innerHTML = '&#128260; Recalcular WC'; }
+      if (data.ok) { alert(data.mensaje); if (data.total > 0) { setTimeout(refreshData, 10000); setTimeout(refreshData, 30000); } }
+      else { alert('Error: ' + (data.detail || 'desconocido')); }
+    })
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.innerHTML = '&#128260; Recalcular WC'; } alert('Error: ' + e.message); });
 }
 
 function cambiarEstadoActual() {
