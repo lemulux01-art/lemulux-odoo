@@ -3385,16 +3385,22 @@ UI_HTML = """<!doctype html>
     <div style="font-size:11px;color:var(--muted);margin-top:8px">Facturas en "Autom&aacute;tica" se emiten solo si tienen raz&oacute;n social + RUT + direcci&oacute;n + giro; si no, quedan pendientes.</div>
   </div>
   <div class="toolbar">
-    <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="renderTable()">
-    <select id="statusFilter" onchange="renderTable()">
+    <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="resetYRender()">
+    <select id="statusFilter" onchange="resetYRender()">
       <option value="pendiente">Pendiente</option>
       <option value="">Todos los estados</option>
       <option value="enviado">Enviado</option>
       <option value="error">Error</option>
       <option value="rechazado">Rechazado</option>
     </select>
+    <select id="pageSize" onchange="resetYRender()" title="Filas por pagina">
+      <option value="50">50 por pagina</option>
+      <option value="100">100 por pagina</option>
+      <option value="500">500 por pagina</option>
+      <option value="1000">1000 por pagina</option>
+    </select>
     <input type="hidden" id="fuenteFilter" value="">
-    <select id="horaCorte" onchange="recalcularTurnos()">
+    <select id="horaCorte" onchange="resetYRender()">
       <option value="14">Corte 14:00</option>
       <option value="15">Corte 15:00</option>
       <option value="13">Corte 13:00</option>
@@ -3414,28 +3420,34 @@ UI_HTML = """<!doctype html>
   </div>
   <div id="selInfo" style="display:none;margin-bottom:10px;font-size:13px;color:var(--muted)"><span id="selCount"></span></div>
   <div id="tableWrap"><div class="empty">Cargando...</div></div>
+  <div id="pager"></div>
 </div>
 
 <!-- Modal Calendario -->
 <div class="modal" id="calModal">
-  <div class="modal-card" style="max-width:520px">
+  <div class="modal-card" style="width:min(1050px,96vw)">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-      <div class="title" style="font-size:20px">Seleccionar turno</div>
+      <div class="title" style="font-size:20px">&#128197; Calendario de ventas</div>
       <button class="secondary" onclick="cerrarCalendario()">Cerrar</button>
     </div>
-    <div style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
-      <label style="font-size:13px">Hora de corte:</label>
-      <select id="horaCorte2" onchange="sincronizarCorte(this.value); renderCalendario()">
-        <option value="14">14:00</option>
-        <option value="15">15:00</option>
-        <option value="13">13:00</option>
-        <option value="12">12:00</option>
-      </select>
+    <div style="margin-bottom:14px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button class="secondary" onclick="cambiarAnio(-1)">&#9664;</button>
+        <span id="calYearLabel" style="font-size:18px;font-weight:700;min-width:150px;text-align:center"></span>
+        <button class="secondary" onclick="cambiarAnio(1)">&#9654;</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:13px;color:var(--muted)">Hora de corte:</span>
+        <select id="horaCorte2" onchange="sincronizarCorte(this.value); renderCalendario()">
+          <option value="14">14:00</option>
+          <option value="15">15:00</option>
+          <option value="13">13:00</option>
+          <option value="12">12:00</option>
+        </select>
+      </div>
+      <button class="secondary" onclick="seleccionarTurno(''); cerrarCalendario()">Ver todas las ventas</button>
     </div>
-    <div id="calGrid" style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;text-align:center;"></div>
-    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;">
-      <button class="secondary" onclick="seleccionarTurno(''); cerrarCalendario()">Ver todos</button>
-    </div>
+    <div id="calGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px;"></div>
   </div>
 </div>
 
@@ -3644,6 +3656,8 @@ UI_JS = '''
 var ventas = [];
 var currentId = null;
 var turnoActivo = '';
+var currentPage = 1;
+var calYear = null;
 
 function badge(estado) {
   var map = {pendiente:'badge-pendiente', enviado:'badge-enviado', error:'badge-error', rechazado:'badge-default', nota_credito:'badge-nc'};
@@ -3737,7 +3751,7 @@ function seleccionarTurno(key) {
     btn.style.background = 'var(--blue)';
   }
   cerrarCalendario();
-  renderTable();
+  resetYRender();
 }
 
 function setFuente(f) {
@@ -3750,7 +3764,7 @@ function setFuente(f) {
   else if (f === 'mercadolibre') document.getElementById('cardML').classList.add('activa');
   else if (f === 'woocommerce') document.getElementById('cardWC').classList.add('activa');
   else if (f === 'falabella') { var cfl = document.getElementById('cardFL'); if (cfl) cfl.classList.add('activa'); }
-  renderTable();
+  resetYRender();
 }
 
 function updateStats(items) {
@@ -3834,12 +3848,45 @@ function rowHtml(v) {
     '</tr>';
 }
 
+function resetYRender() { currentPage = 1; renderTable(); }
+
+function irPagina(p) {
+  currentPage = p;
+  renderTable();
+  try { document.getElementById('tableWrap').scrollIntoView({block: 'start'}); } catch (e) {}
+}
+
+function renderPager(total, totalPages, start, shown) {
+  var pager = document.getElementById('pager');
+  if (!pager) return;
+  if (!total) { pager.innerHTML = ''; return; }
+  var from = start + 1, to = start + shown;
+  var nav = '';
+  nav += '<button class="secondary" ' + (currentPage <= 1 ? 'disabled' : '') + ' onclick="irPagina(1)">&#171; Primera</button>';
+  nav += '<button class="secondary" ' + (currentPage <= 1 ? 'disabled' : '') + ' onclick="irPagina(' + (currentPage - 1) + ')">&#8249; Anterior</button>';
+  nav += '<span style="font-size:13px;padding:0 6px">P&aacute;gina ' + currentPage + ' de ' + totalPages + '</span>';
+  nav += '<button class="secondary" ' + (currentPage >= totalPages ? 'disabled' : '') + ' onclick="irPagina(' + (currentPage + 1) + ')">Siguiente &#8250;</button>';
+  nav += '<button class="secondary" ' + (currentPage >= totalPages ? 'disabled' : '') + ' onclick="irPagina(' + totalPages + ')">&#218;ltima &#187;</button>';
+  pager.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-top:12px">' +
+    '<span style="font-size:13px;color:var(--muted)">Mostrando ' + from + '&ndash;' + to + ' de ' + total + '</span>' +
+    '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + nav + '</div></div>';
+}
+
+function cambiarAnio(delta) { if (calYear == null) return; calYear += delta; renderCalendario(); }
+
 function renderTable() {
   var items = filteredVentas();
   updateStats(items);
   var wrap = document.getElementById('tableWrap');
+  var pageSize = parseInt((document.getElementById('pageSize') || {value: '50'}).value || '50', 10);
+  var totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  if (currentPage > totalPages) currentPage = totalPages;
+  if (currentPage < 1) currentPage = 1;
+  var start = (currentPage - 1) * pageSize;
+  var pageItems = items.slice(start, start + pageSize);
   if (!items.length) {
     wrap.innerHTML = '<div class="empty">No hay ventas para mostrar.</div>';
+    renderPager(0, 1, 0, 0);
     return;
   }
   var html = '<table><thead><tr>';
@@ -3848,7 +3895,7 @@ function renderTable() {
   html += '<th>Direccion / Ciudad / Region</th><th>Total / Items</th>';
   html += '<th>Tipo</th><th>Envio</th><th>Estado / Fuente</th><th>Estado envio</th><th>Acciones</th>';
   html += '</tr></thead><tbody>';
-  for (var i = 0; i < items.length; i++) { html += rowHtml(items[i]); }
+  for (var i = 0; i < pageItems.length; i++) { html += rowHtml(pageItems[i]); }
   html += '</tbody></table>';
   wrap.innerHTML = html;
   wrap.querySelectorAll('[data-action]').forEach(function(el) {
@@ -3866,6 +3913,7 @@ function renderTable() {
       else if (action === 'copy') { try { navigator.clipboard.writeText(id); } catch(e2) {} }
     });
   });
+  renderPager(items.length, totalPages, start, pageItems.length);
 }
 
 function refreshData() {
@@ -4348,44 +4396,53 @@ function sincronizarCorte(val) {
 
 function renderCalendario() {
   var grid = document.getElementById('calGrid');
+  var lbl = document.getElementById('calYearLabel');
   var conteo = {};
   ventas.forEach(function(v) {
     var k = getTurnoKey(v.creado_en);
     if (k) conteo[k] = (conteo[k] || 0) + 1;
   });
-  var keys = Object.keys(conteo).sort().reverse();
+  var keys = Object.keys(conteo);
   if (!keys.length) {
-    grid.innerHTML = '<div style="grid-column:1/-1;color:#94a3b8;padding:20px">No hay turnos disponibles</div>';
+    grid.innerHTML = '<div style="grid-column:1/-1;color:#94a3b8;padding:20px">No hay ventas para mostrar</div>';
+    if (lbl) lbl.textContent = '';
     return;
   }
-  var dias = ['Dom','Lun','Mar','Mie','Jue','Vie','Sab'];
-  var html = dias.map(function(d) { return '<div style="font-size:11px;color:#94a3b8;padding:4px 0;font-weight:700">' + d + '</div>'; }).join('');
-  var first = keys[keys.length-1];
-  var last = keys[0];
-  var p = first.split('-');
-  var startDate = new Date(Date.UTC(parseInt(p[0]), parseInt(p[1])-1, parseInt(p[2])));
-  var dow = startDate.getUTCDay();
-  startDate = new Date(startDate.getTime() - dow * 86400000);
-  var p2 = last.split('-');
-  var endDate = new Date(Date.UTC(parseInt(p2[0]), parseInt(p2[1])-1, parseInt(p2[2])));
-  var cur = new Date(startDate.getTime());
-  while (cur <= endDate) {
-    var y = cur.getUTCFullYear();
-    var m = String(cur.getUTCMonth()+1).padStart(2,'0');
-    var d = String(cur.getUTCDate()).padStart(2,'0');
-    var key = y + '-' + m + '-' + d;
-    var cnt = conteo[key] || 0;
-    var isActive = turnoActivo === key;
-    var bg = isActive ? 'var(--blue)' : (cnt > 0 ? 'var(--panel2)' : 'transparent');
-    var border = cnt > 0 ? '1px solid var(--border)' : '1px solid transparent';
-    var cursor = cnt > 0 ? 'pointer' : 'default';
-    var clickAttr = cnt > 0 ? ' data-turno="' + key + '"' : '';
-    html += '<div class="cal-day" style="border-radius:8px;padding:6px 2px;background:' + bg + ';border:' + border + ';cursor:' + cursor + '"' + clickAttr + '>';
-    html += '<div style="font-size:13px;font-weight:600">' + parseInt(d) + '</div>';
-    if (cnt > 0) { html += '<div style="font-size:11px;color:' + (isActive ? 'white' : '#22c55e') + '">' + cnt + '</div>'; }
-    html += '</div>';
-    cur = new Date(cur.getTime() + 86400000);
+  if (calYear == null) {
+    calYear = Math.max.apply(null, keys.map(function(k) { return parseInt(k.split('-')[0], 10); }));
   }
+  var meses = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+  var diasSem = ['L','M','X','J','V','S','D'];
+  var html = '';
+  var totalAnio = 0;
+  for (var mes = 0; mes < 12; mes++) {
+    var totalMes = 0;
+    for (var kk in conteo) {
+      var pk = kk.split('-');
+      if (parseInt(pk[0], 10) === calYear && (parseInt(pk[1], 10) - 1) === mes) totalMes += conteo[kk];
+    }
+    totalAnio += totalMes;
+    html += '<div style="background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:8px">';
+    html += '<div style="font-size:12px;font-weight:700;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center"><span>' + meses[mes] + '</span><span style="font-size:11px;color:' + (totalMes ? '#4ade80' : '#475569') + '">' + totalMes + '</span></div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px;text-align:center">';
+    for (var w = 0; w < 7; w++) html += '<div style="font-size:9px;color:#64748b">' + diasSem[w] + '</div>';
+    var first = new Date(Date.UTC(calYear, mes, 1));
+    var dow = (first.getUTCDay() + 6) % 7;
+    for (var b = 0; b < dow; b++) html += '<div></div>';
+    var daysInMonth = new Date(Date.UTC(calYear, mes + 1, 0)).getUTCDate();
+    for (var dia = 1; dia <= daysInMonth; dia++) {
+      var key = calYear + '-' + String(mes + 1).padStart(2, '0') + '-' + String(dia).padStart(2, '0');
+      var cnt = conteo[key] || 0;
+      var isActive = turnoActivo === key;
+      var bg = isActive ? 'var(--blue)' : (cnt > 0 ? '#14532d' : 'transparent');
+      var col = isActive ? 'white' : (cnt > 0 ? '#86efac' : '#475569');
+      var cursor = cnt > 0 ? 'pointer' : 'default';
+      var attr = cnt > 0 ? ' data-turno="' + key + '" title="' + cnt + ' venta(s)"' : '';
+      html += '<div class="cal-day" style="font-size:10px;padding:3px 0;border-radius:4px;background:' + bg + ';color:' + col + ';cursor:' + cursor + '"' + attr + '>' + dia + '</div>';
+    }
+    html += '</div></div>';
+  }
+  if (lbl) lbl.textContent = calYear + ' (' + totalAnio + ' ventas)';
   grid.innerHTML = html;
   grid.querySelectorAll('[data-turno]').forEach(function(el) {
     el.addEventListener('click', function() { seleccionarTurno(el.dataset.turno); });
