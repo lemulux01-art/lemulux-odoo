@@ -41,6 +41,18 @@ ODOO_DOC_TYPE_FACTURA_ID = 1
 ODOO_DOC_TYPE_BOLETA_ID = 5
 ODOO_PAYMENT_TERM_CONTADO_ID = 1
 
+# =========================
+# INTERRUPTOR DE AUTO-EMISION
+# =========================
+# Controla si el DTE se emite solo al ingresar la compra. Valores: "auto" | "manual".
+#   AUTO_EMIT_BOLETAS=auto    -> las boletas se emiten automaticamente
+#   AUTO_EMIT_BOLETAS=manual  -> las boletas quedan pendientes para autorizar a mano
+#   AUTO_EMIT_FACTURAS=auto   -> las facturas se emiten solo si tienen datos completos
+#   AUTO_EMIT_FACTURAS=manual -> las facturas quedan siempre pendientes
+# Todo manual = ambas en "manual". Cambiar en Railway sin tocar codigo.
+AUTO_EMIT_BOLETAS = os.getenv("AUTO_EMIT_BOLETAS", "auto").strip().lower()
+AUTO_EMIT_FACTURAS = os.getenv("AUTO_EMIT_FACTURAS", "auto").strip().lower()
+
 ODOO_STANDARD_NARRATION = (
     '<p>Para futuras compras:&nbsp;</p>'
     '<p><a href="https://lemulux.com/">https://lemulux.com/</a></p>'
@@ -1055,6 +1067,148 @@ def create_document(order, billing_raw, tipo, email, giro,
 
 
 # =========================
+# EMISION / NC / AUTONOMIA
+# =========================
+
+def datos_completos_para_factura(venta: dict) -> bool:
+    """Una factura solo se auto-emite si tiene razon social, RUT, direccion y giro reales."""
+    cliente = (venta.get("cliente") or "").strip()
+    rut = (venta.get("rut") or "").strip()
+    direccion = (venta.get("direccion") or "").strip()
+    giro = (venta.get("giro") or "").strip()
+    cliente_ok = bool(cliente) and not cliente.startswith("Cliente ")
+    giro_ok = bool(giro) and giro != DEFAULT_BOLETA_ACTIVITY
+    return cliente_ok and bool(rut) and bool(direccion) and giro_ok
+
+
+def emitir_venta(oid: str) -> tuple:
+    """Crea el documento en Odoo para una venta y la marca como 'enviado'.
+    Lanza excepcion si falla. Idempotente: si ya esta enviada devuelve su move_id."""
+    venta = get_venta(oid)
+    if not venta:
+        raise Exception(f"Venta {oid} no encontrada")
+    if venta.get("move_id") and venta.get("estado") == "enviado":
+        return venta["move_id"], venta.get("partner_id")
+    order = json.loads(venta["order_json"])
+    billing = json.loads(venta["billing_json"] or "{}")
+    move_id, partner_id = create_document(
+        order=order, billing_raw=billing,
+        tipo=venta.get("tipo_sugerido") or "Boleta",
+        email=venta.get("email") or ML_DEFAULT_EMAIL,
+        giro=venta.get("giro") or "",
+        cliente_override=venta.get("cliente"),
+        rut_override=venta.get("rut"),
+        direccion_override=venta.get("direccion"),
+        ciudad_override=venta.get("ciudad"),
+        region_override=venta.get("region"),
+    )
+    update_venta(oid, estado="enviado", move_id=move_id,
+                 partner_id=partner_id if partner_id else None,
+                 error=None, enviado_en=datetime.now())
+    return move_id, partner_id
+
+
+def auto_emitir_venta(oid: str):
+    """Emision automatica al ingresar la compra, segun el interruptor:
+      Boleta  -> se emite si AUTO_EMIT_BOLETAS == 'auto'
+      Factura -> se emite si AUTO_EMIT_FACTURAS == 'auto' Y tiene datos completos
+    En cualquier otro caso la venta queda 'pendiente' para autorizar a mano.
+    Nunca propaga la excepcion (no debe tumbar el worker de webhooks)."""
+    venta = get_venta(oid)
+    if not venta or venta.get("estado") != "pendiente":
+        return
+    tipo = venta.get("tipo_sugerido") or "Boleta"
+    if tipo == "Factura":
+        if AUTO_EMIT_FACTURAS != "auto":
+            logger.info(f"[{oid}] Factura en modo manual (AUTO_EMIT_FACTURAS), queda pendiente")
+            return
+        if not datos_completos_para_factura(venta):
+            logger.info(f"[{oid}] Auto-emision pospuesta: factura con datos incompletos, queda pendiente")
+            return
+    else:
+        if AUTO_EMIT_BOLETAS != "auto":
+            logger.info(f"[{oid}] Boleta en modo manual (AUTO_EMIT_BOLETAS), queda pendiente")
+            return
+    try:
+        move_id, _ = emitir_venta(oid)
+        logger.info(f"[{oid}] Auto-emitida: {tipo} move_id={move_id}")
+    except Exception as e:
+        logger.error(f"[{oid}] Error en auto-emision: {e}", exc_info=True)
+        update_venta(oid, estado="error", error=str(e)[:500])
+
+
+def _crear_nota_credito(venta: dict, motivo: str) -> Optional[int]:
+    """Crea y publica la NC en Odoo para la venta dada. Marca la venta como 'nota_credito'.
+    Lanza excepcion si falla. Reutilizada por el endpoint manual y el automatismo de cancelacion."""
+    oid = venta["id"]
+    move_id = venta.get("move_id")
+    if not move_id:
+        raise Exception("La venta no tiene documento en Odoo")
+    ctx = odoo_connect()
+    moves = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "name"]})
+    if not moves:
+        raise Exception(f"Documento {move_id} no encontrado en Odoo")
+    move = moves[0]
+    if move["state"] != "posted":
+        raise Exception(f"Documento {move['name']} no esta publicado (estado: {move['state']})")
+    from datetime import date
+    # Odoo 17-18 usa refund_method, Odoo 19 renombro a refund_type
+    reversal_fields = odoo_exec(ctx, "account.move.reversal", "fields_get", [], {"attributes": ["string"]})
+    reversal_vals = {
+        "move_ids": [(6, 0, [move_id])],
+        "date": date.today().isoformat(),
+        "reason": motivo,
+        "journal_id": False,
+    }
+    if "refund_method" in reversal_fields:
+        reversal_vals["refund_method"] = "cancel"
+    elif "refund_type" in reversal_fields:
+        reversal_vals["refund_type"] = "cancel"
+    wizard_id = odoo_exec(ctx, "account.move.reversal", "create", [reversal_vals])
+    result = odoo_exec(ctx, "account.move.reversal", "reverse_moves", [[wizard_id]])
+    nc_move_id = None
+    if isinstance(result, dict):
+        domain = result.get("domain")
+        if domain:
+            ncs = odoo_exec(ctx, "account.move", "search", [domain])
+            if ncs:
+                nc_move_id = ncs[0]
+        res_id = result.get("res_id")
+        if res_id:
+            nc_move_id = res_id
+    if not nc_move_id:
+        ncs = odoo_exec(ctx, "account.move", "search", [[["reversed_entry_id", "=", move_id]]], {"limit": 1})
+        if ncs:
+            nc_move_id = ncs[0]
+    if nc_move_id:
+        nc_state = odoo_exec(ctx, "account.move", "read", [[nc_move_id]], {"fields": ["state"]})[0]["state"]
+        if nc_state == "draft":
+            odoo_exec(ctx, "account.move", "action_post", [[nc_move_id]])
+        logger.info(f"[{oid}] NC creada: move_id={nc_move_id}")
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE ventas SET estado='nota_credito', nc_motivo=%s WHERE id=%s", (motivo, oid))
+        conn.commit()
+    return nc_move_id
+
+
+def auto_nota_credito_si_cancelado(venta: dict, ml_status: str):
+    """Si una orden ML pasa a 'cancelled' y ya tenia documento emitido, crea la NC sola.
+    Solo aplica a Mercado Libre. Nunca propaga la excepcion."""
+    if ml_status != "cancelled":
+        return
+    if not venta or venta.get("move_id") is None:
+        return
+    if venta.get("estado") != "enviado":
+        return
+    try:
+        nc_id = _crear_nota_credito(venta, "Anulacion automatica (cancelada en Mercado Libre)")
+        logger.info(f"[{venta.get('id')}] NC automatica por cancelacion ML: nc_move_id={nc_id}")
+    except Exception as e:
+        logger.error(f"[{venta.get('id')}] Error en NC automatica: {e}", exc_info=True)
+
+
+# =========================
 # PROCESAMIENTO WEBHOOK ML
 # =========================
 
@@ -1086,6 +1240,7 @@ def process_webhook_order(order_id: str):
             if existing_pack:
                 update_venta(existing_pack["id"], estado_envio=estado_envio)
                 logger.info(f"[pack:{pack_id}] Estado envio actualizado: {estado_envio}")
+                auto_nota_credito_si_cancelado(get_venta(existing_pack["id"]), ml_status)
                 return
             if ml_status not in ML_ESTADOS_VALIDOS:
                 logger.info(f"[pack:{pack_id}] Estado no valido ({ml_status}), ignorado")
@@ -1116,11 +1271,13 @@ def process_webhook_order(order_id: str):
                       direccion, email, ciudad, region,
                       pack_id=pack_id, order_items_override=all_items)
             logger.info(f"[pack:{pack_id}] Pack consolidado: {len(all_orders)} ordenes, {len(all_items)} items")
+            auto_emitir_venta(pack_id)
             return
         existing = get_venta(order_id)
         if existing:
             update_venta(order_id, estado_envio=estado_envio)
             logger.info(f"[{order_id}] Estado envio actualizado: {estado_envio}")
+            auto_nota_credito_si_cancelado(get_venta(order_id), ml_status)
             return
         if ml_status not in ML_ESTADOS_VALIDOS:
             logger.info(f"[{order_id}] Estado no valido ({ml_status}), ignorado")
@@ -1144,6 +1301,7 @@ def process_webhook_order(order_id: str):
             giro = DEFAULT_BOLETA_ACTIVITY
         save_venta(order, billing_raw, tipo_sugerido, cliente, rut, giro, direccion, email, ciudad, region)
         logger.info(f"[{order_id}] Guardada: {tipo_sugerido} estado={estado_envio}")
+        auto_emitir_venta(order_id)
     except Exception as e:
         logger.error(f"[{order_id}] Error procesando webhook: {e}", exc_info=True)
 
@@ -1420,12 +1578,12 @@ def wc_get_meta(order: dict, key: str) -> str:
 
 
 def wc_extract_tipodoc(order: dict) -> str:
-    # Si llenó giro o RUT empresa -> Factura sin importar billing_tipodoc
+    # Si lleno giro o RUT empresa -> Factura sin importar billing_tipodoc
     giro = wc_get_meta(order, WC_FIELD_GIRO).strip()
     rut_empresa = wc_get_meta(order, WC_FIELD_RUT_EMPRESA).strip()
     if giro or rut_empresa:
         return "Factura"
-    # Fallback: revisar el campo tipodoc explícito
+    # Fallback: revisar el campo tipodoc explicito
     tipodoc_raw = wc_get_meta(order, WC_FIELD_TIPODOC).strip().lower()
     if "factura" in tipodoc_raw:
         return "Factura"
@@ -1486,13 +1644,35 @@ def wc_extract_region(order: dict) -> str:
 def wc_build_order_items(order: dict) -> list:
     items = []
     for li in order.get("line_items") or []:
-        qty        = float(li.get("quantity") or 1)
-        unit_price = float(li.get("price") or 0)
+        qty = float(li.get("quantity") or 1) or 1
+        # WooCommerce entrega los montos de linea en NETO (sin IVA); el IVA va aparte
+        # en total_tax. create_document espera precio BRUTO (con IVA) porque despues
+        # divide por 1.19, asi que reconstruimos el bruto = (total + total_tax) / qty.
+        total     = float(li.get("total") or 0)
+        total_tax = float(li.get("total_tax") or 0)
+        bruto_linea = total + total_tax
+        if bruto_linea > 0:
+            unit_price = bruto_linea / qty
+        else:
+            # Fallback: 'price' es el neto por unidad -> pasarlo a bruto
+            unit_price = float(li.get("price") or 0) * IVA_RATE
         items.append({
             "item":       {"title": li.get("name") or "Producto WC"},
             "quantity":   qty,
-            "unit_price": unit_price,
+            "unit_price": round(unit_price, 4),
         })
+    # Envio: WooCommerce lo entrega en shipping_lines (total neto + total_tax aparte).
+    # Se agrega como una linea mas, tambien en BRUTO, para que el total del DTE coincida.
+    for sl in order.get("shipping_lines") or []:
+        s_total     = float(sl.get("total") or 0)
+        s_total_tax = float(sl.get("total_tax") or 0)
+        s_bruto = s_total + s_total_tax
+        if s_bruto > 0:
+            items.append({
+                "item":       {"title": sl.get("method_title") or "Despacho"},
+                "quantity":   1,
+                "unit_price": round(s_bruto, 4),
+            })
     return items
 
 
@@ -1564,6 +1744,7 @@ def process_wc_order(order_id: str):
                 )
             conn.commit()
         logger.info(f"[WC:{order_id}] Guardada -> tipo={tipo} rut={rut or 'sin RUT'} cliente={nombre}")
+        auto_emitir_venta(oid_str)
     except Exception as e:
         logger.error(f"[WC:{order_id}] Error procesando: {e}", exc_info=True)
 
@@ -1630,6 +1811,7 @@ async def on_startup():
     fr = threading.Thread(target=reconciliar_fl_ordenes, daemon=True)
     fr.start()
     logger.info("Reconciliador Falabella iniciado (cada 25 min)")
+    logger.info(f"Auto-emision -> boletas={AUTO_EMIT_BOLETAS} facturas={AUTO_EMIT_FACTURAS}")
 
 
 # =========================
@@ -1651,6 +1833,16 @@ def health():
         return {"status": "healthy", "db": bool(row and row.get("ok") == 1)}
     except Exception as e:
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
+
+
+@app.get("/config/auto-emision")
+def config_auto_emision():
+    """Muestra el estado actual del interruptor de auto-emision."""
+    return {
+        "boletas": AUTO_EMIT_BOLETAS,
+        "facturas": AUTO_EMIT_FACTURAS,
+        "nota": "Valores: 'auto' o 'manual'. Se cambian con las env vars AUTO_EMIT_BOLETAS / AUTO_EMIT_FACTURAS y reinicio.",
+    }
 
 
 @app.get("/debug/shipping/{oid}")
@@ -1904,6 +2096,30 @@ def ingresar_venta_manual(payload: VentaManualPayload):
     except Exception as e:
         logger.error(f"Error ingresando venta manual: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class AutorizarMasivoPayload(BaseModel):
+    ids: list
+
+
+@app.post("/ventas/autorizar-masivo")
+def autorizar_masivo(payload: AutorizarMasivoPayload):
+    """Emite en Odoo todas las ventas indicadas (facturacion manual masiva)."""
+    ids = [str(i) for i in (payload.ids or [])]
+    if not ids:
+        raise HTTPException(status_code=400, detail="No se enviaron ventas")
+    resultados = {"ok": 0, "error": 0, "detalle": []}
+    for oid in ids:
+        try:
+            move_id, _ = emitir_venta(oid)
+            resultados["ok"] += 1
+            resultados["detalle"].append({"id": oid, "ok": True, "move_id": move_id})
+        except Exception as e:
+            resultados["error"] += 1
+            resultados["detalle"].append({"id": oid, "ok": False, "error": str(e)[:200]})
+            update_venta(oid, estado="error", error=str(e)[:500])
+    logger.info(f"Autorizacion masiva: {resultados['ok']} OK, {resultados['error']} errores")
+    return resultados
 
 
 @app.post("/ventas/actualizar-envio")
@@ -2196,22 +2412,7 @@ def autorizar_venta(oid: str):
     if venta.get("move_id") and venta.get("estado") == "enviado":
         return {"ok": True, "id": oid, "move_id": venta["move_id"], "message": "Ya enviada"}
     try:
-        order = json.loads(venta["order_json"])
-        billing = json.loads(venta["billing_json"])
-        move_id, partner_id = create_document(
-            order=order, billing_raw=billing,
-            tipo=venta.get("tipo_sugerido") or "Boleta",
-            email=venta.get("email") or ML_DEFAULT_EMAIL,
-            giro=venta.get("giro") or "",
-            cliente_override=venta.get("cliente"),
-            rut_override=venta.get("rut"),
-            direccion_override=venta.get("direccion"),
-            ciudad_override=venta.get("ciudad"),
-            region_override=venta.get("region"),
-        )
-        update_venta(oid, estado="enviado", move_id=move_id,
-                    partner_id=partner_id if partner_id else None,
-                    error=None, enviado_en=datetime.now())
+        move_id, partner_id = emitir_venta(oid)
         return {"ok": True, "id": oid, "move_id": move_id, "partner_id": partner_id}
     except Exception as e:
         logger.error(f"[{oid}] Error al autorizar: {e}", exc_info=True)
@@ -2226,58 +2427,13 @@ def crear_nota_credito(oid: str, body: dict):
         raise HTTPException(status_code=404, detail="Venta no encontrada")
     if venta.get("estado") != "enviado":
         raise HTTPException(status_code=400, detail="Solo se puede crear NC de ventas ya enviadas a Odoo")
-    move_id = venta.get("move_id")
-    if not move_id:
+    if not venta.get("move_id"):
         raise HTTPException(status_code=400, detail="La venta no tiene documento en Odoo")
     motivo = (body.get("motivo") or "").strip()
     if not motivo:
         raise HTTPException(status_code=400, detail="El motivo es obligatorio")
     try:
-        ctx = odoo_connect()
-        moves = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "name"]})
-        if not moves:
-            raise HTTPException(status_code=404, detail=f"Documento {move_id} no encontrado en Odoo")
-        move = moves[0]
-        if move["state"] != "posted":
-            raise HTTPException(status_code=400, detail=f"Documento {move['name']} no esta publicado (estado: {move['state']})")
-        from datetime import date
-        # Odoo 17-18 usa refund_method, Odoo 19 renombro a refund_type
-        reversal_fields = odoo_exec(ctx, "account.move.reversal", "fields_get", [], {"attributes": ["string"]})
-        reversal_vals = {
-            "move_ids": [(6, 0, [move_id])],
-            "date": date.today().isoformat(),
-            "reason": motivo,
-            "journal_id": False,
-        }
-        if "refund_method" in reversal_fields:
-            reversal_vals["refund_method"] = "cancel"
-        elif "refund_type" in reversal_fields:
-            reversal_vals["refund_type"] = "cancel"
-        wizard_id = odoo_exec(ctx, "account.move.reversal", "create", [reversal_vals])
-        result = odoo_exec(ctx, "account.move.reversal", "reverse_moves", [[wizard_id]])
-        nc_move_id = None
-        if isinstance(result, dict):
-            domain = result.get("domain")
-            if domain:
-                ncs = odoo_exec(ctx, "account.move", "search", [domain])
-                if ncs:
-                    nc_move_id = ncs[0]
-            res_id = result.get("res_id")
-            if res_id:
-                nc_move_id = res_id
-        if not nc_move_id:
-            ncs = odoo_exec(ctx, "account.move", "search", [[["reversed_entry_id", "=", move_id]]], {"limit": 1})
-            if ncs:
-                nc_move_id = ncs[0]
-        if nc_move_id:
-            nc_state = odoo_exec(ctx, "account.move", "read", [[nc_move_id]], {"fields": ["state"]})[0]["state"]
-            if nc_state == "draft":
-                odoo_exec(ctx, "account.move", "action_post", [[nc_move_id]])
-            logger.info(f"[{oid}] NC creada: move_id={nc_move_id}")
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE ventas SET estado='nota_credito', nc_motivo=%s WHERE id=%s", (motivo, oid))
-            conn.commit()
+        nc_move_id = _crear_nota_credito(venta, motivo)
         return {"ok": True, "id": oid, "nc_move_id": nc_move_id, "motivo": motivo, "mensaje": "Nota de credito creada en Odoo"}
     except HTTPException:
         raise
@@ -2318,6 +2474,28 @@ def anular_venta(oid: str):
         conn.commit()
     logger.info(f"[{oid}] Venta anulada y reseteada a pendiente. Odoo: {odoo_result}")
     return {"ok": True, "id": oid, "odoo": odoo_result, "message": "Venta reseteada a pendiente"}
+
+
+class EstadoPayload(BaseModel):
+    estado: str
+
+
+ESTADOS_VALIDOS_MANUAL = {"pendiente", "enviado", "error", "rechazado", "nota_credito"}
+
+
+@app.post("/ventas/{oid}/estado")
+def cambiar_estado_manual(oid: str, payload: EstadoPayload):
+    """Cambia el estado de una venta manualmente (override). NO toca Odoo;
+    solo actualiza el registro local. Util para corregir estados desfasados."""
+    venta = get_venta(oid)
+    if not venta:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+    nuevo = (payload.estado or "").strip()
+    if nuevo not in ESTADOS_VALIDOS_MANUAL:
+        raise HTTPException(status_code=400, detail=f"Estado invalido. Validos: {sorted(ESTADOS_VALIDOS_MANUAL)}")
+    update_venta(oid, estado=nuevo)
+    logger.info(f"[{oid}] Estado cambiado manualmente a '{nuevo}'")
+    return {"ok": True, "id": oid, "estado": nuevo}
 
 
 
@@ -2511,7 +2689,7 @@ def fl_get(action: str, extra_params: dict = None) -> dict:
 
 
 def fl_get_order(order_id: str) -> dict:
-    """GetOrder v2 — devuelve datos del cliente + billing + items."""
+    """GetOrder v2 devuelve datos del cliente + billing + items."""
     data = fl_get("GetOrder", {"OrderId": str(order_id)})
     try:
         return data["SuccessResponse"]["Body"]["Orders"]["Order"]
@@ -2520,7 +2698,7 @@ def fl_get_order(order_id: str) -> dict:
 
 
 def fl_get_order_items(order_id: str) -> list:
-    """GetOrderItems — devuelve los productos de la orden."""
+    """GetOrderItems devuelve los productos de la orden."""
     data = fl_get("GetOrderItems", {"OrderId": str(order_id)})
     try:
         items = data["SuccessResponse"]["Body"]["OrderItems"]["OrderItem"]
@@ -2532,7 +2710,7 @@ def fl_get_order_items(order_id: str) -> list:
 
 
 def fl_get_orders_recent(created_after: str = None, limit: int = 100) -> list:
-    """GetOrders — listado de ordenes recientes para reconciliacion."""
+    """GetOrders listado de ordenes recientes para reconciliacion."""
     if not created_after:
         from datetime import timedelta
         created_after = (datetime.utcnow() - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
@@ -2792,6 +2970,8 @@ def process_fl_order(order_id: str, order_data: dict = None):
             logger.warning(f"[FL:{order_id}] Guardada con datos RESUMIDOS (GetOrders) sin RUT - reprocesar cuando whitelist disponible")
         else:
             logger.info(f"[FL:{order_id}] Guardada -> tipo={tipo} rut={rut or 'sin RUT'} cliente={nombre}")
+            # Auto-emitir solo con datos completos (evita emitir con la linea generica de GetOrders)
+            auto_emitir_venta(oid_str)
 
     except Exception as e:
         logger.error(f"[FL:{order_id}] Error procesando: {e}", exc_info=True)
@@ -2988,6 +3168,7 @@ UI_HTML = """<!doctype html>
     <button class="secondary" onclick="reconciliarFL()" title="Consulta las ultimas 100 ordenes en Falabella">&#127873; Reconciliar FL</button>
     <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio en ventas ML">&#128666; Actualizar envios</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
+    <button id="btnAutorizarMasivo" class="success" style="display:none" onclick="autorizarMasivo()">&#10003; Autorizar seleccionadas</button>
   </div>
   <div id="selInfo" style="display:none;margin-bottom:10px;font-size:13px;color:var(--muted)"><span id="selCount"></span></div>
   <div id="tableWrap"><div class="empty">Cargando...</div></div>
@@ -3131,6 +3312,15 @@ UI_HTML = """<!doctype html>
         <option value="del Nuble">del Nuble</option>
       </select></div>
       <div class="full" id="giroGroup" style="display:none"><label>Giro (solo factura)</label><input id="editGiro"></div>
+      <div><label>Cambiar estado (manual, no toca Odoo)</label>
+        <select id="editEstado">
+          <option value="">-- mantener --</option>
+          <option value="pendiente">pendiente</option>
+          <option value="enviado">enviado</option>
+          <option value="error">error</option>
+          <option value="rechazado">rechazado</option>
+          <option value="nota_credito">nota_credito</option>
+        </select></div>
       <div><label>Total bruto</label><input id="editTotal" disabled></div>
       <div><label>Cantidad items</label><input id="editItemsCount" disabled></div>
       <div class="full"><label>Productos vendidos</label><textarea id="editProducts" disabled></textarea></div>
@@ -3138,6 +3328,7 @@ UI_HTML = """<!doctype html>
     <div class="modal-actions">
       <button class="secondary" onclick="closeModal()">Cancelar</button>
       <button class="warn" onclick="reprocesarActual()">Reprocesar desde ML</button>
+      <button class="secondary" onclick="cambiarEstadoActual()">Aplicar estado</button>
       <button onclick="saveEdit()">Guardar</button>
       <button class="success" onclick="saveAndAuthorize()">Guardar y autorizar</button>
     </div>
@@ -3560,6 +3751,7 @@ function openEdit(id) {
   document.getElementById('editCiudad').value = v.ciudad || '';
   document.getElementById('editRegion').value = v.region || '';
   document.getElementById('editGiro').value = v.tipo_sugerido === 'Factura' ? (v.giro || '') : '';
+  document.getElementById('editEstado').value = '';
   document.getElementById('editTotal').value = '...';
   document.getElementById('editItemsCount').value = '...';
   document.getElementById('editProducts').value = 'Cargando...';
@@ -3626,9 +3818,28 @@ function reprocesarActual() {
   reprocesar(currentId);
 }
 
+function cambiarEstadoActual() {
+  if (!currentId) return;
+  var nuevo = document.getElementById('editEstado').value;
+  if (!nuevo) { alert('Selecciona un estado'); return; }
+  if (!confirm('Cambiar el estado de la venta ' + currentId + ' a "' + nuevo + '"? (Solo actualiza el registro local, no modifica Odoo)')) return;
+  fetch('/ventas/' + currentId + '/estado', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({estado: nuevo})
+  }).then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok) { alert('Estado actualizado a ' + data.estado); closeModal(); refreshData(); }
+      else { alert('Error: ' + (data.detail || 'desconocido')); }
+    })
+    .catch(function(e) { alert('Error: ' + e.message); });
+}
+
 function onCheckboxChange() {
   var seleccionadas = getSeleccionadas();
   var btn = document.getElementById('btnAgrupar');
+  var btnMasivo = document.getElementById('btnAutorizarMasivo');
+  if (btnMasivo) btnMasivo.style.display = seleccionadas.length >= 1 ? 'inline-block' : 'none';
   var info = document.getElementById('selInfo');
   var count = document.getElementById('selCount');
   document.querySelectorAll('.cb-row[data-id]').forEach(function(cb) {
@@ -3674,6 +3885,26 @@ function agruparSeleccionadas() {
         alert('Error: ' + (data.detail || 'desconocido'));
       }
     });
+}
+
+function autorizarMasivo() {
+  var ids = getSeleccionadas();
+  if (!ids.length) { alert('Selecciona al menos 1 venta'); return; }
+  if (!confirm('Autorizar y emitir en Odoo ' + ids.length + ' venta(s) seleccionada(s)?')) return;
+  var btn = document.getElementById('btnAutorizarMasivo');
+  if (btn) { btn.disabled = true; btn.textContent = 'Emitiendo...'; }
+  fetch('/ventas/autorizar-masivo', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ids: ids})
+  }).then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.innerHTML = '&#10003; Autorizar seleccionadas'; }
+      if (typeof data.ok === 'number') { alert('Emitidas: ' + data.ok + ' | Errores: ' + data.error); }
+      else { alert('Error: ' + (data.detail || 'desconocido')); }
+      refreshData();
+    })
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.innerHTML = '&#10003; Autorizar seleccionadas'; } alert('Error: ' + e.message); });
 }
 
 function actualizarEnvio() {
