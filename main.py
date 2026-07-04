@@ -2893,18 +2893,26 @@ def autorizar_venta(oid: str):
 
 @app.post("/ventas/{oid}/adjuntar-ml")
 def adjuntar_ml_manual(oid: str):
-    """Sube manualmente el comprobante a Mercado Libre (para probar en 1 orden).
-    Requiere venta ML ya emitida (con move_id). Devuelve la respuesta cruda de ML."""
+    """Test manual en 1 orden ML: si no esta emitida la EMITE (crea boleta/factura en Odoo) y
+    luego sube el PDF a Mercado Libre. Devuelve la respuesta cruda de ML."""
     venta = get_venta(oid)
     if not venta:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
     if (venta.get("fuente") or "mercadolibre") != "mercadolibre":
         raise HTTPException(status_code=400, detail="Solo aplica a ventas de Mercado Libre")
-    if not venta.get("move_id") or venta.get("estado") != "enviado":
-        raise HTTPException(status_code=400, detail="La venta debe estar emitida (enviado, con documento en Odoo)")
+    emitido_ahora = False
+    move_id = venta.get("move_id")
+    if not move_id or venta.get("estado") != "enviado":
+        try:
+            move_id, _ = emitir_venta(oid)
+            emitido_ahora = True
+        except Exception as e:
+            logger.error(f"[{oid}] Error emitiendo antes de adjuntar: {e}", exc_info=True)
+            manejar_error_emision(oid, venta.get("tipo_sugerido") or "Boleta", e)
+            raise HTTPException(status_code=500, detail=f"No se pudo emitir el DTE: {e}")
     try:
-        resp = adjuntar_comprobante_ml(oid, venta["move_id"])
-        return {"ok": True, "id": oid, "respuesta": resp}
+        resp = adjuntar_comprobante_ml(oid, move_id)
+        return {"ok": True, "id": oid, "emitido_ahora": emitido_ahora, "move_id": move_id, "respuesta": resp}
     except Exception as e:
         logger.error(f"[{oid}] Error adjuntando a ML: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -4122,9 +4130,9 @@ function rowHtml(v) {
   if (v.estado === 'enviado') {
     acciones += '<button class="bad" data-action="anular" data-id="' + esc(id) + '">Anular</button>';
     acciones += '<button class="bad" style="background:#92400e;border-color:#92400e" data-action="notacredito" data-id="' + esc(id) + '">N/C</button>';
-    if ((v.fuente || 'mercadolibre') === 'mercadolibre') {
-      acciones += '<button class="secondary" data-action="adjuntarml" data-id="' + esc(id) + '" title="Subir el PDF del comprobante a Mercado Libre" style="background:#0ea5e9;color:#fff">Cargar PDF a ML</button>';
-    }
+  }
+  if ((v.fuente || 'mercadolibre') === 'mercadolibre' && (v.estado === 'pendiente' || v.estado === 'enviado')) {
+    acciones += '<button data-action="adjuntarml" data-id="' + esc(id) + '" title="Emite (si falta) y sube el PDF del comprobante a Mercado Libre" style="background:#0ea5e9;color:#fff;border:none;border-radius:8px;padding:9px 12px;font-weight:600;cursor:pointer">Cargar PDF a ML</button>';
   }
   return '<tr id="row-' + esc(id) + '">' +
     '<td><input type="checkbox" class="cb-row" data-id="' + esc(id) + '" onchange="onCheckboxChange()"></td>' +
@@ -4415,12 +4423,15 @@ function reprocesarActual() {
 }
 
 function adjuntarMlManual(id) {
-  if (!confirm('Subir el PDF del comprobante a Mercado Libre para la venta ' + id + '?\\n(Prueba real: adjunta el documento a la orden del comprador.)')) return;
+  if (!confirm('Test para la venta ' + id + ':\\nSi no esta emitida, se EMITE la boleta/factura en Odoo y luego se sube el PDF a Mercado Libre. Continuar?')) return;
   fetch('/ventas/' + id + '/adjuntar-ml', {method: 'POST'})
     .then(function(r){ return r.json(); })
     .then(function(d) {
-      if (d.ok) { alert('OK. Respuesta de ML:\\n' + JSON.stringify(d.respuesta || d)); refreshData(); }
-      else { alert('Error: ' + (d.detail || 'desconocido')); }
+      if (d.ok) {
+        var extra = d.emitido_ahora ? '(se emitio ahora, move_id ' + d.move_id + ')\\n' : '';
+        alert('OK. ' + extra + 'Respuesta de ML:\\n' + JSON.stringify(d.respuesta || d));
+        refreshData();
+      } else { alert('Error: ' + (d.detail || 'desconocido')); }
     })
     .catch(function(e){ alert('Error: ' + e.message); });
 }
