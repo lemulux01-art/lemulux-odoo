@@ -50,7 +50,7 @@ ODOO_PAYMENT_TERM_CONTADO_ID = 1
 # Separado POR CANAL (mercadolibre / woocommerce / falabella) y por tipo (boletas / facturas).
 # Se puede cambiar EN VIVO desde el dashboard (se guarda en la BD y persiste reinicios).
 # Env vars solo dan el valor INICIAL: AUTO_EMIT_{ML|WC|FL}_{BOLETAS|FACTURAS}, y si no,
-# cae al global AUTO_EMIT_{BOLETAS|FACTURAS}, y si tampoco, "auto".
+# cae al global AUTO_EMIT_{BOLETAS|FACTURAS}, y si tampoco, "manual" (arranca todo en manual).
 def _auto_emit_default(src: str, tipo: str) -> str:
     esp = os.getenv(f"AUTO_EMIT_{src}_{tipo}")
     if esp:
@@ -58,13 +58,34 @@ def _auto_emit_default(src: str, tipo: str) -> str:
     glob = os.getenv(f"AUTO_EMIT_{tipo}")
     if glob:
         return glob.strip().lower()
-    return "auto"
+    return "manual"
 
 AUTO_EMIT = {
     "mercadolibre": {"boletas": _auto_emit_default("ML", "BOLETAS"), "facturas": _auto_emit_default("ML", "FACTURAS")},
     "woocommerce":  {"boletas": _auto_emit_default("WC", "BOLETAS"), "facturas": _auto_emit_default("WC", "FACTURAS")},
     "falabella":    {"boletas": _auto_emit_default("FL", "BOLETAS"), "facturas": _auto_emit_default("FL", "FACTURAS")},
 }
+
+# Acciones POST-emision por canal. Valores "on" | "off" (default off; se activan a mano en el
+# dashboard y persisten en la BD). Se ejecutan despues de emitir el DTE, y NUNCA tumban la
+# emision (si fallan, solo se registran en el log).
+#   pagar -> registra el pago en Odoo => la factura/boleta queda PAGADA
+#   email -> envia el comprobante al cliente por el correo interno de Odoo
+# (Adjuntar el comprobante en Mercado Libre queda pendiente de confirmar endpoint/prerequisitos.)
+def _post_emit_default(src: str, accion: str) -> str:
+    v = os.getenv(f"POST_EMIT_{src}_{accion}")
+    return v.strip().lower() if v else "off"
+
+POST_EMIT = {
+    "mercadolibre": {"pagar": _post_emit_default("ML", "PAGAR"), "email": _post_emit_default("ML", "EMAIL"), "adjuntar_ml": _post_emit_default("ML", "ADJUNTAR")},
+    "woocommerce":  {"pagar": _post_emit_default("WC", "PAGAR"), "email": _post_emit_default("WC", "EMAIL")},
+    "falabella":    {"pagar": _post_emit_default("FL", "PAGAR"), "email": _post_emit_default("FL", "EMAIL")},
+}
+
+# Estado de folios CAF por tipo. "ok" | "agotado". Si al emitir se detecta que no hay folios,
+# se DETIENE la auto-emision de ese tipo (las ventas quedan pendientes) y se avisa en el dashboard
+# hasta que se carguen mas CAF y se pulse "Reanudar". Se persiste en la BD.
+CAF_STATUS = {"boleta": "ok", "factura": "ok"}
 
 ODOO_STANDARD_NARRATION = (
     '<p>Para futuras compras:&nbsp;</p>'
@@ -1174,6 +1195,145 @@ def datos_completos_para_factura(venta: dict) -> bool:
     return cliente_ok and bool(rut) and bool(direccion) and giro_ok
 
 
+def registrar_pago_odoo(move_id: int):
+    """Registra el pago de una factura/boleta en Odoo => queda PAGADA.
+    Usa el wizard account.payment.register (estable en Odoo 15-18). Idempotente.
+    Opcional: ODOO_PAYMENT_JOURNAL_ID para forzar el diario de pago (banco/caja)."""
+    from datetime import date
+    ctx = odoo_connect()
+    mv = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "payment_state"]})
+    if not mv:
+        raise Exception(f"Documento {move_id} no encontrado en Odoo")
+    mv = mv[0]
+    if mv.get("state") != "posted":
+        raise Exception(f"Documento {move_id} no esta publicado (estado {mv.get('state')})")
+    if mv.get("payment_state") in ("paid", "in_payment", "reversed"):
+        return  # ya pagada / no aplica
+    vals = {"payment_date": date.today().isoformat()}
+    journal_id = None
+    jid = os.getenv("ODOO_PAYMENT_JOURNAL_ID")
+    if jid:
+        try:
+            journal_id = int(jid)
+        except ValueError:
+            journal_id = None
+    if not journal_id:
+        # Sin override, usar el diario de BANCO (el pago se registra por banco)
+        banks = odoo_exec(ctx, "account.journal", "search", [[["type", "=", "bank"]]], {"limit": 1})
+        if banks:
+            journal_id = banks[0]
+    if journal_id:
+        vals["journal_id"] = journal_id
+    wizard_id = odoo_exec(ctx, "account.payment.register", "create", [vals],
+                          {"context": {"active_model": "account.move", "active_ids": [move_id]}})
+    odoo_exec(ctx, "account.payment.register", "action_create_payments", [[wizard_id]])
+    logger.info(f"Pago registrado en Odoo (move_id={move_id}) -> factura PAGADA")
+
+
+def enviar_comprobante_email(move_id: int):
+    """Envia el comprobante (con su PDF) al cliente por el correo interno de Odoo.
+    Usa la plantilla estandar de factura si existe; si no, la primera de account.move."""
+    ctx = odoo_connect()
+    tmpl_id = None
+    try:
+        ref = odoo_exec(ctx, "ir.model.data", "check_object_reference",
+                        ["account", "email_template_edi_invoice"])
+        if ref and len(ref) == 2:
+            tmpl_id = ref[1]
+    except Exception:
+        tmpl_id = None
+    if not tmpl_id:
+        found = odoo_exec(ctx, "mail.template", "search", [[["model", "=", "account.move"]]], {"limit": 1})
+        tmpl_id = found[0] if found else None
+    if not tmpl_id:
+        raise Exception("No hay plantilla de correo de factura configurada en Odoo")
+    odoo_exec(ctx, "mail.template", "send_mail", [[tmpl_id], move_id], {"force_send": True})
+    logger.info(f"Comprobante enviado por email desde Odoo (move_id={move_id})")
+
+
+def obtener_pdf_dte_odoo(move_id: int) -> bytes:
+    """Descarga el PDF del DTE (factura/boleta) desde Odoo via el controlador de reportes.
+    Usa una sesion web (los metodos _render_qweb_pdf estan bloqueados por XML-RPC).
+    Requiere ODOO_URL/DB/USER y ODOO_API_KEY (o ODOO_PASSWORD). Report: account.account_invoices."""
+    url = get_env("ODOO_URL").rstrip("/")
+    db = get_env("ODOO_DB")
+    user = get_env("ODOO_USER")
+    pwd = os.getenv("ODOO_PASSWORD") or get_env("ODOO_API_KEY")
+    report = os.getenv("ODOO_INVOICE_REPORT", "account.account_invoices")
+    sess = requests.Session()
+    auth = sess.post(f"{url}/web/session/authenticate",
+                     json={"jsonrpc": "2.0", "params": {"db": db, "login": user, "password": pwd}},
+                     timeout=30)
+    auth.raise_for_status()
+    if not (auth.json().get("result") or {}).get("uid"):
+        raise Exception("No se pudo autenticar la sesion web de Odoo para obtener el PDF")
+    r = sess.get(f"{url}/report/pdf/{report}/{move_id}", timeout=90)
+    r.raise_for_status()
+    if not r.content.startswith(b"%PDF"):
+        raise Exception("Odoo no devolvio un PDF valido (revisar el nombre del reporte)")
+    return r.content
+
+
+def subir_comprobante_ml(pack_id: str, pdf_bytes: bytes, oid: str) -> dict:
+    """Sube el PDF del comprobante al pack de Mercado Libre.
+    POST /packs/{pack_id}/fiscal_documents (multipart, campo 'fiscal_document', PDF <= 1MB)."""
+    if not pdf_bytes:
+        raise Exception("PDF vacio")
+    if len(pdf_bytes) > 1024 * 1024:
+        raise Exception(f"El PDF pesa {len(pdf_bytes)} bytes (> 1MB); ML no lo acepta")
+    api_url = f"https://api.mercadolibre.com/packs/{pack_id}/fiscal_documents"
+    files = {"fiscal_document": (f"comprobante_{oid}.pdf", pdf_bytes, "application/pdf")}
+    res = requests.post(api_url, headers=ml_headers(), files=files, timeout=90)
+    if res.status_code == 401:
+        refresh_ml_token()
+        res = requests.post(api_url, headers=ml_headers(), files=files, timeout=90)
+    res.raise_for_status()
+    try:
+        return res.json()
+    except Exception:
+        return {"status_code": res.status_code}
+
+
+def adjuntar_comprobante_ml(oid: str, move_id: int):
+    """Sube a Mercado Libre el PDF del DTE ya emitido en Odoo. Solo ML.
+    Omite logistica Full (fulfillment), que MLC no permite adjuntar comprobante."""
+    venta = get_venta(oid)
+    if not venta:
+        raise Exception("Venta no encontrada")
+    if (venta.get("tipo_envio_ml") or "") == "Full":
+        logger.info(f"[{oid}] Adjuntar ML omitido: logistica Full (fulfillment) no permite subir comprobante en MLC")
+        return {"omitido": "logistica Full (fulfillment) no permite adjuntar comprobante en MLC"}
+    order = json.loads(venta.get("order_json") or "{}")
+    pack_id = venta.get("pack_id") or order.get("pack_id") or order.get("id") or oid
+    pdf = obtener_pdf_dte_odoo(move_id)
+    resp = subir_comprobante_ml(str(pack_id), pdf, oid)
+    logger.info(f"[{oid}] Comprobante subido a ML (pack {pack_id}, {len(pdf)} bytes): {resp}")
+    return resp
+
+
+def ejecutar_post_emision(move_id: int, fuente: str, oid: str):
+    """Corre las acciones post-emision ACTIVADAS para el canal (pagar / email / adjuntar_ml).
+    Nunca propaga excepciones: si algo falla, la venta ya quedo emitida igual."""
+    if not move_id:
+        return
+    cfg = POST_EMIT.get((fuente or "mercadolibre").strip().lower(), {})
+    if cfg.get("pagar") == "on":
+        try:
+            registrar_pago_odoo(move_id)
+        except Exception as e:
+            logger.error(f"[{oid}] Post-emision 'pagar' fallo: {e}", exc_info=True)
+    if cfg.get("email") == "on":
+        try:
+            enviar_comprobante_email(move_id)
+        except Exception as e:
+            logger.error(f"[{oid}] Post-emision 'email' fallo: {e}", exc_info=True)
+    if cfg.get("adjuntar_ml") == "on":
+        try:
+            adjuntar_comprobante_ml(oid, move_id)
+        except Exception as e:
+            logger.error(f"[{oid}] Post-emision 'adjuntar_ml' fallo: {e}", exc_info=True)
+
+
 def emitir_venta(oid: str) -> tuple:
     """Crea el documento en Odoo para una venta y la marca como 'enviado'.
     Lanza excepcion si falla. Idempotente: si ya esta enviada devuelve su move_id."""
@@ -1198,7 +1358,38 @@ def emitir_venta(oid: str) -> tuple:
     update_venta(oid, estado="enviado", move_id=move_id,
                  partner_id=partner_id if partner_id else None,
                  error=None, enviado_en=datetime.now())
+    ejecutar_post_emision(move_id, venta.get("fuente") or "mercadolibre", oid)
     return move_id, partner_id
+
+
+def es_error_caf(msg: str) -> bool:
+    """Heuristica: el error de Odoo por falta de folios CAF menciona 'caf' o 'folio'."""
+    m = (msg or "").lower()
+    return ("caf" in m) or ("folio" in m)
+
+
+def marcar_caf_agotado(tipo_caf: str, msg: str = ""):
+    """Marca el tipo (boleta/factura) como sin folios y detiene su auto-emision. Persiste."""
+    if CAF_STATUS.get(tipo_caf) != "agotado":
+        CAF_STATUS[tipo_caf] = "agotado"
+        try:
+            set_config(f"caf_agotado_{tipo_caf}", "agotado")
+        except Exception:
+            pass
+        logger.error(f"SIN FOLIOS CAF de {tipo_caf.upper()}: auto-emision de {tipo_caf} DETENIDA hasta cargar mas CAF. {str(msg)[:200]}")
+
+
+def manejar_error_emision(oid: str, tipo_doc: str, e: Exception):
+    """Decide el estado de la venta segun el error de emision.
+    Si es por falta de folios CAF: detiene la auto-emision de ese tipo y deja la venta PENDIENTE
+    (no perdida) con una nota clara. Cualquier otro error: estado 'error'."""
+    msg = str(e)
+    tipo_caf = "factura" if tipo_doc == "Factura" else "boleta"
+    if es_error_caf(msg):
+        marcar_caf_agotado(tipo_caf, msg)
+        update_venta(oid, estado="pendiente", error=f"Sin folios CAF de {tipo_caf}: solicitar mas CAF")
+    else:
+        update_venta(oid, estado="error", error=msg[:500])
 
 
 def auto_emitir_venta(oid: str):
@@ -1224,12 +1415,16 @@ def auto_emitir_venta(oid: str):
         if cfg.get("boletas") != "auto":
             logger.info(f"[{oid}] Boleta ({fuente}) en modo manual, queda pendiente")
             return
+    tipo_caf = "factura" if tipo == "Factura" else "boleta"
+    if CAF_STATUS.get(tipo_caf) == "agotado":
+        logger.warning(f"[{oid}] CAF de {tipo_caf} agotado: auto-emision detenida, queda pendiente")
+        return
     try:
         move_id, _ = emitir_venta(oid)
         logger.info(f"[{oid}] Auto-emitida: {tipo} move_id={move_id}")
     except Exception as e:
         logger.error(f"[{oid}] Error en auto-emision: {e}", exc_info=True)
-        update_venta(oid, estado="error", error=str(e)[:500])
+        manejar_error_emision(oid, tipo, e)
 
 
 def _crear_nota_credito(venta: dict, motivo: str) -> Optional[int]:
@@ -1971,6 +2166,16 @@ async def on_startup():
             if _val in ("auto", "manual"):
                 AUTO_EMIT[_fuente][_campo] = _val
     logger.info(f"Auto-emision -> {AUTO_EMIT}")
+    for _fuente in POST_EMIT:
+        for _accion in list(POST_EMIT[_fuente].keys()):
+            _pv = get_config(f"post_emit_{_fuente}_{_accion}")
+            if _pv in ("on", "off"):
+                POST_EMIT[_fuente][_accion] = _pv
+    logger.info(f"Post-emision -> {POST_EMIT}")
+    for _tc in CAF_STATUS:
+        if get_config(f"caf_agotado_{_tc}") == "agotado":
+            CAF_STATUS[_tc] = "agotado"
+    logger.info(f"CAF status -> {CAF_STATUS}")
 
 
 # =========================
@@ -1999,8 +2204,29 @@ def config_auto_emision():
     """Muestra el estado actual del interruptor de auto-emision por canal."""
     return {
         **AUTO_EMIT,
+        "post_emit": POST_EMIT,
+        "caf": CAF_STATUS,
         "nota": "Valores: 'auto' o 'manual' por canal/tipo. Editable en vivo desde el dashboard (POST /config/auto-emision).",
     }
+
+
+class CafReanudarPayload(BaseModel):
+    tipo: str
+
+
+@app.post("/config/caf/reanudar")
+def caf_reanudar(payload: CafReanudarPayload):
+    """Reanuda la auto-emision de un tipo tras cargar mas folios CAF (boleta / factura / todos)."""
+    tipo = (payload.tipo or "").strip().lower()
+    tipos = ["boleta", "factura"] if tipo == "todos" else [tipo]
+    for t in tipos:
+        if t not in CAF_STATUS:
+            raise HTTPException(status_code=400, detail="tipo debe ser 'boleta', 'factura' o 'todos'")
+    for t in tipos:
+        CAF_STATUS[t] = "ok"
+        set_config(f"caf_agotado_{t}", "ok")
+    logger.info(f"CAF reanudado: {tipos} -> {CAF_STATUS}")
+    return {"ok": True, "caf": CAF_STATUS}
 
 
 class AutoEmisionPayload(BaseModel):
@@ -2025,6 +2251,31 @@ def set_auto_emision(payload: AutoEmisionPayload):
         set_config(f"auto_emit_{fuente}_{campo}", valor)
     logger.info(f"Auto-emision cambiada [{fuente}] -> {AUTO_EMIT[fuente]}")
     return {"ok": True, "fuente": fuente, **AUTO_EMIT[fuente]}
+
+
+class PostEmisionPayload(BaseModel):
+    fuente: str
+    pagar: Optional[str] = None
+    email: Optional[str] = None
+    adjuntar_ml: Optional[str] = None
+
+
+@app.post("/config/post-emision")
+def set_post_emision(payload: PostEmisionPayload):
+    """Activa/desactiva acciones post-emision (pagar / email / adjuntar_ml) de un canal."""
+    fuente = (payload.fuente or "").strip().lower()
+    if fuente not in POST_EMIT:
+        raise HTTPException(status_code=400, detail="fuente debe ser 'mercadolibre', 'woocommerce' o 'falabella'")
+    for campo, valor in (("pagar", payload.pagar), ("email", payload.email), ("adjuntar_ml", payload.adjuntar_ml)):
+        if valor is None or campo not in POST_EMIT[fuente]:
+            continue
+        valor = valor.strip().lower()
+        if valor not in ("on", "off"):
+            raise HTTPException(status_code=400, detail=f"{campo} debe ser 'on' o 'off'")
+        POST_EMIT[fuente][campo] = valor
+        set_config(f"post_emit_{fuente}_{campo}", valor)
+    logger.info(f"Post-emision cambiada [{fuente}] -> {POST_EMIT[fuente]}")
+    return {"ok": True, "fuente": fuente, **POST_EMIT[fuente]}
 
 
 @app.get("/debug/shipping/{oid}")
@@ -2325,7 +2576,8 @@ def autorizar_masivo(payload: AutorizarMasivoPayload):
         except Exception as e:
             resultados["error"] += 1
             resultados["detalle"].append({"id": oid, "ok": False, "error": str(e)[:200]})
-            update_venta(oid, estado="error", error=str(e)[:500])
+            _v = get_venta(oid)
+            manejar_error_emision(oid, (_v or {}).get("tipo_sugerido") or "Boleta", e)
     logger.info(f"Autorizacion masiva: {resultados['ok']} OK, {resultados['error']} errores")
     return resultados
 
@@ -2635,7 +2887,26 @@ def autorizar_venta(oid: str):
         return {"ok": True, "id": oid, "move_id": move_id, "partner_id": partner_id}
     except Exception as e:
         logger.error(f"[{oid}] Error al autorizar: {e}", exc_info=True)
-        update_venta(oid, estado="error", error=str(e)[:500])
+        manejar_error_emision(oid, venta.get("tipo_sugerido") or "Boleta", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ventas/{oid}/adjuntar-ml")
+def adjuntar_ml_manual(oid: str):
+    """Sube manualmente el comprobante a Mercado Libre (para probar en 1 orden).
+    Requiere venta ML ya emitida (con move_id). Devuelve la respuesta cruda de ML."""
+    venta = get_venta(oid)
+    if not venta:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+    if (venta.get("fuente") or "mercadolibre") != "mercadolibre":
+        raise HTTPException(status_code=400, detail="Solo aplica a ventas de Mercado Libre")
+    if not venta.get("move_id") or venta.get("estado") != "enviado":
+        raise HTTPException(status_code=400, detail="La venta debe estar emitida (enviado, con documento en Odoo)")
+    try:
+        resp = adjuntar_comprobante_ml(oid, venta["move_id"])
+        return {"ok": True, "id": oid, "respuesta": resp}
+    except Exception as e:
+        logger.error(f"[{oid}] Error adjuntando a ML: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3340,6 +3611,7 @@ UI_HTML = """<!doctype html>
       <a class="link" href="/ventas" target="_blank">API</a>
     </div>
   </div>
+  <div id="cafAlert"></div>
   <div class="grid" style="grid-template-columns:repeat(5,1fr)">
     <div class="card" id="cardTodas" style="cursor:pointer" onclick="setFuente('')">
       <h3>Total</h3><div class="value" id="cTotal">&mdash;</div>
@@ -3383,6 +3655,32 @@ UI_HTML = """<!doctype html>
       <select id="cfgFLFacturas" onchange="guardarAutoEmision('falabella')" style="padding:6px 10px"><option value="auto">Autom&aacute;tica</option><option value="manual">Manual</option></select>
     </div>
     <div style="font-size:11px;color:var(--muted);margin-top:8px">Facturas en "Autom&aacute;tica" se emiten solo si tienen raz&oacute;n social + RUT + direcci&oacute;n + giro; si no, quedan pendientes.</div>
+  </div>
+  <div style="margin-bottom:12px;padding:12px 14px;background:var(--panel);border:1px solid var(--border);border-radius:12px">
+    <div style="font-size:13px;font-weight:700;margin-bottom:10px">&#9989; Acciones post-emisi&oacute;n por canal
+      <span id="cfgPostEstado" style="font-weight:400;font-size:12px;color:var(--muted);margin-left:8px"></span></div>
+    <div style="display:grid;grid-template-columns:auto auto auto auto;gap:8px 20px;align-items:center">
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Canal</span>
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Marcar pagada (Odoo)</span>
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Enviar email (WooCommerce)</span>
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Adjuntar comprobante en ML</span>
+
+      <span style="font-size:13px">&#x1F6CD; Mercado Libre</span>
+      <select id="peMLpagar" onchange="guardarPostEmision('mercadolibre')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+      <span style="font-size:11px;color:#64748b">No aplica (sin email real)</span>
+      <select id="peMLadjuntar" onchange="guardarPostEmision('mercadolibre')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+
+      <span style="font-size:13px">&#x1F6D2; WooCommerce</span>
+      <select id="peWCpagar" onchange="guardarPostEmision('woocommerce')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+      <select id="peWCemail" onchange="guardarPostEmision('woocommerce')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+      <span style="font-size:11px;color:#64748b">No aplica</span>
+
+      <span style="font-size:13px">&#x1F7E1; Falabella</span>
+      <select id="peFLpagar" onchange="guardarPostEmision('falabella')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+      <span style="font-size:11px;color:#64748b">No aplica</span>
+      <span style="font-size:11px;color:#64748b">No aplica</span>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px">"Marcar pagada" registra el pago en Odoo por el diario de banco (queda PAGADA). "Enviar email" (solo WooCommerce) manda el comprobante por el correo de Odoo. "Adjuntar en ML" sube el PDF del DTE al pack de Mercado Libre (packs/fiscal_documents; no aplica a env&iacute;os Full).</div>
   </div>
   <div class="toolbar">
     <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="resetYRender()">
@@ -3824,6 +4122,9 @@ function rowHtml(v) {
   if (v.estado === 'enviado') {
     acciones += '<button class="bad" data-action="anular" data-id="' + esc(id) + '">Anular</button>';
     acciones += '<button class="bad" style="background:#92400e;border-color:#92400e" data-action="notacredito" data-id="' + esc(id) + '">N/C</button>';
+    if ((v.fuente || 'mercadolibre') === 'mercadolibre') {
+      acciones += '<button class="secondary" data-action="adjuntarml" data-id="' + esc(id) + '" title="Subir el PDF del comprobante a Mercado Libre" style="background:#0ea5e9;color:#fff">Cargar PDF a ML</button>';
+    }
   }
   return '<tr id="row-' + esc(id) + '">' +
     '<td><input type="checkbox" class="cb-row" data-id="' + esc(id) + '" onchange="onCheckboxChange()"></td>' +
@@ -3909,6 +4210,7 @@ function renderTable() {
       else if (action === 'autorizar') autorizar(id);
       else if (action === 'anular') anular(id);
       else if (action === 'notacredito') abrirNC(id);
+      else if (action === 'adjuntarml') adjuntarMlManual(id);
       else if (action === 'verpack') verPack(id, el.dataset.pack);
       else if (action === 'copy') { try { navigator.clipboard.writeText(id); } catch(e2) {} }
     });
@@ -4112,6 +4414,17 @@ function reprocesarActual() {
   reprocesar(currentId);
 }
 
+function adjuntarMlManual(id) {
+  if (!confirm('Subir el PDF del comprobante a Mercado Libre para la venta ' + id + '?\\n(Prueba real: adjunta el documento a la orden del comprador.)')) return;
+  fetch('/ventas/' + id + '/adjuntar-ml', {method: 'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (d.ok) { alert('OK. Respuesta de ML:\\n' + JSON.stringify(d.respuesta || d)); refreshData(); }
+      else { alert('Error: ' + (d.detail || 'desconocido')); }
+    })
+    .catch(function(e){ alert('Error: ' + e.message); });
+}
+
 function recalcularWC(id) {
   if (!confirm('Recalcular la venta ' + id + ' desde WooCommerce? Corrige montos (IVA + envio).')) return;
   fetch('/ventas/' + id + '/recalcular-wc', {method:'POST'})
@@ -4129,16 +4442,85 @@ var CFG_IDS = {
   falabella:    {b: 'cfgFLBoletas', f: 'cfgFLFacturas'}
 };
 
+var PE_IDS = {
+  mercadolibre: {pagar: 'peMLpagar', adjuntar_ml: 'peMLadjuntar'},
+  woocommerce:  {pagar: 'peWCpagar', email: 'peWCemail'},
+  falabella:    {pagar: 'peFLpagar'}
+};
+
+function guardarPostEmision(fuente) {
+  var ids = PE_IDS[fuente];
+  if (!ids) return;
+  var body = {fuente: fuente};
+  if (ids.pagar) body.pagar = document.getElementById(ids.pagar).value;
+  if (ids.email) body.email = document.getElementById(ids.email).value;
+  if (ids.adjuntar_ml) body.adjuntar_ml = document.getElementById(ids.adjuntar_ml).value;
+  var est = document.getElementById('cfgPostEstado');
+  if (est) { est.textContent = 'Guardando...'; est.style.color = '#94a3b8'; }
+  fetch('/config/post-emision', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (est) {
+        if (d.ok) { est.textContent = 'Guardado \\u2713 ' + fuente + ': pagar ' + d.pagar + (d.email !== undefined ? ' / email ' + d.email : '') + (d.adjuntar_ml !== undefined ? ' / adjuntar ' + d.adjuntar_ml : ''); est.style.color = '#4ade80'; }
+        else { est.textContent = 'Error: ' + (d.detail || 'desconocido'); est.style.color = '#f87171'; }
+      }
+    })
+    .catch(function(e){ if (est) { est.textContent = 'Error: ' + e.message; est.style.color = '#f87171'; } });
+}
+
+function renderCafAlert(caf) {
+  var el = document.getElementById('cafAlert');
+  if (!el) return;
+  caf = caf || {};
+  var agotados = Object.keys(caf).filter(function(t){ return caf[t] === 'agotado'; });
+  if (!agotados.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  var nombres = agotados.map(function(t){ return t.charAt(0).toUpperCase() + t.slice(1); }).join(' y ');
+  var btns = agotados.map(function(t){ return '<button class="warn" data-caf="' + t + '">Reanudar ' + t + '</button>'; }).join(' ');
+  el.style.display = 'block';
+  el.innerHTML = '<div style="background:#7f1d1d;border:1px solid #ef4444;border-radius:12px;padding:12px 16px;margin-bottom:14px;color:#fecaca;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">' +
+    '<div><strong>&#9888; Sin folios CAF de ' + nombres + '.</strong> La emisi&oacute;n autom&aacute;tica de ' + nombres + ' est&aacute; DETENIDA. Solicita m&aacute;s CAF en el SII, c&aacute;rgalos en Odoo y pulsa Reanudar. Las ventas afectadas quedaron <strong>pendientes</strong>.</div>' +
+    '<div style="display:flex;gap:6px;flex-wrap:wrap">' + btns + '</div></div>';
+  el.querySelectorAll('[data-caf]').forEach(function(b){ b.addEventListener('click', function(){ reanudarCaf(b.getAttribute('data-caf')); }); });
+}
+
+function reanudarCaf(tipo) {
+  if (!confirm('Ya cargaste mas folios CAF de ' + tipo + '? Se reanuda la emision automatica de ' + tipo + '.')) return;
+  fetch('/config/caf/reanudar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tipo: tipo})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.ok) { renderCafAlert(d.caf); alert('Reanudado. Ahora autoriza o reprocesa las ventas que quedaron pendientes por falta de CAF.'); refreshData(); }
+      else { alert('Error: ' + (d.detail || 'desconocido')); }
+    })
+    .catch(function(e){ alert('Error: ' + e.message); });
+}
+
+function pollCaf() {
+  fetch('/config/auto-emision').then(function(r){ return r.json(); }).then(function(d){ renderCafAlert(d.caf); }).catch(function(){});
+}
+
 function cargarAutoEmision() {
   fetch('/config/auto-emision')
     .then(function(r){ return r.json(); })
     .then(function(d) {
+      renderCafAlert(d.caf);
       Object.keys(CFG_IDS).forEach(function(fuente) {
         var cfg = d[fuente];
         if (!cfg) return;
         var ids = CFG_IDS[fuente];
         if (cfg.boletas) document.getElementById(ids.b).value = cfg.boletas;
         if (cfg.facturas) document.getElementById(ids.f).value = cfg.facturas;
+      });
+      var pe = d.post_emit || {};
+      Object.keys(PE_IDS).forEach(function(fuente) {
+        var c = pe[fuente];
+        if (!c) return;
+        var ids = PE_IDS[fuente];
+        if (ids.pagar && c.pagar) document.getElementById(ids.pagar).value = c.pagar;
+        if (ids.email && c.email) { var _e = document.getElementById(ids.email); if (_e) _e.value = c.email; }
+        if (ids.adjuntar_ml && c.adjuntar_ml) { var _a = document.getElementById(ids.adjuntar_ml); if (_a) _a.value = c.adjuntar_ml; }
       });
       var est = document.getElementById('cfgEstado');
       if (est) est.textContent = '';
@@ -4587,6 +4969,7 @@ setInterval(function() {
     return document.getElementById(id).classList.contains('open');
   });
   if (!anyOpen) refreshSilente();
+  pollCaf();
 }, 30000);
 '''
 
