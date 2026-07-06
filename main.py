@@ -786,7 +786,11 @@ def ml_headers():
     return {"Authorization": f"Bearer {get_env('ML_ACCESS_TOKEN')}"}
 
 
+_ml_scope = ""
+
+
 def refresh_ml_token() -> bool:
+    global _ml_scope
     try:
         payload = {
             "grant_type": "refresh_token",
@@ -801,7 +805,9 @@ def refresh_ml_token() -> bool:
             os.environ["ML_ACCESS_TOKEN"] = data["access_token"]
         if data.get("refresh_token"):
             os.environ["ML_REFRESH_TOKEN"] = data["refresh_token"]
-        logger.info("Token ML renovado")
+        if data.get("scope"):
+            _ml_scope = data["scope"]
+        logger.info(f"Token ML renovado (scope: {_ml_scope or 'desconocido'})")
         return True
     except Exception as e:
         logger.error(f"Error renovando token ML: {e}")
@@ -1252,9 +1258,28 @@ def enviar_comprobante_email(move_id: int):
 
 
 def obtener_pdf_dte_odoo(move_id: int) -> bytes:
-    """Descarga el PDF del DTE (factura/boleta) desde Odoo via el controlador de reportes.
-    Usa una sesion web (los metodos _render_qweb_pdf estan bloqueados por XML-RPC).
-    Requiere ODOO_URL/DB/USER y ODOO_API_KEY (o ODOO_PASSWORD). Report: account.account_invoices."""
+    """Obtiene el PDF del DTE (factura/boleta) desde Odoo.
+    1) Intenta leer un PDF ya ADJUNTO al documento via XML-RPC (usa el API key, sin password).
+    2) Si no hay, lo genera via el controlador de reportes con una sesion web
+       (requiere ODOO_PASSWORD real; el API key no sirve para el login web)."""
+    # --- 1) PDF adjunto (XML-RPC) ---
+    try:
+        ctx = odoo_connect()
+        atts = odoo_exec(
+            ctx, "ir.attachment", "search_read",
+            [[["res_model", "=", "account.move"], ["res_id", "=", move_id],
+              ["mimetype", "=", "application/pdf"]]],
+            {"fields": ["datas"], "limit": 1, "order": "id desc"},
+        )
+        if atts and atts[0].get("datas"):
+            pdf = base64.b64decode(atts[0]["datas"])
+            if pdf[:4] == b"%PDF":
+                logger.info(f"PDF DTE obtenido de adjunto Odoo (move_id={move_id}, {len(pdf)} bytes)")
+                return pdf
+    except Exception as e:
+        logger.warning(f"obtener_pdf_dte_odoo: sin PDF adjunto o fallo lectura ({e}); intento sesion web")
+
+    # --- 2) Generar via controlador de reportes (sesion web) ---
     url = get_env("ODOO_URL").rstrip("/")
     db = get_env("ODOO_DB")
     user = get_env("ODOO_USER")
@@ -1266,11 +1291,11 @@ def obtener_pdf_dte_odoo(move_id: int) -> bytes:
                      timeout=30)
     auth.raise_for_status()
     if not (auth.json().get("result") or {}).get("uid"):
-        raise Exception("No se pudo autenticar la sesion web de Odoo para obtener el PDF")
+        raise Exception("No se pudo autenticar la sesion web de Odoo para el PDF (setear ODOO_PASSWORD con la clave real)")
     r = sess.get(f"{url}/report/pdf/{report}/{move_id}", timeout=90)
     r.raise_for_status()
     if not r.content.startswith(b"%PDF"):
-        raise Exception("Odoo no devolvio un PDF valido (revisar el nombre del reporte)")
+        raise Exception("Odoo no devolvio un PDF valido (revisar ODOO_INVOICE_REPORT)")
     return r.content
 
 
@@ -2318,6 +2343,54 @@ def debug_direccion(oid: str):
             [s for s in list(dict.fromkeys(flatten_strings(order) + flatten_strings(billing_raw))) if looks_like_chilean_address(s)],
             key=score_address_candidate, reverse=True
         )[:20]
+    }
+
+
+@app.get("/debug/ml-scopes")
+def debug_ml_scopes():
+    """Muestra los permisos (scopes) del token de ML. Necesitas 'write' para cargar comprobantes."""
+    refresh_ml_token()  # refresca y captura el scope actual
+    scope = _ml_scope or ""
+    tiene_write = "write" in scope.lower()
+    return {
+        "scope": scope or "desconocido",
+        "tiene_write": tiene_write,
+        "interpretacion": ("OK: la app tiene permiso de escritura, puede cargar comprobantes"
+                           if tiene_write else
+                           "FALTA 'write': la app solo puede leer. Hay que agregar el scope 'write' a la app de ML y reautorizar."),
+    }
+
+
+@app.get("/debug/ml-fiscal/{oid}")
+def debug_ml_fiscal(oid: str):
+    """Prueba de solo lectura: intenta LEER los comprobantes del pack en ML.
+    status 200 => la app accede al recurso; 401/403 => falta permiso/scope."""
+    venta = get_venta(oid)
+    order = {}
+    if venta and venta.get("order_json"):
+        try:
+            order = json.loads(venta["order_json"])
+        except Exception:
+            order = {}
+    pack_id = (venta or {}).get("pack_id") or order.get("pack_id") or order.get("id") or oid
+    url = f"https://api.mercadolibre.com/packs/{pack_id}/fiscal_documents"
+    try:
+        r = requests.get(url, headers=ml_headers(), timeout=30)
+    except Exception as e:
+        return {"pack_id": str(pack_id), "error": str(e)}
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text[:800]
+    return {
+        "pack_id": str(pack_id),
+        "status_code": r.status_code,
+        "puede_acceder": r.status_code == 200,
+        "interpretacion": ("OK: la app puede leer/cargar comprobantes en este pack"
+                           if r.status_code == 200 else
+                           "Sin permiso (falta scope 'write' o la app no tiene acceso): revisar en developers.mercadolibre.cl"
+                           if r.status_code in (401, 403) else "Ver respuesta_ml"),
+        "respuesta_ml": body,
     }
 
 
