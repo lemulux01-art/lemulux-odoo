@@ -871,7 +871,7 @@ _ml_lock = threading.Lock()   # serializa todos los requests a ML entre threads
 _ml_last_request = 0.0        # timestamp del ultimo request exitoso
 
 
-def ml_get(url: str) -> dict:
+def ml_get(url: str, extra_headers: dict = None) -> dict:
     global _consecutive_429, _ml_last_request
     with _ml_lock:
         # Respetar minimo 500ms entre requests para no saturar el rate limit
@@ -882,7 +882,10 @@ def ml_get(url: str) -> dict:
 
         for attempt in range(6):
             try:
-                res = requests.get(url, headers=ml_headers(), timeout=30)
+                _h = ml_headers()
+                if extra_headers:
+                    _h = {**_h, **extra_headers}
+                res = requests.get(url, headers=_h, timeout=30)
             except requests.RequestException as e:
                 logger.error(f"Error de red en {url}: {e}")
                 raise
@@ -2580,6 +2583,78 @@ def debug_shipping(oid: str):
         "logistic_type_in_order": shipping.get("logistic_type"),
         "logistic_type_in_shipment": (shipment_data.get("logistic_type") or
                                        shipment_data.get("shipping_option", {}).get("shipping_method_id")),
+    }
+
+
+@app.get("/ml/debug-split/{order_id}")
+def ml_debug_split(order_id: str):
+    """Diagnostico de una venta dividida en ML: muestra pack, ordenes del pack y el estado de
+    cada envio (status/substatus/sibling_id) para entender la estructura antes de facturar.
+    Correr con el numero de orden ORIGINAL o con cualquiera de las nuevas."""
+    def shipment_new(sid):
+        if not sid:
+            return {}
+        try:
+            return ml_get(f"https://api.mercadolibre.com/shipments/{sid}", {"x-format-new": "true"})
+        except Exception as e:
+            return {"error": str(e)}
+    try:
+        order = get_ml_order(order_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"No se pudo leer la orden: {e}")
+    if not order:
+        raise HTTPException(status_code=404, detail="Orden no encontrada en ML")
+    pack_id = order.get("pack_id")
+    resumen_orden = {
+        "order_id": order.get("id"),
+        "pack_id": pack_id,
+        "status": order.get("status"),
+        "shipping_id": (order.get("shipping") or {}).get("id"),
+        "items": [{"title": safe_get(it, "item", "title", default=""),
+                   "qty": it.get("quantity")} for it in (order.get("order_items") or [])],
+    }
+    sh = shipment_new(resumen_orden["shipping_id"])
+    resumen_orden["shipment"] = {
+        "id": sh.get("id"), "status": sh.get("status"), "substatus": sh.get("substatus"),
+        "sibling_id": sh.get("sibling_id"), "reason": sh.get("reason"),
+    }
+    # Pack: lista de ordenes que agrupa
+    pack_info = {}
+    ordenes_pack = []
+    if pack_id:
+        try:
+            pack = get_ml_pack(str(pack_id))
+        except Exception as e:
+            pack = {"error": str(e)}
+        pack_info = {k: pack.get(k) for k in ("id", "status", "shipment_id") if isinstance(pack, dict)}
+        for o in (pack.get("orders") or []) if isinstance(pack, dict) else []:
+            oid_p = str(o.get("id") or "")
+            try:
+                od = get_ml_order(oid_p)
+            except Exception:
+                od = {}
+            sid = (od.get("shipping") or {}).get("id")
+            shp = shipment_new(sid)
+            v_bd = get_venta(oid_p)
+            ordenes_pack.append({
+                "order_id": oid_p,
+                "status": od.get("status"),
+                "shipping_id": sid,
+                "shipment_status": shp.get("status"),
+                "shipment_substatus": shp.get("substatus"),
+                "sibling_id": shp.get("sibling_id"),
+                "items_qty": sum(float(it.get("quantity") or 0) for it in (od.get("order_items") or [])),
+                "en_bd": bool(v_bd),
+                "estado_bd": (v_bd or {}).get("estado"),
+                "move_id_bd": (v_bd or {}).get("move_id"),
+            })
+    return {
+        "ok": True,
+        "orden_consultada": resumen_orden,
+        "pack": pack_info,
+        "pack_id": pack_id,
+        "ordenes_del_pack": ordenes_pack,
+        "nota": "Si 'ordenes_del_pack' lista 451 y 453 bajo el mismo pack_id, la factura (por pack) es UNA sola para toda la venta.",
     }
 
 
