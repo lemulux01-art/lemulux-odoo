@@ -3675,17 +3675,20 @@ def process_fl_order(order_id: str, order_data: dict = None):
             logger.warning(f"[FL:{order_id}] Orden no encontrada")
             return
 
-        # Normalizar status de forma robusta
+        # Normalizar status de forma robusta.
+        # En GetOrders, Statuses suele venir como {"Status": ["delivered"]} (lista anidada);
+        # tambien puede ser {"Status": "..."}, una lista, o un string directo.
         _s = order.get("Statuses")
+        status_raw = None
         if isinstance(_s, dict):
-            status_val = _s.get("Status", "pending")
-        elif isinstance(_s, list):
-            status_val = _s[0] if _s else "pending"
-        elif isinstance(_s, str):
-            status_val = _s
-        else:
-            status_val = "pending"
-        status_val = str(status_val).strip().lower().replace(" ", "_")
+            status_raw = _s.get("Status")
+        elif isinstance(_s, (list, str)):
+            status_raw = _s
+        if isinstance(status_raw, list):
+            status_raw = status_raw[0] if status_raw else None
+        if isinstance(status_raw, dict):  # p.ej. {"Status": "..."} anidado
+            status_raw = status_raw.get("Status")
+        status_val = str(status_raw or "pending").strip().lower().replace(" ", "_")
 
         if existing:
             update_venta(oid_str, estado_envio=status_val)
@@ -3693,7 +3696,8 @@ def process_fl_order(order_id: str, order_data: dict = None):
             return
 
         if status_val not in FL_ESTADOS_VALIDOS:
-            logger.info(f"[FL:{order_id}] Estado {status_val} no valido para facturar, ignorado")
+            logger.info(f"[FL:{order_id}] Estado '{status_val}' no valido para facturar, ignorado "
+                        f"(Statuses crudo: {order.get('Statuses')!r})")
             return
 
         extra_str = order.get("ExtraBillingAttributes") or ""
