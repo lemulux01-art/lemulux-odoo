@@ -69,9 +69,10 @@ AUTO_EMIT = {
 # Acciones POST-emision por canal. Valores "on" | "off" (default off; se activan a mano en el
 # dashboard y persisten en la BD). Se ejecutan despues de emitir el DTE, y NUNCA tumban la
 # emision (si fallan, solo se registran en el log).
-#   pagar -> registra el pago en Odoo => la factura/boleta queda PAGADA
-#   email -> envia el comprobante al cliente por el correo interno de Odoo
-# (Adjuntar el comprobante en Mercado Libre queda pendiente de confirmar endpoint/prerequisitos.)
+#   pagar       -> registra el pago en Odoo => la factura/boleta queda PAGADA
+#   email       -> envia el comprobante al cliente por el correo interno de Odoo
+#   adjuntar_ml -> sube el PDF del DTE al pack de Mercado Libre (packs/fiscal_documents)
+#   adjuntar_fl -> sube el PDF del DTE a Falabella Seller Center (SetInvoicePDF)
 def _post_emit_default(src: str, accion: str) -> str:
     v = os.getenv(f"POST_EMIT_{src}_{accion}")
     return v.strip().lower() if v else "off"
@@ -79,7 +80,7 @@ def _post_emit_default(src: str, accion: str) -> str:
 POST_EMIT = {
     "mercadolibre": {"pagar": _post_emit_default("ML", "PAGAR"), "email": _post_emit_default("ML", "EMAIL"), "adjuntar_ml": _post_emit_default("ML", "ADJUNTAR")},
     "woocommerce":  {"pagar": _post_emit_default("WC", "PAGAR"), "email": _post_emit_default("WC", "EMAIL")},
-    "falabella":    {"pagar": _post_emit_default("FL", "PAGAR"), "email": _post_emit_default("FL", "EMAIL")},
+    "falabella":    {"pagar": _post_emit_default("FL", "PAGAR"), "email": _post_emit_default("FL", "EMAIL"), "adjuntar_fl": _post_emit_default("FL", "ADJUNTAR")},
 }
 
 # Estado de folios CAF por tipo. "ok" | "agotado". Si al emitir se detecta que no hay folios,
@@ -1311,6 +1312,34 @@ def obtener_pdf_dte_odoo(move_id: int) -> bytes:
     return r.content
 
 
+def obtener_datos_dte_odoo(move_id: int) -> dict:
+    """Lee del documento en Odoo el folio (numero) y la fecha del DTE ya emitido.
+    Falabella exige invoiceNumber + invoiceDate al cargar el documento tributario.
+    - numero: usa el folio de la localizacion chilena (l10n_latam_document_number);
+      cae a 'name' si no existe.
+    - fecha:  invoice_date (fecha del documento) o 'date' contable."""
+    ctx = odoo_connect()
+    fields = ["name", "invoice_date", "date"]
+    move_fields = odoo_exec(ctx, "account.move", "fields_get", [], {"attributes": ["string"]})
+    if "l10n_latam_document_number" in move_fields:
+        fields.insert(0, "l10n_latam_document_number")
+    rows = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": fields})
+    if not rows:
+        raise Exception(f"Documento {move_id} no encontrado en Odoo")
+    mv = rows[0]
+    folio = (mv.get("l10n_latam_document_number") or "").strip()
+    if folio:
+        # El folio de l10n_cl ya es el numero puro del DTE; usarlo tal cual.
+        numero = folio
+    else:
+        # Fallback: 'name' suele traer prefijo (ej "FAC/2026/000123"); tomar el ultimo grupo de digitos.
+        name = (mv.get("name") or "").strip()
+        grupos = re.findall(r"\d+", name)
+        numero = grupos[-1] if grupos else name
+    fecha = mv.get("invoice_date") or mv.get("date") or datetime.now().strftime("%Y-%m-%d")
+    return {"numero": numero, "fecha": str(fecha)[:10]}
+
+
 def subir_comprobante_ml(pack_id: str, pdf_bytes: bytes, oid: str) -> dict:
     """Sube el PDF del comprobante al pack de Mercado Libre.
     POST /packs/{pack_id}/fiscal_documents (multipart, campo 'fiscal_document', PDF <= 1MB)."""
@@ -1369,6 +1398,11 @@ def ejecutar_post_emision(move_id: int, fuente: str, oid: str):
             adjuntar_comprobante_ml(oid, move_id)
         except Exception as e:
             logger.error(f"[{oid}] Post-emision 'adjuntar_ml' fallo: {e}", exc_info=True)
+    if cfg.get("adjuntar_fl") == "on":
+        try:
+            adjuntar_comprobante_fl(oid, move_id)
+        except Exception as e:
+            logger.error(f"[{oid}] Post-emision 'adjuntar_fl' fallo: {e}", exc_info=True)
 
 
 def emitir_venta(oid: str) -> tuple:
@@ -2295,15 +2329,17 @@ class PostEmisionPayload(BaseModel):
     pagar: Optional[str] = None
     email: Optional[str] = None
     adjuntar_ml: Optional[str] = None
+    adjuntar_fl: Optional[str] = None
 
 
 @app.post("/config/post-emision")
 def set_post_emision(payload: PostEmisionPayload):
-    """Activa/desactiva acciones post-emision (pagar / email / adjuntar_ml) de un canal."""
+    """Activa/desactiva acciones post-emision (pagar / email / adjuntar_ml / adjuntar_fl) de un canal."""
     fuente = (payload.fuente or "").strip().lower()
     if fuente not in POST_EMIT:
         raise HTTPException(status_code=400, detail="fuente debe ser 'mercadolibre', 'woocommerce' o 'falabella'")
-    for campo, valor in (("pagar", payload.pagar), ("email", payload.email), ("adjuntar_ml", payload.adjuntar_ml)):
+    for campo, valor in (("pagar", payload.pagar), ("email", payload.email),
+                         ("adjuntar_ml", payload.adjuntar_ml), ("adjuntar_fl", payload.adjuntar_fl)):
         if valor is None or campo not in POST_EMIT[fuente]:
             continue
         valor = valor.strip().lower()
@@ -2557,9 +2593,11 @@ def ventas(estado: Optional[str] = None):
     items = list_ventas(estado)
     enriched = []
     for v in items:
+        order_number = ""
         try:
             order = json.loads(v.get("order_json") or "{}")
             productos, cantidad_items, total_bruto = summarize_order_items(order)
+            order_number = order.get("order_number") or ""
         except Exception:
             productos, cantidad_items, total_bruto = [], 0, 0.0
         tipo_envio = v.get("tipo_envio_ml") or "-"
@@ -2571,6 +2609,7 @@ def ventas(estado: Optional[str] = None):
             "cantidad_items": cantidad_items,
             "total_bruto": total_bruto,
             "tipo_envio": tipo_envio,
+            "order_number": order_number,
         })
     return {"items": enriched}
 
@@ -3003,6 +3042,33 @@ def adjuntar_ml_manual(oid: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/ventas/{oid}/adjuntar-fl")
+def adjuntar_fl_manual(oid: str):
+    """Test manual en 1 orden Falabella: si no esta emitida la EMITE (crea boleta/factura
+    en Odoo) y luego sube el PDF a Falabella (SetInvoicePDF). Devuelve la respuesta cruda."""
+    venta = get_venta(oid)
+    if not venta:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+    if (venta.get("fuente") or "") != "falabella":
+        raise HTTPException(status_code=400, detail="Solo aplica a ventas de Falabella")
+    emitido_ahora = False
+    move_id = venta.get("move_id")
+    if not move_id or venta.get("estado") != "enviado":
+        try:
+            move_id, _ = emitir_venta(oid)
+            emitido_ahora = True
+        except Exception as e:
+            logger.error(f"[{oid}] Error emitiendo antes de adjuntar a FL: {e}", exc_info=True)
+            manejar_error_emision(oid, venta.get("tipo_sugerido") or "Boleta", e)
+            raise HTTPException(status_code=500, detail=f"No se pudo emitir el DTE: {e}")
+    try:
+        resp = adjuntar_comprobante_fl(oid, move_id)
+        return {"ok": True, "id": oid, "emitido_ahora": emitido_ahora, "move_id": move_id, "respuesta": resp}
+    except Exception as e:
+        logger.error(f"[{oid}] Error adjuntando a Falabella: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ventas/{oid}/nota-credito")
 def crear_nota_credito(oid: str, body: dict):
     venta = get_venta(oid)
@@ -3120,10 +3186,16 @@ async def fl_webhook_endpoint(request: Request):
 
 
 @app.post("/fl/reconciliar")
-def fl_reconciliar_manual():
-    """Fuerza reconciliacion con Falabella: consulta ultimas 100 ordenes."""
+def fl_reconciliar_manual(days: int = None, limit: int = 100):
+    """Fuerza reconciliacion con Falabella: consulta las ordenes recientes e ingresa las
+    que falten en la BD. Opcional: days = cuantos dias hacia atras buscar (por defecto usa
+    FL_RECON_DAYS); limit = cuantas ordenes traer (max util 100)."""
     try:
-        ordenes = fl_get_orders_recent(limit=100)
+        created_after = None
+        if days and int(days) > 0:
+            from datetime import timedelta
+            created_after = (datetime.utcnow() - timedelta(days=int(days))).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        ordenes = fl_get_orders_recent(created_after=created_after, limit=limit)
         ids_fl  = [f"FL-{o['OrderId']}" for o in ordenes if o.get("OrderId")]
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -3193,11 +3265,45 @@ def fl_debug_order(order_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/fl/debug-orders")
+def fl_debug_orders(days: int = 30, limit: int = 20):
+    """Diagnostico: respuesta CRUDA de GetOrders para ver si Falabella devuelve ordenes,
+    un error de permisos, o datos enmascarados. Ej: /fl/debug-orders?days=60"""
+    from datetime import timedelta
+    created_after = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    try:
+        data = fl_get("GetOrders", {"CreatedAfter": created_after, "Limit": str(limit),
+                                    "SortBy": "created_at", "SortDirection": "DESC"})
+    except Exception as e:
+        return {"created_after": created_after, "error": str(e)}
+    orders = []
+    try:
+        o = data["SuccessResponse"]["Body"]["Orders"]["Order"]
+        orders = o if isinstance(o, list) else [o]
+    except Exception:
+        pass
+    return {
+        "created_after": created_after,
+        "user": get_env("FL_USER_ID", required=False, default=""),
+        "count": len(orders),
+        "claves_respuesta": list(data.keys()) if isinstance(data, dict) else str(type(data)),
+        "head_ids": [str(x.get("OrderId")) for x in orders[:10] if isinstance(x, dict)],
+        "primeras_ordenes": orders[:3],
+        "raw": data,
+    }
+
+
 # =========================
 # FALABELLA SELLER CENTER
 # =========================
 
 FL_BASE_URL      = "https://sellercenter-api.falabella.com"
+# Endpoint REST para cargar el documento tributario (SetInvoicePDF). Configurable por si
+# cambia la ruta/version. Ref: developers.falabella.com .../reference/setinvoicepdf
+FL_INVOICE_PDF_URL = os.getenv("FL_INVOICE_PDF_URL",
+                               "https://sellercenter-api.falabella.com/v1/marketplace-sellers/invoice/pdf")
+# Codigo de operador segun pais (Chile=FACL, Colombia=FACO, Peru=FAPE).
+FL_OPERATOR_CODE = os.getenv("FL_OPERATOR_CODE", "FACL")
 FL_DEFAULT_EMAIL = "boleta@lemulux.com"
 FL_ESTADOS_VALIDOS = {"pending", "ready_to_ship", "shipped", "delivered", "processing"}
 
@@ -3235,8 +3341,10 @@ def fl_get(action: str, extra_params: dict = None) -> dict:
         if elapsed < 1.0:
             time.sleep(1.0 - elapsed)
 
-        # GetOrder/GetOrderItems usan Version=2.0, el resto usa 1.0
-        version = "2.0" if action in ("GetOrder", "GetOrderItems") else "1.0"
+        # Esta cuenta responde con Version 1.0 en todas las acciones (GetOrders v1.0 trae todo,
+        # incluido NationalRegistrationNumber/RUT y ExtraBillingAttributes). La v2.0 devolvia 400.
+        # Configurable con FL_API_VERSION por si cambia.
+        version = os.getenv("FL_API_VERSION", "1.0")
         params = {
             "Action":    action,
             "Format":    "JSON",
@@ -3271,45 +3379,158 @@ def fl_get(action: str, extra_params: dict = None) -> dict:
             raise
 
 
-def fl_get_order(order_id: str) -> dict:
-    """GetOrder v2 devuelve datos del cliente + billing + items."""
-    data = fl_get("GetOrder", {"OrderId": str(order_id)})
+def _fl_extract_list(data: dict, container_key: str, item_key: str) -> list:
+    """Extrae la lista de items (Orders/OrderItems) del JSON de Falabella.
+    En JSON, Body[container] es una LISTA de {item_key: {...}}; en XML seria un dict
+    {item_key: {...} o [...]}. Se manejan ambas formas."""
     try:
-        return data["SuccessResponse"]["Body"]["Orders"]["Order"]
+        cont = data["SuccessResponse"]["Body"][container_key]
     except (KeyError, TypeError):
-        return {}
+        return []
+    if isinstance(cont, list):
+        out = []
+        for x in cont:
+            out.append(x[item_key] if isinstance(x, dict) and item_key in x else x)
+        return out
+    if isinstance(cont, dict):
+        it = cont.get(item_key)
+        if isinstance(it, list):
+            return it
+        if it:
+            return [it]
+    return []
+
+
+def fl_get_order(order_id: str) -> dict:
+    """GetOrder devuelve datos del cliente + billing de la orden."""
+    data = fl_get("GetOrder", {"OrderId": str(order_id)})
+    orders = _fl_extract_list(data, "Orders", "Order")
+    return orders[0] if orders else {}
 
 
 def fl_get_order_items(order_id: str) -> list:
     """GetOrderItems devuelve los productos de la orden."""
     data = fl_get("GetOrderItems", {"OrderId": str(order_id)})
+    return _fl_extract_list(data, "OrderItems", "OrderItem")
+
+
+def fl_order_item_ids(order_id: str) -> list:
+    """Lista de OrderItemId de una orden Falabella (necesarios para SetInvoicePDF)."""
+    ids = []
+    for it in fl_get_order_items(order_id):
+        oii = it.get("OrderItemId") or it.get("OrderItemID") or it.get("order_item_id")
+        if oii is not None and str(oii).strip():
+            ids.append(str(oii).strip())
+    return ids
+
+
+def fl_invoice_type(tipo: str) -> str:
+    """Mapea el tipo interno (Boleta/Factura/Nota de credito) al enum de Falabella."""
+    t = (tipo or "").strip().lower()
+    if t.startswith("factura"):
+        return "FACTURA"
+    if "credito" in t or "crédito" in t or t.startswith("nc") or "nota" in t:
+        return "NOTA_DE_CREDITO"
+    return "BOLETA"
+
+
+def subir_comprobante_fl(order_item_ids: list, pdf_bytes: bytes, invoice_number: str,
+                         invoice_date: str, invoice_type: str, oid: str) -> dict:
+    """Sube el PDF del documento tributario a Falabella Seller Center (SetInvoicePDF).
+    POST {FL_INVOICE_PDF_URL} con los parametros comunes firmados en headers y el
+    payload (incluido el PDF en base64) en el body JSON. Solo aplica a ordenes que ya
+    alcanzaron 'ready_to_ship'; no aplica a items despachados por Falabella (FBF)."""
+    if not pdf_bytes:
+        raise Exception("PDF vacio")
+    if not order_item_ids:
+        raise Exception("La orden no tiene OrderItemIds para asociar el documento")
+    if not invoice_number:
+        raise Exception("Falta el numero (folio) del documento emitido en Odoo")
+
+    version = os.getenv("FL_API_VERSION", "1.0")
+    # La firma va sobre los parametros comunes (Action, Format, Service, Timestamp,
+    # UserID, Version), ordenados y URL-encoded. Reutiliza fl_sign (mismo algoritmo).
+    common = {
+        "Action":    "SetInvoicePDF",
+        "Format":    "JSON",
+        "Service":   "Invoice",
+        "Timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+        "UserID":    get_env("FL_USER_ID"),
+        "Version":   version,
+    }
+    common["Signature"] = fl_sign(common)
+
+    body = {
+        "orderItemIds":          [str(i) for i in order_item_ids],
+        "invoiceNumber":         str(invoice_number),
+        "invoiceDate":           str(invoice_date),
+        "invoiceType":           invoice_type,
+        "operatorCode":          FL_OPERATOR_CODE,
+        "invoiceDocumentFormat": "pdf",
+        "invoiceDocument":       base64.b64encode(pdf_bytes).decode("ascii"),
+    }
+    headers = dict(common)
+    headers["Content-Type"] = "application/json"
+    headers["accept"] = "application/json"
+    headers["User-Agent"] = f"{get_env('FL_USER_ID')}/Python/3"
+
+    with _ml_lock:
+        elapsed = time.time() - _ml_last_request
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
+        res = requests.post(FL_INVOICE_PDF_URL, params=common, headers=headers,
+                            json=body, timeout=90)
+    if res.status_code == 429:
+        logger.warning(f"[FL] 429 en SetInvoicePDF ({oid}), esperando 30s")
+        time.sleep(30)
+        common["Timestamp"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        common["Signature"] = fl_sign({k: v for k, v in common.items() if k != "Signature"})
+        headers.update({k: common[k] for k in ("Timestamp", "Signature")})
+        res = requests.post(FL_INVOICE_PDF_URL, params=common, headers=headers,
+                            json=body, timeout=90)
     try:
-        items = data["SuccessResponse"]["Body"]["OrderItems"]["OrderItem"]
-        if isinstance(items, dict):
-            items = [items]
-        return items
-    except (KeyError, TypeError):
-        return []
+        data = res.json()
+    except Exception:
+        data = {"status_code": res.status_code, "text": res.text[:500]}
+    if res.status_code >= 400 or (isinstance(data, dict) and data.get("ErrorResponse")):
+        raise Exception(f"Falabella rechazo el documento (HTTP {res.status_code}): {data}")
+    return data
+
+
+def adjuntar_comprobante_fl(oid: str, move_id: int) -> dict:
+    """Sube a Falabella el PDF del DTE ya emitido en Odoo. Solo canal Falabella."""
+    venta = get_venta(oid)
+    if not venta:
+        raise Exception("Venta no encontrada")
+    if (venta.get("fuente") or "") != "falabella":
+        raise Exception("Solo aplica a ventas de Falabella")
+    order = json.loads(venta.get("order_json") or "{}")
+    order_id = str(oid).replace("FL-", "", 1)
+    item_ids = fl_order_item_ids(order_id)
+    datos = obtener_datos_dte_odoo(move_id)
+    pdf = obtener_pdf_dte_odoo(move_id)
+    inv_type = fl_invoice_type(venta.get("tipo_sugerido") or "Boleta")
+    resp = subir_comprobante_fl(item_ids, pdf, datos["numero"], datos["fecha"], inv_type, oid)
+    logger.info(f"[{oid}] Documento tributario subido a Falabella "
+                f"(items {item_ids}, folio {datos['numero']}, {inv_type}, {len(pdf)} bytes): {resp}")
+    return resp
 
 
 def fl_get_orders_recent(created_after: str = None, limit: int = 100) -> list:
-    """GetOrders listado de ordenes recientes para reconciliacion."""
+    """GetOrders listado de ordenes recientes para reconciliacion.
+    Ventana por defecto amplia (FL_RECON_DAYS, 10 dias) porque una orden se crea dias antes
+    de estar lista para facturar."""
     if not created_after:
         from datetime import timedelta
-        created_after = (datetime.utcnow() - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        days = int(os.getenv("FL_RECON_DAYS", "10"))
+        created_after = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     data = fl_get("GetOrders", {
         "CreatedAfter": created_after,
         "Limit": str(limit),
         "SortBy": "created_at",
         "SortDirection": "DESC",
     })
-    try:
-        orders = data["SuccessResponse"]["Body"]["Orders"]["Order"]
-        if isinstance(orders, dict):
-            orders = [orders]
-        return orders
-    except (KeyError, TypeError):
-        return []
+    return _fl_extract_list(data, "Orders", "Order")
 
 
 def fl_parse_extra_billing(extra_str: str) -> dict:
@@ -3513,6 +3734,7 @@ def process_fl_order(order_id: str, order_data: dict = None):
         fake_order = {
             "id":          oid_str,
             "status":      status_val,
+            "order_number": str(order.get("OrderNumber") or "").strip(),
             "order_items": order_items,
             "buyer": {
                 "email":      email,
@@ -3755,8 +3977,8 @@ UI_HTML = """<!doctype html>
     <div style="display:grid;grid-template-columns:auto auto auto auto;gap:8px 20px;align-items:center">
       <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Canal</span>
       <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Marcar pagada (Odoo)</span>
-      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Enviar email (WooCommerce)</span>
-      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Adjuntar comprobante en ML</span>
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Enviar email al cliente</span>
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Cargar documento tributario</span>
 
       <span style="font-size:13px">&#x1F6CD; Mercado Libre</span>
       <select id="peMLpagar" onchange="guardarPostEmision('mercadolibre')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
@@ -3770,10 +3992,10 @@ UI_HTML = """<!doctype html>
 
       <span style="font-size:13px">&#x1F7E1; Falabella</span>
       <select id="peFLpagar" onchange="guardarPostEmision('falabella')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
-      <span style="font-size:11px;color:#64748b">No aplica</span>
-      <span style="font-size:11px;color:#64748b">No aplica</span>
+      <select id="peFLemail" onchange="guardarPostEmision('falabella')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+      <select id="peFLadjuntar" onchange="guardarPostEmision('falabella')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
     </div>
-    <div style="font-size:11px;color:var(--muted);margin-top:8px">"Marcar pagada" registra el pago en Odoo por el diario de banco (queda PAGADA). "Enviar email" (solo WooCommerce) manda el comprobante por el correo de Odoo. "Adjuntar en ML" sube el PDF del DTE al pack de Mercado Libre (packs/fiscal_documents; no aplica a env&iacute;os Full).</div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px">"Marcar pagada" registra el pago en Odoo por el diario de banco (queda PAGADA). "Enviar email" manda el comprobante al cliente por el correo interno de Odoo (WooCommerce y Falabella). "Cargar documento tributario" sube el PDF del DTE al marketplace: en ML al pack (packs/fiscal_documents, no aplica a env&iacute;os Full); en Falabella v&iacute;a SetInvoicePDF (solo &oacute;rdenes en ready_to_ship o posterior; no aplica a env&iacute;os por Falabella/FBF).</div>
   </div>
   <div class="toolbar">
     <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="resetYRender()">
@@ -3803,7 +4025,8 @@ UI_HTML = """<!doctype html>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
     <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 200 ordenes en ML">&#128279; Reconciliar ML</button>
     <button class="secondary" onclick="reconciliarWC()" title="Consulta las ultimas 100 ordenes en WooCommerce">&#128666; Reconciliar WC</button>
-    <button class="secondary" onclick="reconciliarFL()" title="Consulta las ultimas 100 ordenes en Falabella">&#127873; Reconciliar FL</button>
+    <button class="secondary" onclick="reconciliarFL()" title="Consulta las ordenes recientes en Falabella (te pregunta cuantos dias) e ingresa las que falten">&#127873; Reconciliar FL</button>
+    <button class="secondary" onclick="ingresarFL()" title="Ingresa una orden de Falabella por su OrderId (para pruebas)">&#128229; Ingresar orden FL</button>
     <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio en ventas ML">&#128666; Actualizar envios</button>
     <button class="warn" onclick="recalcularWCTodos()" title="Corrige montos (IVA + envio) de ventas WooCommerce pendientes">&#128260; Recalcular WC</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
@@ -4188,7 +4411,7 @@ function filteredVentas() {
   return ventas.filter(function(v) {
     var okS = !s || v.estado === s;
     var okF = !f || (v.fuente || 'mercadolibre') === f;
-    var campos = [v.id, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase();
+    var campos = [v.id, v.order_number, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase();
     var okQ = !q || campos.indexOf(q) >= 0;
     var okT = !turnoActivo || getTurnoKey(v.creado_en) === turnoActivo;
     return okS && okQ && okT && okF;
@@ -4219,9 +4442,13 @@ function rowHtml(v) {
   if ((v.fuente || 'mercadolibre') === 'mercadolibre' && (v.estado === 'pendiente' || v.estado === 'enviado')) {
     acciones += '<button data-action="adjuntarml" data-id="' + esc(id) + '" title="Emite (si falta) y sube el PDF del comprobante a Mercado Libre" style="background:#0ea5e9;color:#fff;border:none;border-radius:8px;padding:9px 12px;font-weight:600;cursor:pointer">Cargar PDF a ML</button>';
   }
+  if (v.fuente === 'falabella' && (v.estado === 'pendiente' || v.estado === 'enviado')) {
+    acciones += '<button data-action="adjuntarfl" data-id="' + esc(id) + '" title="Emite (si falta) y sube el PDF del documento tributario a Falabella" style="background:#16a34a;color:#fff;border:none;border-radius:8px;padding:9px 12px;font-weight:600;cursor:pointer">Cargar PDF a FL</button>';
+  }
   return '<tr id="row-' + esc(id) + '">' +
     '<td><input type="checkbox" class="cb-row" data-id="' + esc(id) + '" onchange="onCheckboxChange()"></td>' +
     '<td>' + safe(fecha) + '<div class="small">' + safe(id) + '</div>' +
+      (v.order_number ? '<div class="small" style="color:#fbbf24">N&deg; ' + safe(v.order_number) + '</div>' : '') +
       '<div class="small"><a href="#" class="link" data-action="copy" data-id="' + esc(id) + '">Copiar ID</a></div></td>' +
     '<td><strong>' + safe(v.cliente) + '</strong>' +
       '<div class="small">' + safe(v.email) + '</div>' +
@@ -4304,6 +4531,7 @@ function renderTable() {
       else if (action === 'anular') anular(id);
       else if (action === 'notacredito') abrirNC(id);
       else if (action === 'adjuntarml') adjuntarMlManual(id);
+      else if (action === 'adjuntarfl') adjuntarFlManual(id);
       else if (action === 'verpack') verPack(id, el.dataset.pack);
       else if (action === 'copy') { try { navigator.clipboard.writeText(id); } catch(e2) {} }
     });
@@ -4521,6 +4749,20 @@ function adjuntarMlManual(id) {
     .catch(function(e){ alert('Error: ' + e.message); });
 }
 
+function adjuntarFlManual(id) {
+  if (!confirm('Test para la venta ' + id + ':\\nSi no esta emitida, se EMITE la boleta/factura en Odoo y luego se sube el PDF a Falabella (SetInvoicePDF). Continuar?')) return;
+  fetch('/ventas/' + id + '/adjuntar-fl', {method: 'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (d.ok) {
+        var extra = d.emitido_ahora ? '(se emitio ahora, move_id ' + d.move_id + ')\\n' : '';
+        alert('OK. ' + extra + 'Respuesta de Falabella:\\n' + JSON.stringify(d.respuesta || d));
+        refreshData();
+      } else { alert('Error: ' + (d.detail || 'desconocido')); }
+    })
+    .catch(function(e){ alert('Error: ' + e.message); });
+}
+
 function recalcularWC(id) {
   if (!confirm('Recalcular la venta ' + id + ' desde WooCommerce? Corrige montos (IVA + envio).')) return;
   fetch('/ventas/' + id + '/recalcular-wc', {method:'POST'})
@@ -4541,7 +4783,7 @@ var CFG_IDS = {
 var PE_IDS = {
   mercadolibre: {pagar: 'peMLpagar', adjuntar_ml: 'peMLadjuntar'},
   woocommerce:  {pagar: 'peWCpagar', email: 'peWCemail'},
-  falabella:    {pagar: 'peFLpagar'}
+  falabella:    {pagar: 'peFLpagar', email: 'peFLemail', adjuntar_fl: 'peFLadjuntar'}
 };
 
 function guardarPostEmision(fuente) {
@@ -4551,6 +4793,7 @@ function guardarPostEmision(fuente) {
   if (ids.pagar) body.pagar = document.getElementById(ids.pagar).value;
   if (ids.email) body.email = document.getElementById(ids.email).value;
   if (ids.adjuntar_ml) body.adjuntar_ml = document.getElementById(ids.adjuntar_ml).value;
+  if (ids.adjuntar_fl) body.adjuntar_fl = document.getElementById(ids.adjuntar_fl).value;
   var est = document.getElementById('cfgPostEstado');
   if (est) { est.textContent = 'Guardando...'; est.style.color = '#94a3b8'; }
   fetch('/config/post-emision', {
@@ -4560,7 +4803,7 @@ function guardarPostEmision(fuente) {
   }).then(function(r){ return r.json(); })
     .then(function(d) {
       if (est) {
-        if (d.ok) { est.textContent = 'Guardado \\u2713 ' + fuente + ': pagar ' + d.pagar + (d.email !== undefined ? ' / email ' + d.email : '') + (d.adjuntar_ml !== undefined ? ' / adjuntar ' + d.adjuntar_ml : ''); est.style.color = '#4ade80'; }
+        if (d.ok) { est.textContent = 'Guardado \\u2713 ' + fuente + ': pagar ' + d.pagar + (d.email !== undefined ? ' / email ' + d.email : '') + (d.adjuntar_ml !== undefined ? ' / adjuntar ' + d.adjuntar_ml : '') + (d.adjuntar_fl !== undefined ? ' / adjuntar ' + d.adjuntar_fl : ''); est.style.color = '#4ade80'; }
         else { est.textContent = 'Error: ' + (d.detail || 'desconocido'); est.style.color = '#f87171'; }
       }
     })
@@ -4617,6 +4860,7 @@ function cargarAutoEmision() {
         if (ids.pagar && c.pagar) document.getElementById(ids.pagar).value = c.pagar;
         if (ids.email && c.email) { var _e = document.getElementById(ids.email); if (_e) _e.value = c.email; }
         if (ids.adjuntar_ml && c.adjuntar_ml) { var _a = document.getElementById(ids.adjuntar_ml); if (_a) _a.value = c.adjuntar_ml; }
+        if (ids.adjuntar_fl && c.adjuntar_fl) { var _f = document.getElementById(ids.adjuntar_fl); if (_f) _f.value = c.adjuntar_fl; }
       });
       var est = document.getElementById('cfgEstado');
       if (est) est.textContent = '';
@@ -4796,19 +5040,45 @@ function reconciliarWC() {
 }
 
 function reconciliarFL() {
+  var dias = prompt('Reconciliar Falabella: cuantos dias hacia atras buscar ordenes?\\n(vacio = ventana por defecto)', '30');
+  if (dias === null) return;
+  var url = '/fl/reconciliar?limit=100';
+  dias = (dias || '').trim();
+  if (dias) url += '&days=' + encodeURIComponent(dias);
   var btn = document.querySelector('[onclick="reconciliarFL()"]');
   if (btn) { btn.disabled = true; btn.textContent = 'Consultando FL...'; }
-  fetch('/fl/reconciliar', {method:'POST'})
+  fetch(url, {method:'POST'})
     .then(function(r){ return r.json(); })
     .then(function(data) {
       if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar FL'; }
       if (data.ok) {
         var msg = 'FL: ' + data.total_fl + ' | BD: ' + data.en_bd + ' | Faltantes: ' + data.faltantes;
         if (data.faltantes > 0) { msg += ' - ' + data.mensaje; setTimeout(refreshData, 8000); setTimeout(refreshData, 20000); }
+        else { msg += '\\n(No hay ordenes nuevas en esa ventana. Prueba mas dias, o usa "Ingresar orden FL" con un OrderId.)'; }
         alert(msg);
       } else { alert('Error: ' + (data.detail || 'desconocido')); }
     })
     .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar FL'; } alert('Error: ' + e.message); });
+}
+
+function ingresarFL() {
+  var oid = prompt('Ingresar una orden de Falabella por su ID (OrderId numerico de Seller Center):');
+  if (oid === null) return;
+  oid = (oid || '').trim().replace(/^FL-/, '');
+  if (!oid) { alert('Debes indicar el OrderId'); return; }
+  var btn = document.querySelector('[onclick="ingresarFL()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Ingresando...'; }
+  fetch('/fl/ingresar/' + encodeURIComponent(oid), {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Ingresar orden FL'; }
+      if (data.ok) {
+        alert('Orden ' + (data.id || ('FL-' + oid)) + ' procesada.\\nCliente: ' + (data.cliente || '-') + ' | Estado: ' + (data.estado || data.message || '-'));
+        setFuente('falabella');
+        refreshData();
+      } else { alert('Error: ' + (data.detail || 'desconocido')); }
+    })
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Ingresar orden FL'; } alert('Error: ' + e.message); });
 }
 
 function reprocesarTodo() {
