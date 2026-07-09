@@ -460,6 +460,18 @@ def extract_name(billing_info: dict, order: dict) -> str:
             val = item.get("value")
             if isinstance(val, str) and val.strip():
                 return val.strip()
+    # Nombre del RECIBO (persona/boleta): ML lo entrega en additional_info FIRST_NAME + LAST_NAME.
+    # Es el "dato para su recibo de cobro" que ingreso el comprador, y puede diferir del nombre
+    # de la cuenta. Debe primar por sobre el nombre de la cuenta.
+    ai_fields = {}
+    for item in billing_info.get("additional_info") or []:
+        t = (item.get("type") or "").upper()
+        v = item.get("value")
+        if isinstance(v, str) and v.strip():
+            ai_fields[t] = v.strip()
+    recibo_nombre = " ".join(x for x in [ai_fields.get("FIRST_NAME", ""), ai_fields.get("LAST_NAME", "")] if x).strip()
+    if recibo_nombre:
+        return recibo_nombre
     name = (billing_info.get("name") or "").strip()
     last_name = (billing_info.get("last_name") or "").strip()
     if name and last_name:
