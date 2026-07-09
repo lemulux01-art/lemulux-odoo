@@ -2587,7 +2587,7 @@ def debug_shipping(oid: str):
 
 
 @app.get("/ml/debug-split/{ident}")
-def ml_debug_split(ident: str):
+def ml_debug_split(ident: str, extra: str = None):
     """Diagnostico de una venta dividida en ML. Acepta un order_id, un pack_id o el id de la
     venta en nuestra BD. Resuelve por BD -> orden -> pack y muestra las ordenes del pack con el
     estado de cada envio (status/substatus/sibling_id). Solo lectura."""
@@ -2665,15 +2665,21 @@ def ml_debug_split(ident: str):
                 debug["resuelto_por"] = f"pack:{pid}"
             break
 
-    ordenes_pack = []
-    if pack:
-        for o in (pack.get("orders") or []):
+    def explorar_pack(pid):
+        """Resumen de un pack: estado, family/trash y sus ordenes con envio."""
+        p = pack_safe(pid)
+        if not p or p.get("error"):
+            return {"pack_id": str(pid), "error": (p or {}).get("error", "no encontrado")}
+        ords = []
+        for o in (p.get("orders") or []):
             oid_p = str(o.get("id") or "")
             od = order_safe(oid_p)
             sid = (od.get("shipping") or {}).get("id")
             shp = shipment_new(sid)
             v_bd = get_venta(oid_p)
-            ordenes_pack.append({
+            # Tambien buscar la venta en BD por el pack (asi vemos como la tenemos guardada)
+            v_bd_pack = get_venta(str(pid))
+            ords.append({
                 "order_id": oid_p,
                 "status": od.get("status"),
                 "shipping_id": sid,
@@ -2681,20 +2687,42 @@ def ml_debug_split(ident: str):
                 "shipment_substatus": shp.get("substatus"),
                 "sibling_id": shp.get("sibling_id"),
                 "items_qty": sum(float(it.get("quantity") or 0) for it in (od.get("order_items") or [])),
-                "en_bd": bool(v_bd),
-                "estado_bd": (v_bd or {}).get("estado"),
-                "move_id_bd": (v_bd or {}).get("move_id"),
+                "en_bd_por_order": bool(v_bd),
+                "en_bd_por_pack": bool(v_bd_pack),
+                "estado_bd": (v_bd or v_bd_pack or {}).get("estado"),
+                "move_id_bd": (v_bd or v_bd_pack or {}).get("move_id"),
             })
+        return {
+            "pack_id": str(pid),
+            "status": p.get("status"),
+            "family_pack_id": p.get("family_pack_id"),
+            "trash_pack_id": p.get("trash_pack_id"),
+            "shipment_id": p.get("shipment_id"),
+            "ordenes": ords,
+        }
+
+    # 5) Explorar la FAMILIA: el pack original + family_pack_id + trash + extras (?extra=id1,id2)
+    fam_id = pack.get("family_pack_id") if isinstance(pack, dict) else None
+    trash_id = pack.get("trash_pack_id") if isinstance(pack, dict) else None
+    extras = [e.strip() for e in (extra or "").split(",") if e.strip()]
+    ids_familia, vistos = [], set()
+    for pid in [pack_id_ok, fam_id, trash_id] + extras:
+        if pid and str(pid) not in vistos:
+            vistos.add(str(pid))
+            ids_familia.append(pid)
+    familia = [explorar_pack(pid) for pid in ids_familia]
 
     return {
         "ok": True,
         "debug": debug,
         "pack_id_resuelto": pack_id_ok,
+        "family_pack_id": fam_id,
+        "trash_pack_id": trash_id,
         "pack_raw_keys": list(pack.keys()) if isinstance(pack, dict) else None,
         "pack_status": pack.get("status") if isinstance(pack, dict) else None,
-        "pack_shipment_id": pack.get("shipment_id") if isinstance(pack, dict) else None,
-        "ordenes_del_pack": ordenes_pack,
-        "nota": "Si 'ordenes_del_pack' lista 2+ ordenes bajo el mismo pack, la factura va por pack (UNA sola).",
+        "familia": familia,
+        "nota": ("Se explora el pack original + family_pack_id + trash + los ids que pases en ?extra=. "
+                 "Si las hijas no aparecen, corre de nuevo agregando ?extra=2000013934540451,2000013934540453"),
     }
 
 
