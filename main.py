@@ -1105,10 +1105,14 @@ def upsert_partner(ctx, order_id, nombre, rut, email, giro, direccion, es_empres
     giro_a_usar = giro.strip()
     if tipo == "Boleta" and not giro_a_usar:
         giro_a_usar = DEFAULT_BOLETA_ACTIVITY
-    vals = {"name": nombre, "email": email, "comment": f"ML_ORDER:{order_id}"}
+    vals = {"name": nombre, "comment": f"ML_ORDER:{order_id}"}
+    # Solo grabar email si hay uno real; si viene vacio se deja el partner sin correo
+    # (no queremos escribir boleta@lemulux.com, que recibimos nosotros).
+    if email:
+        vals["email"] = email
     if rut:
         vals["vat"] = rut_con_guion(rut)
-    if "l10n_cl_dte_email" in partner_fields:
+    if email and "l10n_cl_dte_email" in partner_fields:
         vals["l10n_cl_dte_email"] = email
     if direccion and "street" in partner_fields:
         vals["street"] = direccion
@@ -1185,7 +1189,11 @@ def create_document(order, billing_raw, tipo, email, giro,
     direccion = (direccion_override or extract_direccion(order, billing_info, billing_raw) or "").strip()
     ciudad = (ciudad_override or extract_ciudad_from_billing(billing_info) or "").strip()
     region = (region_override or extract_region_from_billing(billing_info) or "").strip()
-    email = (email or ML_DEFAULT_EMAIL).strip()
+    email = (email or "").strip()
+    # Default de correo SOLO para ML/WC/manual. En Falabella, sin email real se deja VACIO
+    # (boleta@lemulux.com lo recibimos nosotros; no queremos auto-enviarnoslo).
+    if not email and not order_id.startswith("FL-"):
+        email = ML_DEFAULT_EMAIL
     giro = (giro or "").strip()
     telefono = extract_telefono(order, billing_info)
     es_empresa = tipo == "Factura"
@@ -1300,8 +1308,23 @@ def registrar_pago_odoo(move_id: int):
 
 def enviar_comprobante_email(move_id: int):
     """Envia el comprobante (con su PDF) al cliente por el correo interno de Odoo.
-    Usa la plantilla estandar de factura si existe; si no, la primera de account.move."""
+    Usa la plantilla estandar de factura si existe; si no, la primera de account.move.
+    Si el cliente NO tiene email, NO envia (evita auto-enviarnos boleta@lemulux.com)."""
     ctx = odoo_connect()
+    # Verificar que el partner del documento tenga email real antes de enviar.
+    try:
+        mv = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["partner_id"]})
+        partner_id = mv[0]["partner_id"][0] if mv and mv[0].get("partner_id") else None
+        correo = ""
+        if partner_id:
+            pr = odoo_exec(ctx, "res.partner", "read", [[partner_id]], {"fields": ["email"]})
+            correo = (pr[0].get("email") or "").strip() if pr else ""
+        if not correo or correo.lower() == ML_DEFAULT_EMAIL.lower():
+            logger.info(f"[email] move_id={move_id} sin email real del cliente -> no se envia")
+            return
+    except Exception as e:
+        logger.warning(f"[email] no se pudo verificar email del cliente (move_id={move_id}): {e}")
+        return
     tmpl_id = None
     try:
         ref = odoo_exec(ctx, "ir.model.data", "check_object_reference",
@@ -1467,7 +1490,7 @@ def emitir_venta(oid: str) -> tuple:
     move_id, partner_id = create_document(
         order=order, billing_raw=billing,
         tipo=venta.get("tipo_sugerido") or "Boleta",
-        email=venta.get("email") or ML_DEFAULT_EMAIL,
+        email=venta.get("email") or "",  # create_document aplica default solo si NO es Falabella
         giro=venta.get("giro") or "",
         cliente_override=venta.get("cliente"),
         rut_override=venta.get("rut"),
@@ -3677,10 +3700,12 @@ def _es_email_valido(s: str) -> bool:
 
 
 def fl_extract_email(tipo: str, billing: dict, order: dict) -> str:
-    """Email del cliente. Debe ser SIEMPRE el del comprador (boleta o factura); el default
-    boleta@lemulux.com es solo ultimo recurso cuando Falabella no entrega ninguno.
-    Busca en: billing (ReceiverEmail/Email), nivel orden (CustomerEmail/Email) y ambas
-    direcciones; si nada, escanea la orden por un email valido que no sea el default."""
+    """Email del comprador (boleta o factura). Busca en billing (ReceiverEmail/Email),
+    nivel orden (CustomerEmail/Email) y ambas direcciones; si nada, escanea la orden por un
+    email valido que no sea el default.
+    IMPORTANTE: si Falabella NO entrega email real, devuelve "" (vacio). NO se usa
+    boleta@lemulux.com porque ese buzon lo recibimos nosotros: preferimos dejar el cliente
+    sin correo en Odoo antes que auto-enviarnoslo."""
     billing = billing or {}
     order = order or {}
     addr_b = order.get("AddressBilling") if isinstance(order.get("AddressBilling"), dict) else {}
@@ -3701,7 +3726,7 @@ def fl_extract_email(tipo: str, billing: dict, order: dict) -> str:
         for token in s.replace(",", " ").replace(";", " ").split():
             if _es_email_valido(token) and token.split("@")[-1].lower() != default_dom:
                 return token.strip()
-    return FL_DEFAULT_EMAIL
+    return ""  # sin email real -> vacio (no usar el default que recibimos nosotros)
 
 
 def fl_extract_direccion(tipo: str, billing: dict, order: dict) -> str:
@@ -3805,6 +3830,57 @@ def fl_build_order_items(items: list, order: dict) -> list:
     return list(grouped.values())
 
 
+def _fl_estados_reversion() -> set:
+    """Estados de item Falabella que implican reversar el documento (NC).
+    canceled/returned siempre; failed opcional via FL_NC_INCLUYE_FAILED."""
+    rev = {"canceled", "cancelled", "returned"}
+    if os.getenv("FL_NC_INCLUYE_FAILED", "").strip().lower() in ("1", "true", "on", "si", "yes"):
+        rev = rev | {"failed"}
+    return rev
+
+
+def fl_detectar_reversion_total(order_id: str) -> Optional[str]:
+    """Consulta los items de la orden y devuelve 'returned'/'canceled' SOLO si TODOS los items
+    estan en un estado de reversion (devolucion/cancelacion total). Devuelve None si es parcial,
+    mixto o no se pudo determinar (los parciales se registran para NC manual)."""
+    try:
+        items = fl_get_order_items(order_id)
+    except Exception as e:
+        logger.warning(f"[FL:{order_id}] no se pudo verificar reversion: {e}")
+        return None
+    if not items:
+        return None
+    rev = _fl_estados_reversion()
+    estados = [str(it.get("Status") or "").strip().lower().replace(" ", "_") for it in items]
+    if estados and all(e in rev for e in estados):
+        return "returned" if "returned" in estados else "canceled"
+    if any(e in rev for e in estados):
+        logger.warning(f"[FL:{order_id}] Reversion PARCIAL (items: {estados}); requiere NC manual")
+    return None
+
+
+def auto_nota_credito_si_reversion_fl(venta: dict, tipo_rev: str):
+    """Falabella: si la orden fue cancelada o devuelta TOTALMENTE y ya tenia documento emitido,
+    crea la NC sola. Idempotente (no repite si la venta ya esta en 'nota_credito'). Nunca
+    propaga la excepcion: si falla, la venta sigue igual y se registra en el log."""
+    if not tipo_rev:
+        return
+    if not venta or not venta.get("move_id"):
+        return
+    if venta.get("estado") == "nota_credito":
+        return  # ya tiene NC
+    if venta.get("estado") != "enviado":
+        return  # sin DTE emitido no hay nada que reversar
+    motivo = ("Anulacion automatica Falabella (devolucion del comprador)"
+              if tipo_rev == "returned" else
+              "Anulacion automatica Falabella (orden cancelada)")
+    try:
+        nc_id = _crear_nota_credito(venta, motivo)
+        logger.info(f"[{venta.get('id')}] NC automatica Falabella ({tipo_rev}): nc_move_id={nc_id}")
+    except Exception as e:
+        logger.error(f"[{venta.get('id')}] Error en NC automatica Falabella: {e}", exc_info=True)
+
+
 def process_fl_order(order_id: str, order_data: dict = None):
     """Procesa una orden Falabella y la guarda en tabla ventas.
     Si order_data se provee (desde GetOrders), se usa directamente sin llamar GetOrder.
@@ -3842,6 +3918,11 @@ def process_fl_order(order_id: str, order_data: dict = None):
         if existing:
             update_venta(oid_str, estado_envio=status_val)
             logger.info(f"[FL:{order_id}] Estado actualizado: {status_val}")
+            # Si la orden cambio a cancelada/devuelta y ya tenia DTE emitido, crear NC sola.
+            if status_val in _fl_estados_reversion() and existing.get("estado") == "enviado" \
+               and existing.get("move_id") and existing.get("estado") != "nota_credito":
+                tipo_rev = fl_detectar_reversion_total(order_id)
+                auto_nota_credito_si_reversion_fl(existing, tipo_rev)
             return
 
         if status_val not in FL_ESTADOS_VALIDOS:
@@ -3919,7 +4000,7 @@ def process_fl_order(order_id: str, order_data: dict = None):
                         oid_str, None,
                         (nombre or "Cliente FL").strip(),
                         normalize_rut(rut) if rut else "",
-                        (email or FL_DEFAULT_EMAIL).strip(),
+                        (email or "").strip(),  # sin email real -> vacio, nunca el default
                         (giro or "").strip(),
                         (direccion or "").strip(),
                         (ciudad or "").strip(),
@@ -3961,7 +4042,11 @@ def fl_reingesta_datos(oid: str) -> dict:
     rut       = fl_extract_rut(order, tipo, billing) or venta.get("rut") or ""
     nombre    = fl_extract_nombre(order, tipo, billing) or venta.get("cliente") or "Cliente FL"
     giro      = fl_extract_giro(tipo, billing) or venta.get("giro") or ""
-    email     = fl_extract_email(tipo, billing, order) or venta.get("email") or FL_DEFAULT_EMAIL
+    _email_ext  = fl_extract_email(tipo, billing, order)
+    _email_prev = (venta.get("email") or "").strip()
+    if _email_prev.lower() in (FL_DEFAULT_EMAIL.lower(), ML_DEFAULT_EMAIL.lower()):
+        _email_prev = ""  # descartar defaults guardados antes
+    email     = _email_ext or _email_prev  # puede quedar "" (sin email real)
     direccion = fl_extract_direccion(tipo, billing, order) or venta.get("direccion") or ""
     ciudad    = fl_extract_ciudad(tipo, billing, order) or venta.get("ciudad") or ""
     region    = fl_extract_region(tipo, billing, order) or venta.get("region") or ""
@@ -3997,7 +4082,7 @@ def fl_reingesta_datos(oid: str) -> dict:
         oid,
         cliente=(nombre or "Cliente FL").strip(),
         rut=normalize_rut(rut) if rut else "",
-        email=(email or FL_DEFAULT_EMAIL).strip(),
+        email=(email or "").strip(),  # vacio si no hay email real del cliente
         giro=(giro or "").strip(),
         direccion=(direccion or "").strip(),
         ciudad=(ciudad or "").strip(),
