@@ -772,6 +772,38 @@ def extract_shipping_cost(order: dict) -> float:
     return envio if envio > 0 else 0.0
 
 
+def extract_telefono(order: dict, billing_info: dict = None) -> str:
+    """Telefono del cliente para grabar en el partner de Odoo. Busca (en orden):
+    order.telefono/phone (FL fake_order / manual), buyer.phone (ML puede traer dict
+    {area_code, number}), y billing_info (additional_info tipo PHONE, o claves phone/telefono)."""
+    billing_info = billing_info or {}
+    for key in ("telefono", "phone"):
+        v = str(order.get(key) or "").strip()
+        if v:
+            return v
+    bp = safe_get(order, "buyer", "phone", default=None)
+    if isinstance(bp, dict):
+        num = str(bp.get("number") or "").strip()
+        area = str(bp.get("area_code") or "").strip()
+        if num:
+            return (area + num).strip()
+    elif bp:
+        v = str(bp).strip()
+        if v:
+            return v
+    for item in billing_info.get("additional_info") or []:
+        k = str(item.get("type") or item.get("id") or "").lower()
+        if "phone" in k or "telefono" in k:
+            v = str(item.get("value") or "").strip()
+            if v:
+                return v
+    for key in ("phone", "telephone", "telefono"):
+        v = str(billing_info.get(key) or "").strip()
+        if v:
+            return v
+    return ""
+
+
 def summarize_order_items(order: dict) -> tuple:
     items_summary = []
     item_count = 0
@@ -1061,7 +1093,7 @@ def get_state_id(ctx: OdooCtx, region_name: str) -> Optional[int]:
     return ids[0] if ids else None
 
 
-def upsert_partner(ctx, order_id, nombre, rut, email, giro, direccion, es_empresa, tipo, ciudad="", region="") -> int:
+def upsert_partner(ctx, order_id, nombre, rut, email, giro, direccion, es_empresa, tipo, ciudad="", region="", telefono="") -> int:
     partner_fields = get_partner_fields(ctx)
     activity_field = get_activity_field_name(ctx)
     chile_id = get_chile_country_id(ctx)
@@ -1082,6 +1114,13 @@ def upsert_partner(ctx, order_id, nombre, rut, email, giro, direccion, es_empres
         vals["street"] = direccion
     if ciudad and "city" in partner_fields:
         vals["city"] = ciudad
+    if telefono:
+        tel = str(telefono).strip()
+        if "phone" in partner_fields:
+            vals["phone"] = tel
+        # Numeros moviles chilenos (9 xxxx xxxx) tambien al campo Movil si existe.
+        if "mobile" in partner_fields and re.sub(r"\D", "", tel).lstrip("56").startswith("9"):
+            vals["mobile"] = tel
     if region and "state_id" in partner_fields:
         state_id = get_state_id(ctx, region)
         if state_id:
@@ -1148,6 +1187,7 @@ def create_document(order, billing_raw, tipo, email, giro,
     region = (region_override or extract_region_from_billing(billing_info) or "").strip()
     email = (email or ML_DEFAULT_EMAIL).strip()
     giro = (giro or "").strip()
+    telefono = extract_telefono(order, billing_info)
     es_empresa = tipo == "Factura"
     if tipo == "Factura" and (not nombre or not rut or not direccion or not giro):
         raise Exception("Para Factura se requiere razon social, RUT, direccion y giro")
@@ -1155,7 +1195,8 @@ def create_document(order, billing_raw, tipo, email, giro,
         giro = DEFAULT_BOLETA_ACTIVITY
     partner_id = upsert_partner(ctx=ctx, order_id=order_id, nombre=nombre, rut=rut,
                                 email=email, giro=giro, direccion=direccion,
-                                es_empresa=es_empresa, tipo=tipo, ciudad=ciudad, region=region)
+                                es_empresa=es_empresa, tipo=tipo, ciudad=ciudad, region=region,
+                                telefono=telefono)
     journal_id = get_journal(ctx, tipo)
     if not journal_id:
         raise Exception(f"No se encontro diario Odoo para {tipo}")
@@ -3243,6 +3284,41 @@ def fl_ingresar_manual(order_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/fl/reprocesar-datos/{order_id}")
+def fl_reprocesar_datos_una(order_id: str):
+    """Reprocesa 1 venta Falabella: actualiza envio + telefono desde la orden real."""
+    oid = f"FL-{order_id}" if not str(order_id).startswith("FL-") else str(order_id)
+    try:
+        res = fl_reingesta_datos(oid)
+        return {"ok": True, **res}
+    except Exception as e:
+        logger.error(f"[{oid}] reprocesar-datos fallo: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/fl/reprocesar-datos")
+def fl_reprocesar_datos_todos():
+    """Reprocesa TODAS las ventas Falabella existentes: reconsulta cada orden y actualiza
+    envio + telefono (y el telefono del partner en Odoo si ya existe). No modifica DTEs ya
+    emitidos, pero deja las pendientes listas para emitir con envio + telefono correctos."""
+    ventas_fl = [v for v in list_ventas(None) if (v.get("fuente") == "falabella")]
+    ids = [v["id"] for v in ventas_fl]
+    def _run():
+        ok = err = 0
+        for oid in ids:
+            try:
+                fl_reingesta_datos(oid)
+                ok += 1
+            except Exception as e:
+                err += 1
+                logger.error(f"[{oid}] reprocesar-datos (masivo) fallo: {e}")
+            time.sleep(1)
+        logger.info(f"[FL] reprocesar-datos masivo completado: ok={ok} err={err} total={len(ids)}")
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "total": len(ids),
+            "mensaje": f"Reprocesando {len(ids)} ventas Falabella en background (envio + telefono)."}
+
+
 @app.get("/fl/debug/{order_id}")
 def fl_debug_order(order_id: str):
     """Muestra los datos crudos de una orden Falabella para diagnostico."""
@@ -3595,17 +3671,36 @@ def fl_extract_giro(tipo: str, billing: dict) -> str:
     return DEFAULT_BOLETA_ACTIVITY
 
 
+def _es_email_valido(s: str) -> bool:
+    s = str(s or "").strip()
+    return "@" in s and "." in s.split("@")[-1] and " " not in s
+
+
 def fl_extract_email(tipo: str, billing: dict, order: dict) -> str:
-    if tipo == "Factura":
-        email = str(billing.get("ReceiverEmail") or "").strip()
-        if email:
-            return email
-    # Fallback: AddressBilling puede tener email en algunos casos
-    addr = order.get("AddressBilling") or {}
-    if isinstance(addr, dict):
-        email = str(addr.get("Email") or "").strip()
-        if email:
-            return email
+    """Email del cliente. Debe ser SIEMPRE el del comprador (boleta o factura); el default
+    boleta@lemulux.com es solo ultimo recurso cuando Falabella no entrega ninguno.
+    Busca en: billing (ReceiverEmail/Email), nivel orden (CustomerEmail/Email) y ambas
+    direcciones; si nada, escanea la orden por un email valido que no sea el default."""
+    billing = billing or {}
+    order = order or {}
+    addr_b = order.get("AddressBilling") if isinstance(order.get("AddressBilling"), dict) else {}
+    addr_s = order.get("AddressShipping") if isinstance(order.get("AddressShipping"), dict) else {}
+    candidatos = [
+        billing.get("ReceiverEmail"), billing.get("Email"), billing.get("CustomerEmail"),
+        order.get("CustomerEmail"), order.get("Email"), order.get("BuyerEmail"),
+        addr_b.get("Email"), addr_b.get("CustomerEmail"),
+        addr_s.get("Email"), addr_s.get("CustomerEmail"),
+    ]
+    for c in candidatos:
+        c = str(c or "").strip()
+        if _es_email_valido(c):
+            return c
+    # Ultimo recurso: escanear la orden completa por un email valido distinto del default.
+    default_dom = FL_DEFAULT_EMAIL.split("@")[-1].lower()
+    for s in flatten_strings(order):
+        for token in s.replace(",", " ").replace(";", " ").split():
+            if _es_email_valido(token) and token.split("@")[-1].lower() != default_dom:
+                return token.strip()
     return FL_DEFAULT_EMAIL
 
 
@@ -3646,6 +3741,52 @@ def fl_extract_region(tipo: str, billing: dict, order: dict) -> str:
         region = html_module.unescape(str(ship.get("Region") or "")).strip()
         return region
     return ""
+
+
+def fl_extract_telefono(order: dict, billing: dict) -> str:
+    """Telefono del cliente Falabella. Busca en el billing (ExtraBillingAttributes),
+    luego en AddressBilling/AddressShipping, y por ultimo a nivel orden."""
+    billing = billing or {}
+    for k in ("ReceiverPhone", "Phone", "PhoneNumber", "ReceiverPhoneNumber", "ReceiverContactNumber"):
+        v = str(billing.get(k) or "").strip()
+        if v:
+            return v
+    for addr_key in ("AddressBilling", "AddressShipping"):
+        addr = order.get(addr_key) or {}
+        if isinstance(addr, dict):
+            for k in ("Phone", "Phone2", "PhoneNumber", "MobilePhone"):
+                v = str(addr.get(k) or "").strip()
+                if v:
+                    return v
+    for k in ("CustomerPhone", "Phone", "PhoneNumber"):
+        v = str(order.get(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def fl_extract_envio(items_raw: list, order: dict) -> float:
+    """Costo de envio BRUTO que pago el comprador. En Falabella viene por item
+    (ShippingAmount); se suma para toda la orden. Fallback a nivel orden si aplica."""
+    envio = 0.0
+    for it in (items_raw or []):
+        val = it.get("ShippingAmount")
+        if val in (None, ""):
+            val = it.get("ShippingFeeAmount")
+        try:
+            envio += float(val or 0)
+        except (TypeError, ValueError):
+            pass
+    if envio <= 0:
+        for k in ("ShippingFeeTotal", "ShippingAmount"):
+            try:
+                v = float(order.get(k) or 0)
+            except (TypeError, ValueError):
+                v = 0.0
+            if v > 0:
+                envio = v
+                break
+    return round(envio, 2) if envio > 0 else 0.0
 
 
 def fl_build_order_items(items: list, order: dict) -> list:
@@ -3743,13 +3884,19 @@ def process_fl_order(order_id: str, order_data: dict = None):
         else:
             order_items = fl_build_order_items(items_raw, order)
 
+        telefono = fl_extract_telefono(order, billing)
+        envio    = fl_extract_envio(items_raw, order)
+
         fake_order = {
             "id":          oid_str,
             "status":      status_val,
             "order_number": str(order.get("OrderNumber") or "").strip(),
             "order_items": order_items,
+            "shipping_cost": envio,
+            "telefono":    telefono,
             "buyer": {
                 "email":      email,
+                "phone":      telefono,
                 "first_name": html_module.unescape(str(order.get("CustomerFirstName") or "")).strip(),
                 "last_name":  html_module.unescape(str(order.get("CustomerLastName") or "")).strip(),
             },
@@ -3792,6 +3939,95 @@ def process_fl_order(order_id: str, order_data: dict = None):
 
     except Exception as e:
         logger.error(f"[FL:{order_id}] Error procesando: {e}", exc_info=True)
+
+
+def fl_reingesta_datos(oid: str) -> dict:
+    """Reconsulta una orden Falabella y actualiza los datos guardados de la venta:
+    recalcula envio + telefono + items y los graba en order_json (y campos cliente/rut/etc).
+    - Si la venta NO esta emitida: al emitirla incluira envio + telefono.
+    - Si YA esta emitida: el DTE no se puede modificar, pero se actualiza el telefono del
+      partner en Odoo (los montos ya emitidos no se tocan)."""
+    venta = get_venta(oid)
+    if not venta:
+        raise Exception("Venta no encontrada")
+    order_id = oid.replace("FL-", "", 1)
+    order = fl_get_order(order_id)
+    if not order:
+        raise Exception("Orden no encontrada en Falabella")
+
+    extra_str = order.get("ExtraBillingAttributes") or ""
+    billing   = fl_parse_extra_billing(extra_str)
+    tipo      = venta.get("tipo_sugerido") or fl_extract_tipo(order)
+    rut       = fl_extract_rut(order, tipo, billing) or venta.get("rut") or ""
+    nombre    = fl_extract_nombre(order, tipo, billing) or venta.get("cliente") or "Cliente FL"
+    giro      = fl_extract_giro(tipo, billing) or venta.get("giro") or ""
+    email     = fl_extract_email(tipo, billing, order) or venta.get("email") or FL_DEFAULT_EMAIL
+    direccion = fl_extract_direccion(tipo, billing, order) or venta.get("direccion") or ""
+    ciudad    = fl_extract_ciudad(tipo, billing, order) or venta.get("ciudad") or ""
+    region    = fl_extract_region(tipo, billing, order) or venta.get("region") or ""
+    telefono  = fl_extract_telefono(order, billing)
+
+    items_raw = []
+    try:
+        items_raw = fl_get_order_items(order_id)
+    except Exception as e:
+        logger.warning(f"[{oid}] reingesta: no se pudo obtener items: {e}")
+    if items_raw:
+        order_items = fl_build_order_items(items_raw, order)
+    else:
+        prev = json.loads(venta.get("order_json") or "{}")
+        order_items = prev.get("order_items") or []
+    envio = fl_extract_envio(items_raw, order)
+
+    fake_order = {
+        "id":            oid,
+        "status":        venta.get("estado_envio") or "",
+        "order_number":  str(order.get("OrderNumber") or "").strip(),
+        "order_items":   order_items,
+        "shipping_cost": envio,
+        "telefono":      telefono,
+        "buyer": {
+            "email":      email,
+            "phone":      telefono,
+            "first_name": html_module.unescape(str(order.get("CustomerFirstName") or "")).strip(),
+            "last_name":  html_module.unescape(str(order.get("CustomerLastName") or "")).strip(),
+        },
+    }
+    update_venta(
+        oid,
+        cliente=(nombre or "Cliente FL").strip(),
+        rut=normalize_rut(rut) if rut else "",
+        email=(email or FL_DEFAULT_EMAIL).strip(),
+        giro=(giro or "").strip(),
+        direccion=(direccion or "").strip(),
+        ciudad=(ciudad or "").strip(),
+        region=(region or "").strip(),
+        order_json=json.dumps(fake_order, ensure_ascii=False),
+        billing_json=json.dumps(billing, ensure_ascii=False),
+    )
+
+    tel_partner = False
+    if telefono and venta.get("partner_id"):
+        try:
+            ctx = odoo_connect()
+            pf = get_partner_fields(ctx)
+            pv = {}
+            if "phone" in pf:
+                pv["phone"] = telefono
+            if "mobile" in pf and re.sub(r"\D", "", telefono).lstrip("56").startswith("9"):
+                pv["mobile"] = telefono
+            if pv:
+                odoo_exec(ctx, "res.partner", "write", [[venta["partner_id"]], pv])
+                tel_partner = True
+        except Exception as e:
+            logger.warning(f"[{oid}] reingesta: no se pudo actualizar telefono del partner: {e}")
+
+    logger.info(f"[{oid}] Reingesta FL: telefono={telefono or '-'} envio={envio} "
+                f"emitida={venta.get('estado') == 'enviado'} tel_partner={tel_partner}")
+    return {
+        "id": oid, "telefono": telefono, "envio": envio,
+        "emitida": venta.get("estado") == "enviado", "telefono_partner_actualizado": tel_partner,
+    }
 
 
 def fl_webhook_worker():
@@ -4039,6 +4275,7 @@ UI_HTML = """<!doctype html>
     <button class="secondary" onclick="reconciliarWC()" title="Consulta las ultimas 100 ordenes en WooCommerce">&#128666; Reconciliar WC</button>
     <button class="secondary" onclick="reconciliarFL()" title="Consulta las ordenes recientes en Falabella (te pregunta cuantos dias) e ingresa las que falten">&#127873; Reconciliar FL</button>
     <button class="secondary" onclick="ingresarFL()" title="Ingresa una orden de Falabella por su OrderId (para pruebas)">&#128229; Ingresar orden FL</button>
+    <button class="warn" onclick="reprocesarDatosFL()" title="Reconsulta las ordenes de Falabella y actualiza envio + telefono en las ventas existentes">&#128260; Reprocesar datos FL</button>
     <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio en ventas ML">&#128666; Actualizar envios</button>
     <button class="warn" onclick="recalcularWCTodos()" title="Corrige montos (IVA + envio) de ventas WooCommerce pendientes">&#128260; Recalcular WC</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
@@ -5071,6 +5308,20 @@ function reconciliarFL() {
       } else { alert('Error: ' + (data.detail || 'desconocido')); }
     })
     .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar FL'; } alert('Error: ' + e.message); });
+}
+
+function reprocesarDatosFL() {
+  if (!confirm('Reprocesar TODAS las ventas de Falabella?\\nReconsulta cada orden y actualiza envio + telefono. Los DTE ya emitidos no cambian de monto (no se puede), pero las pendientes quedaran con envio + telefono correctos y se actualiza el telefono del cliente en Odoo.')) return;
+  var btn = document.querySelector('[onclick="reprocesarDatosFL()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Reprocesando...'; }
+  fetch('/fl/reprocesar-datos', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Reprocesar datos FL'; }
+      if (data.ok) { alert(data.mensaje || ('Reprocesando ' + data.total + ' ventas FL.')); setTimeout(refreshData, 8000); setTimeout(refreshData, 20000); }
+      else { alert('Error: ' + (data.detail || 'desconocido')); }
+    })
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Reprocesar datos FL'; } alert('Error: ' + e.message); });
 }
 
 function ingresarFL() {
