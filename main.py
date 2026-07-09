@@ -1510,6 +1510,45 @@ def ejecutar_post_emision(move_id: int, fuente: str, oid: str):
             logger.error(f"[{oid}] Post-emision 'adjuntar_fl' fallo: {e}", exc_info=True)
 
 
+class SplitParentError(Exception):
+    """La venta ML es el pack ORIGINAL de una division (envio 'pack_splitted'): NO se factura.
+    Cada orden hija se factura por separado (1 unidad c/u) y sube su PDF a su propio pack."""
+    pass
+
+
+def ml_es_split_parent(venta: dict) -> bool:
+    """True si la venta ML es el pack original que fue DIVIDIDO en paquetes (envio en substatus
+    'pack_splitted'). Solo se consulta para ventas ML con pack_id. Defensivo: ante error -> False."""
+    if (venta.get("fuente") or "mercadolibre") != "mercadolibre":
+        return False
+    if not venta.get("pack_id"):
+        return False
+    try:
+        order = json.loads(venta.get("order_json") or "{}")
+        sid = (order.get("shipping") or {}).get("id")
+        if not sid:
+            return False
+        sh = ml_get(f"https://api.mercadolibre.com/shipments/{sid}", {"x-format-new": "true"})
+        return str((sh or {}).get("substatus") or "").lower() == "pack_splitted"
+    except Exception as e:
+        logger.warning(f"[{venta.get('id')}] no se pudo verificar split: {e}")
+        return False
+
+
+def _marcar_venta_dividida(venta: dict):
+    """Marca la venta como 'dividida' (no se factura la orden original). Si ya tenia documento
+    emitido, crea la NC total (la orden original quedo cancelada por la division)."""
+    oid = venta["id"]
+    if venta.get("move_id") and venta.get("estado") == "enviado":
+        try:
+            _crear_nota_credito(venta, "Anulacion automatica: venta dividida en Mercado Libre")
+        except Exception as e:
+            logger.error(f"[{oid}] No se pudo NC la venta dividida: {e}", exc_info=True)
+    update_venta(oid, estado="dividida",
+                 error="Venta dividida en ML: se facturan las ordenes hijas por separado")
+    logger.info(f"[{oid}] Marcada como DIVIDIDA (pack original, no se factura)")
+
+
 def emitir_venta(oid: str) -> tuple:
     """Crea el documento en Odoo para una venta y la marca como 'enviado'.
     Lanza excepcion si falla. Idempotente: si ya esta enviada devuelve su move_id."""
@@ -1518,6 +1557,10 @@ def emitir_venta(oid: str) -> tuple:
         raise Exception(f"Venta {oid} no encontrada")
     if venta.get("move_id") and venta.get("estado") == "enviado":
         return venta["move_id"], venta.get("partner_id")
+    # ML dividida: no se factura el pack original (se facturan las hijas por separado)
+    if ml_es_split_parent(venta):
+        _marcar_venta_dividida(venta)
+        raise SplitParentError(f"Venta {oid} dividida en ML: no se factura la orden original")
     order = json.loads(venta["order_json"])
     billing = json.loads(venta["billing_json"] or "{}")
     move_id, partner_id = create_document(
@@ -1598,6 +1641,8 @@ def auto_emitir_venta(oid: str):
     try:
         move_id, _ = emitir_venta(oid)
         logger.info(f"[{oid}] Auto-emitida: {tipo} move_id={move_id}")
+    except SplitParentError as e:
+        logger.info(f"[{oid}] {e} (quedo marcada 'dividida', no es error)")
     except Exception as e:
         logger.error(f"[{oid}] Error en auto-emision: {e}", exc_info=True)
         manejar_error_emision(oid, tipo, e)
@@ -3048,6 +3093,9 @@ def autorizar_masivo(payload: AutorizarMasivoPayload):
             move_id, _ = emitir_venta(oid)
             resultados["ok"] += 1
             resultados["detalle"].append({"id": oid, "ok": True, "move_id": move_id})
+        except SplitParentError:
+            resultados["detalle"].append({"id": oid, "ok": True, "dividida": True,
+                                          "message": "dividida: no se factura la original"})
         except Exception as e:
             resultados["error"] += 1
             resultados["detalle"].append({"id": oid, "ok": False, "error": str(e)[:200]})
@@ -3360,6 +3408,9 @@ def autorizar_venta(oid: str):
     try:
         move_id, partner_id = emitir_venta(oid)
         return {"ok": True, "id": oid, "move_id": move_id, "partner_id": partner_id}
+    except SplitParentError as e:
+        return {"ok": True, "id": oid, "dividida": True,
+                "message": "Venta dividida en ML: no se factura la orden original; las ordenes hijas se facturan por separado"}
     except Exception as e:
         logger.error(f"[{oid}] Error al autorizar: {e}", exc_info=True)
         manejar_error_emision(oid, venta.get("tipo_sugerido") or "Boleta", e)
@@ -3381,6 +3432,8 @@ def adjuntar_ml_manual(oid: str):
         try:
             move_id, _ = emitir_venta(oid)
             emitido_ahora = True
+        except SplitParentError:
+            raise HTTPException(status_code=400, detail="Venta dividida en ML: no se factura la orden original; adjunta el PDF en cada orden hija por separado")
         except Exception as e:
             logger.error(f"[{oid}] Error emitiendo antes de adjuntar: {e}", exc_info=True)
             manejar_error_emision(oid, venta.get("tipo_sugerido") or "Boleta", e)
@@ -3552,7 +3605,7 @@ class EstadoPayload(BaseModel):
     estado: str
 
 
-ESTADOS_VALIDOS_MANUAL = {"pendiente", "enviado", "error", "rechazado", "nota_credito"}
+ESTADOS_VALIDOS_MANUAL = {"pendiente", "enviado", "error", "rechazado", "nota_credito", "dividida"}
 
 
 @app.post("/ventas/{oid}/estado")
@@ -4751,6 +4804,8 @@ UI_HTML = """<!doctype html>
       <option value="enviado">Enviado</option>
       <option value="error">Error</option>
       <option value="rechazado">Rechazado</option>
+      <option value="nota_credito">Nota de credito</option>
+      <option value="dividida">Dividida</option>
     </select>
     <select id="pageSize" onchange="resetYRender()" title="Filas por pagina">
       <option value="50">50 por pagina</option>
@@ -5030,9 +5085,10 @@ var currentPage = 1;
 var calYear = null;
 
 function badge(estado) {
-  var map = {pendiente:'badge-pendiente', enviado:'badge-enviado', error:'badge-error', rechazado:'badge-default', nota_credito:'badge-nc'};
-  var label = {nota_credito:'N/C'};
-  return '<span class="badge ' + (map[estado] || 'badge-default') + '">' + esc(label[estado] || estado) + '</span>';
+  var map = {pendiente:'badge-pendiente', enviado:'badge-enviado', error:'badge-error', rechazado:'badge-default', nota_credito:'badge-nc', dividida:'badge-default'};
+  var label = {nota_credito:'N/C', dividida:'Dividida'};
+  var extra = estado === 'dividida' ? ' style="background:#3b2a12;color:#fbbf24"' : '';
+  return '<span class="badge ' + (map[estado] || 'badge-default') + '"' + extra + '>' + esc(label[estado] || estado) + '</span>';
 }
 
 function fuentebadge(fuente) {
