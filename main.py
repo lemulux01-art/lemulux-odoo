@@ -2586,11 +2586,11 @@ def debug_shipping(oid: str):
     }
 
 
-@app.get("/ml/debug-split/{order_id}")
-def ml_debug_split(order_id: str):
-    """Diagnostico de una venta dividida en ML: muestra pack, ordenes del pack y el estado de
-    cada envio (status/substatus/sibling_id) para entender la estructura antes de facturar.
-    Correr con el numero de orden ORIGINAL o con cualquiera de las nuevas."""
+@app.get("/ml/debug-split/{ident}")
+def ml_debug_split(ident: str):
+    """Diagnostico de una venta dividida en ML. Acepta un order_id, un pack_id o el id de la
+    venta en nuestra BD. Resuelve por BD -> orden -> pack y muestra las ordenes del pack con el
+    estado de cada envio (status/substatus/sibling_id). Solo lectura."""
     def shipment_new(sid):
         if not sid:
             return {}
@@ -2598,41 +2598,78 @@ def ml_debug_split(order_id: str):
             return ml_get(f"https://api.mercadolibre.com/shipments/{sid}", {"x-format-new": "true"})
         except Exception as e:
             return {"error": str(e)}
-    try:
-        order = get_ml_order(order_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"No se pudo leer la orden: {e}")
-    if not order:
-        raise HTTPException(status_code=404, detail="Orden no encontrada en ML")
-    pack_id = order.get("pack_id")
-    resumen_orden = {
-        "order_id": order.get("id"),
-        "pack_id": pack_id,
-        "status": order.get("status"),
-        "shipping_id": (order.get("shipping") or {}).get("id"),
-        "items": [{"title": safe_get(it, "item", "title", default=""),
-                   "qty": it.get("quantity")} for it in (order.get("order_items") or [])],
-    }
-    sh = shipment_new(resumen_orden["shipping_id"])
-    resumen_orden["shipment"] = {
-        "id": sh.get("id"), "status": sh.get("status"), "substatus": sh.get("substatus"),
-        "sibling_id": sh.get("sibling_id"), "reason": sh.get("reason"),
-    }
-    # Pack: lista de ordenes que agrupa
-    pack_info = {}
-    ordenes_pack = []
-    if pack_id:
+    def order_safe(oid):
         try:
-            pack = get_ml_pack(str(pack_id))
+            return get_ml_order(str(oid)) or {}
         except Exception as e:
-            pack = {"error": str(e)}
-        pack_info = {k: pack.get(k) for k in ("id", "status", "shipment_id") if isinstance(pack, dict)}
-        for o in (pack.get("orders") or []) if isinstance(pack, dict) else []:
+            return {"error": str(e)}
+    def pack_safe(pid):
+        try:
+            return get_ml_pack(str(pid)) or {}
+        except Exception as e:
+            return {"error": str(e)}
+
+    debug = {"ident": ident, "resuelto_por": None}
+
+    # 1) Datos que ya tenemos en la BD (order_json trae order_id real + pack_id + shipping)
+    venta = get_venta(ident)
+    order_json = {}
+    if venta and venta.get("order_json"):
+        try:
+            order_json = json.loads(venta["order_json"])
+        except Exception:
+            order_json = {}
+    debug["en_bd"] = {
+        "existe": bool(venta),
+        "estado": (venta or {}).get("estado"),
+        "move_id": (venta or {}).get("move_id"),
+        "pack_id_bd": (venta or {}).get("pack_id"),
+        "order_id_en_json": order_json.get("id"),
+        "pack_id_en_json": order_json.get("pack_id"),
+        "shipping_id_en_json": (order_json.get("shipping") or {}).get("id"),
+    }
+
+    # 2) Candidatos de pack_id y order_id a probar contra ML
+    cand_pack = [x for x in [order_json.get("pack_id"), (venta or {}).get("pack_id"), ident] if x]
+    cand_order = [x for x in [order_json.get("id"), ident] if x]
+
+    # 3) Intentar como ORDEN
+    order = {}
+    for oid in cand_order:
+        o = order_safe(oid)
+        if o and not o.get("error") and o.get("id"):
+            order = o
+            debug["resuelto_por"] = f"order:{oid}"
+            break
+    if order:
+        debug["orden_consultada"] = {
+            "order_id": order.get("id"),
+            "pack_id": order.get("pack_id"),
+            "status": order.get("status"),
+            "shipping_id": (order.get("shipping") or {}).get("id"),
+            "items": [{"title": safe_get(it, "item", "title", default=""), "qty": it.get("quantity")}
+                      for it in (order.get("order_items") or [])],
+        }
+        if order.get("pack_id"):
+            cand_pack.insert(0, order["pack_id"])
+
+    # 4) Intentar como PACK (el numero visible de ML suele ser el pack)
+    pack = {}
+    pack_id_ok = None
+    for pid in cand_pack:
+        p = pack_safe(pid)
+        if p and not p.get("error") and (p.get("orders") or p.get("id") or p.get("shipment_id")):
+            pack = p
+            pack_id_ok = pid
+            if not debug["resuelto_por"]:
+                debug["resuelto_por"] = f"pack:{pid}"
+            break
+
+    ordenes_pack = []
+    if pack:
+        for o in (pack.get("orders") or []):
             oid_p = str(o.get("id") or "")
-            try:
-                od = get_ml_order(oid_p)
-            except Exception:
-                od = {}
+            od = order_safe(oid_p)
             sid = (od.get("shipping") or {}).get("id")
             shp = shipment_new(sid)
             v_bd = get_venta(oid_p)
@@ -2648,13 +2685,16 @@ def ml_debug_split(order_id: str):
                 "estado_bd": (v_bd or {}).get("estado"),
                 "move_id_bd": (v_bd or {}).get("move_id"),
             })
+
     return {
         "ok": True,
-        "orden_consultada": resumen_orden,
-        "pack": pack_info,
-        "pack_id": pack_id,
+        "debug": debug,
+        "pack_id_resuelto": pack_id_ok,
+        "pack_raw_keys": list(pack.keys()) if isinstance(pack, dict) else None,
+        "pack_status": pack.get("status") if isinstance(pack, dict) else None,
+        "pack_shipment_id": pack.get("shipment_id") if isinstance(pack, dict) else None,
         "ordenes_del_pack": ordenes_pack,
-        "nota": "Si 'ordenes_del_pack' lista 451 y 453 bajo el mismo pack_id, la factura (por pack) es UNA sola para toda la venta.",
+        "nota": "Si 'ordenes_del_pack' lista 2+ ordenes bajo el mismo pack, la factura va por pack (UNA sola).",
     }
 
 
