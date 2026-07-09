@@ -1128,9 +1128,17 @@ def create_document(order, billing_raw, tipo, email, giro,
                     ciudad_override=None, region_override=None) -> tuple:
     ctx = odoo_connect()
     order_id = str(order["id"])
-    existing = find_existing_move(ctx, order_id)
+    # Referencia del cliente / clave de deduplicacion.
+    # Falabella: usar el Nro de orden VISIBLE (OrderNumber, ej 3242572329), no el OrderId
+    # interno (FL-1159267658). Es el numero que vemos en Seller Center y con el que se evita
+    # duplicar documentos. ML/WC/manual conservan el order_id como referencia.
+    order_number = str(order.get("order_number") or "").strip()
+    doc_ref = order_number if (order_id.startswith("FL-") and order_number) else order_id
+    existing = find_existing_move(ctx, doc_ref)
     if existing:
-        logger.info(f"[{order_id}] Documento ya existe: move_id={existing}")
+        # Documento ya emitido para esta orden -> NO se duplica. Se devuelve el existente para
+        # que el flujo siga con la carga del PDF / envio de correo segun corresponda.
+        logger.info(f"[{order_id}] Documento ya existe (ref={doc_ref}): move_id={existing}, no se duplica")
         return existing, 0
     billing_info = get_billing_info(billing_raw)
     rut = normalize_rut(rut_override) if rut_override else extract_rut(billing_info)
@@ -1184,7 +1192,7 @@ def create_document(order, billing_raw, tipo, email, giro,
         "move_type": "out_invoice",
         "partner_id": partner_id,
         "partner_shipping_id": partner_id,
-        "ref": str(order_id),
+        "ref": str(doc_ref),
         "invoice_line_ids": lines,
         "l10n_latam_document_type_id": doc_type_id,
         "invoice_payment_term_id": ODOO_PAYMENT_TERM_CONTADO_ID,
