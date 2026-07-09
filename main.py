@@ -1412,6 +1412,36 @@ def obtener_datos_dte_odoo(move_id: int) -> dict:
     return {"numero": numero, "fecha": str(fecha)[:10]}
 
 
+def obtener_lineas_dte_odoo(move_id: int) -> list:
+    """Lee las lineas de PRODUCTO del documento (factura/boleta) para armar la NC parcial.
+    Devuelve [{line_index, name, quantity, price_unit, price_subtotal}] en el orden del DTE."""
+    ctx = odoo_connect()
+    mv = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["invoice_line_ids"]})
+    if not mv:
+        return []
+    line_ids = mv[0].get("invoice_line_ids") or []
+    if not line_ids:
+        return []
+    lines = odoo_exec(ctx, "account.move.line", "read", [line_ids],
+                      {"fields": ["name", "quantity", "price_unit", "price_subtotal", "display_type"]})
+    out = []
+    idx = 0
+    for ln in lines:
+        # Solo lineas de producto (excluir secciones/notas)
+        if ln.get("display_type") not in (False, None, "product"):
+            continue
+        out.append({
+            "line_index": idx,
+            "line_id": ln["id"],
+            "name": ln.get("name") or "",
+            "quantity": ln.get("quantity") or 0,
+            "price_unit": ln.get("price_unit") or 0,
+            "price_subtotal": ln.get("price_subtotal") or 0,
+        })
+        idx += 1
+    return out
+
+
 def subir_comprobante_ml(pack_id: str, pdf_bytes: bytes, oid: str) -> dict:
     """Sube el PDF del comprobante al pack de Mercado Libre.
     POST /packs/{pack_id}/fiscal_documents (multipart, campo 'fiscal_document', PDF <= 1MB)."""
@@ -1623,6 +1653,112 @@ def _crear_nota_credito(venta: dict, motivo: str) -> Optional[int]:
             cur.execute("UPDATE ventas SET estado='nota_credito', nc_motivo=%s WHERE id=%s", (motivo, oid))
         conn.commit()
     return nc_move_id
+
+
+def _nc_id_desde_result(ctx, result, move_id: int) -> Optional[int]:
+    """Extrae el id de la NC recien creada por el wizard de reversion."""
+    nc_id = None
+    if isinstance(result, dict):
+        domain = result.get("domain")
+        if domain:
+            ncs = odoo_exec(ctx, "account.move", "search", [domain])
+            if ncs:
+                nc_id = ncs[0]
+        if result.get("res_id"):
+            nc_id = result["res_id"]
+    if not nc_id:
+        ncs = odoo_exec(ctx, "account.move", "search",
+                        [[["reversed_entry_id", "=", move_id]]], {"limit": 1, "order": "id desc"})
+        if ncs:
+            nc_id = ncs[0]
+    return nc_id
+
+
+def _crear_nota_credito_parcial(venta: dict, creditos: list, motivo: str) -> int:
+    """Crea una NC PARCIAL: acredita solo los items/cantidades indicados en `creditos`
+    (lista de {line_index, cantidad}). La factura original QUEDA VIGENTE (no se anula);
+    la venta permanece 'enviado'. Usa el wizard con refund_method='refund' para generar la
+    NC en borrador (tipo doc + diario + referencia correctos de la localizacion CL), luego
+    recorta las lineas a lo devuelto y la publica."""
+    oid = venta["id"]
+    move_id = venta.get("move_id")
+    if not move_id:
+        raise Exception("La venta no tiene documento en Odoo")
+    if not creditos:
+        raise Exception("No se indicaron items a acreditar")
+    ctx = odoo_connect()
+    mv = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "name"]})
+    if not mv:
+        raise Exception(f"Documento {move_id} no encontrado en Odoo")
+    if mv[0]["state"] != "posted":
+        raise Exception(f"Documento {mv[0]['name']} no esta publicado (estado: {mv[0]['state']})")
+
+    # Cantidad total del DTE original (para el guard de mapeo por indice)
+    orig_prod = obtener_lineas_dte_odoo(move_id)
+    cred_by_idx = {int(c["line_index"]): float(c["cantidad"]) for c in creditos if float(c.get("cantidad") or 0) > 0}
+    if not cred_by_idx:
+        raise Exception("No se indicaron cantidades a acreditar")
+
+    from datetime import date
+    reversal_fields = odoo_exec(ctx, "account.move.reversal", "fields_get", [], {"attributes": ["string"]})
+    reversal_vals = {
+        "move_ids": [(6, 0, [move_id])],
+        "date": date.today().isoformat(),
+        "reason": motivo,
+        "journal_id": False,
+    }
+    # 'refund' crea la NC en BORRADOR (copia total) para poder recortarla; 'cancel' reversa todo.
+    if "refund_method" in reversal_fields:
+        reversal_vals["refund_method"] = "refund"
+    elif "refund_type" in reversal_fields:
+        reversal_vals["refund_type"] = "refund"
+    wizard_id = odoo_exec(ctx, "account.move.reversal", "create", [reversal_vals])
+    result = odoo_exec(ctx, "account.move.reversal", "reverse_moves", [[wizard_id]])
+    nc_id = _nc_id_desde_result(ctx, result, move_id)
+    if not nc_id:
+        raise Exception("No se pudo generar la NC en borrador")
+
+    # Lineas de producto de la NC (mismo orden que el DTE original)
+    nc_line_ids = odoo_exec(ctx, "account.move", "read", [[nc_id]], {"fields": ["invoice_line_ids"]})[0].get("invoice_line_ids") or []
+    nclines = odoo_exec(ctx, "account.move.line", "read", [nc_line_ids],
+                        {"fields": ["name", "quantity", "display_type"]})
+    prod_lines = [l for l in nclines if l.get("display_type") in (False, None, "product")]
+
+    if len(prod_lines) != len(orig_prod):
+        # El mapeo por indice no es fiable: abortar sin dejar basura.
+        odoo_exec(ctx, "account.move", "unlink", [[nc_id]])
+        raise Exception(f"No coinciden las lineas de la NC ({len(prod_lines)}) con el DTE ({len(orig_prod)}); NC parcial cancelada")
+
+    commands = []
+    for i, l in enumerate(prod_lines):
+        q = cred_by_idx.get(i, 0)
+        orig_q = l.get("quantity") or 0
+        if q <= 0:
+            commands.append((2, l["id"]))               # quitar linea no devuelta
+        elif q < orig_q:
+            commands.append((1, l["id"], {"quantity": q}))  # acreditar cantidad parcial
+        # q >= orig_q -> se deja completa
+    if commands:
+        odoo_exec(ctx, "account.move", "write", [[nc_id], {"invoice_line_ids": commands}])
+
+    # Verificar que quede al menos una linea con monto
+    quedan = odoo_exec(ctx, "account.move", "read", [[nc_id]], {"fields": ["invoice_line_ids"]})[0].get("invoice_line_ids") or []
+    quedan_prod = [l for l in odoo_exec(ctx, "account.move.line", "read", [quedan], {"fields": ["display_type"]})
+                   if l.get("display_type") in (False, None, "product")]
+    if not quedan_prod:
+        odoo_exec(ctx, "account.move", "unlink", [[nc_id]])
+        raise Exception("La NC parcial quedo sin lineas (nada que acreditar)")
+
+    st = odoo_exec(ctx, "account.move", "read", [[nc_id]], {"fields": ["state"]})[0]["state"]
+    if st == "draft":
+        odoo_exec(ctx, "account.move", "action_post", [[nc_id]])
+    logger.info(f"[{oid}] NC PARCIAL creada: move_id={nc_id} (factura {move_id} sigue vigente)")
+    # La venta NO cambia a 'nota_credito' (es parcial, la factura sigue viva).
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE ventas SET nc_motivo=%s WHERE id=%s", (f"NC parcial: {motivo}", oid))
+        conn.commit()
+    return nc_id
 
 
 def auto_nota_credito_si_cancelado(venta: dict, ml_status: str):
@@ -3163,6 +3299,78 @@ def crear_nota_credito(oid: str, body: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _fl_devueltos_por_titulo(order_id: str) -> dict:
+    """Para Falabella: {titulo_item: cantidad_devuelta/cancelada} segun GetOrderItems.
+    Sirve para sugerir las lineas a acreditar en una NC parcial."""
+    rev = _fl_estados_reversion()
+    out = {}
+    try:
+        for it in fl_get_order_items(order_id):
+            st = str(it.get("Status") or "").strip().lower().replace(" ", "_")
+            if st in rev:
+                name = str(it.get("Name") or it.get("SellerSku") or "").strip()
+                out[name] = out.get(name, 0) + float(it.get("Quantity") or it.get("QtyOrdered") or 1)
+    except Exception as e:
+        logger.warning(f"[FL:{order_id}] no se pudo sugerir devueltos: {e}")
+    return out
+
+
+@app.get("/ventas/{oid}/lineas-dte")
+def lineas_dte(oid: str):
+    """Lineas del documento emitido + cantidad SUGERIDA a acreditar (devueltos del marketplace).
+    Alimenta el modal de NC parcial."""
+    venta = get_venta(oid)
+    if not venta:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+    if not venta.get("move_id"):
+        raise HTTPException(status_code=400, detail="La venta no tiene documento en Odoo")
+    try:
+        lineas = obtener_lineas_dte_odoo(venta["move_id"])
+    except Exception as e:
+        logger.error(f"[{oid}] Error leyendo lineas DTE: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    # Sugerencia de devueltos (solo Falabella por ahora; ML queda manual)
+    sugeridos = {}
+    if (venta.get("fuente") or "") == "falabella":
+        sugeridos = _fl_devueltos_por_titulo(oid.replace("FL-", "", 1))
+    for ln in lineas:
+        sug = 0
+        for name, qty in sugeridos.items():
+            if name and (name == ln["name"] or name in ln["name"] or ln["name"] in name):
+                sug = min(qty, ln["quantity"])
+                break
+        ln["sugerido"] = sug
+    return {"ok": True, "id": oid, "lineas": lineas}
+
+
+@app.post("/ventas/{oid}/nota-credito-parcial")
+def crear_nota_credito_parcial(oid: str, body: dict):
+    """Crea una NC PARCIAL acreditando solo los items/cantidades indicados; la factura original
+    queda vigente. body = {motivo, lineas:[{line_index, cantidad}]}."""
+    venta = get_venta(oid)
+    if not venta:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+    if venta.get("estado") != "enviado":
+        raise HTTPException(status_code=400, detail="Solo se puede crear NC de ventas ya enviadas a Odoo")
+    if not venta.get("move_id"):
+        raise HTTPException(status_code=400, detail="La venta no tiene documento en Odoo")
+    motivo = (body.get("motivo") or "").strip()
+    if not motivo:
+        raise HTTPException(status_code=400, detail="El motivo es obligatorio")
+    creditos = body.get("lineas") or []
+    if not creditos:
+        raise HTTPException(status_code=400, detail="Debes indicar al menos un item con cantidad a acreditar")
+    try:
+        nc_id = _crear_nota_credito_parcial(venta, creditos, motivo)
+        return {"ok": True, "id": oid, "nc_move_id": nc_id, "motivo": motivo,
+                "mensaje": "Nota de credito PARCIAL creada; la factura original sigue vigente"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{oid}] Error creando NC parcial: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ventas/{oid}/anular")
 def anular_venta(oid: str):
     venta = get_venta(oid)
@@ -3340,6 +3548,46 @@ def fl_reprocesar_datos_todos():
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "total": len(ids),
             "mensaje": f"Reprocesando {len(ids)} ventas Falabella en background (envio + telefono)."}
+
+
+@app.post("/fl/revisar-devoluciones")
+def fl_revisar_devoluciones():
+    """Revisa las ventas Falabella EMITIDAS y crea NC en las que la orden fue cancelada o
+    devuelta TOTALMENTE en Falabella (idempotente). Corre en background. Las devoluciones
+    parciales quedan registradas en el log para NC manual."""
+    ventas_fl = [v for v in list_ventas(None)
+                 if v.get("fuente") == "falabella" and v.get("estado") == "enviado" and v.get("move_id")]
+    ids = [v["id"] for v in ventas_fl]
+    def _run():
+        nc = 0
+        for oid in ids:
+            try:
+                order_id = oid.replace("FL-", "", 1)
+                tipo_rev = fl_detectar_reversion_total(order_id)
+                if tipo_rev:
+                    auto_nota_credito_si_reversion_fl(get_venta(oid), tipo_rev)
+                    nc += 1
+            except Exception as e:
+                logger.error(f"[{oid}] revisar-devoluciones fallo: {e}")
+            time.sleep(1)
+        logger.info(f"[FL] revisar-devoluciones completado: {nc} NC creadas de {len(ids)} emitidas")
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "total_emitidas": len(ids),
+            "mensaje": f"Revisando {len(ids)} ventas FL emitidas (cancelaciones/devoluciones) en background."}
+
+
+@app.post("/fl/revisar-devoluciones/{order_id}")
+def fl_revisar_devolucion_una(order_id: str):
+    """Revisa 1 venta Falabella emitida y crea NC si la orden fue cancelada/devuelta total."""
+    oid = f"FL-{order_id}" if not str(order_id).startswith("FL-") else str(order_id)
+    v = get_venta(oid)
+    if not v:
+        raise HTTPException(status_code=404, detail="Venta no encontrada")
+    tipo_rev = fl_detectar_reversion_total(oid.replace("FL-", "", 1))
+    if not tipo_rev:
+        return {"ok": True, "id": oid, "nc_creada": False, "mensaje": "La orden no esta cancelada/devuelta total (o es parcial)"}
+    auto_nota_credito_si_reversion_fl(v, tipo_rev)
+    return {"ok": True, "id": oid, "nc_creada": True, "tipo": tipo_rev}
 
 
 @app.get("/fl/debug/{order_id}")
@@ -4171,6 +4419,28 @@ def reconciliar_fl_ordenes():
                         time.sleep(2)
             else:
                 logger.info(f"[FL] Reconciliacion OK: {len(ordenes)} ordenes en BD")
+
+            # Cancelaciones / devoluciones en ordenes YA emitidas: crear NC automatica.
+            rev = _fl_estados_reversion()
+            def _statuses_tokens(o):
+                s = o.get("Statuses")
+                vals = s.get("Status") if isinstance(s, dict) else s
+                if not isinstance(vals, list):
+                    vals = [vals]
+                return {str(v).strip().lower().replace(" ", "_") for v in vals if v}
+            for o in ordenes:
+                oid_o = f"FL-{o['OrderId']}" if o.get("OrderId") else None
+                if not oid_o or oid_o not in ids_en_bd:
+                    continue
+                if not (_statuses_tokens(o) & rev):
+                    continue
+                v = get_venta(oid_o)
+                if not v or v.get("estado") != "enviado" or not v.get("move_id"):
+                    continue
+                tipo_rev = fl_detectar_reversion_total(str(o["OrderId"]))
+                if tipo_rev:
+                    auto_nota_credito_si_reversion_fl(v, tipo_rev)
+                time.sleep(1)
         except Exception as e:
             logger.error(f"[FL] Error en reconciliacion: {e}")
 
@@ -4361,6 +4631,7 @@ UI_HTML = """<!doctype html>
     <button class="secondary" onclick="reconciliarFL()" title="Consulta las ordenes recientes en Falabella (te pregunta cuantos dias) e ingresa las que falten">&#127873; Reconciliar FL</button>
     <button class="secondary" onclick="ingresarFL()" title="Ingresa una orden de Falabella por su OrderId (para pruebas)">&#128229; Ingresar orden FL</button>
     <button class="warn" onclick="reprocesarDatosFL()" title="Reconsulta las ordenes de Falabella y actualiza envio + telefono en las ventas existentes">&#128260; Reprocesar datos FL</button>
+    <button class="bad" onclick="revisarDevolucionesFL()" title="Crea NC en las ventas Falabella emitidas cuya orden fue cancelada o devuelta">&#8617; Devoluciones/Cancelaciones FL</button>
     <button class="secondary" onclick="actualizarEnvio()" title="Actualiza el tipo de envio en ventas ML">&#128666; Actualizar envios</button>
     <button class="warn" onclick="recalcularWCTodos()" title="Corrige montos (IVA + envio) de ventas WooCommerce pendientes">&#128260; Recalcular WC</button>
     <button id="btnAgrupar" class="pack-btn" style="display:none" onclick="agruparSeleccionadas()">&#9935; Agrupar seleccionadas</button>
@@ -4408,6 +4679,14 @@ UI_HTML = """<!doctype html>
       <button class="secondary" onclick="cerrarNC()">Cerrar</button>
     </div>
     <div style="margin-top:16px;padding:12px;background:var(--panel2);border-radius:8px;font-size:13px" id="ncModalInfo"></div>
+    <div style="margin-top:14px;display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="ncParcial" onchange="toggleNcParcial()" style="width:auto">
+      <label for="ncParcial" style="margin:0;cursor:pointer">NC parcial (acreditar solo algunos items / cantidades). La factura original queda vigente.</label>
+    </div>
+    <div id="ncLineasBox" style="margin-top:12px;display:none">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Indica la cantidad a acreditar por item (0 = no se acredita). Los devueltos del marketplace vienen sugeridos.</div>
+      <div id="ncLineas" style="max-height:240px;overflow:auto;border:1px solid var(--border);border-radius:8px"></div>
+    </div>
     <div style="margin-top:16px">
       <label>Motivo de la nota de credito</label>
       <select id="ncMotivo" onchange="toggleNcOtro()">
@@ -4936,7 +5215,34 @@ function abrirNC(id) {
   document.getElementById('ncOtro').value = '';
   document.getElementById('ncOtroGroup').style.display = 'none';
   document.getElementById('ncError').style.display = 'none';
+  document.getElementById('ncParcial').checked = false;
+  document.getElementById('ncLineasBox').style.display = 'none';
+  document.getElementById('ncLineas').innerHTML = '';
   document.getElementById('ncModal').classList.add('open');
+}
+
+function toggleNcParcial() {
+  var on = document.getElementById('ncParcial').checked;
+  var box = document.getElementById('ncLineasBox');
+  box.style.display = on ? 'block' : 'none';
+  if (!on || !_ncCurrentId) return;
+  var cont = document.getElementById('ncLineas');
+  cont.innerHTML = '<div style="padding:10px;color:var(--muted)">Cargando lineas del documento...</div>';
+  fetch('/ventas/' + _ncCurrentId + '/lineas-dte')
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (!data.ok || !data.lineas) { cont.innerHTML = '<div style="padding:10px;color:#f87171">' + (data.detail || 'No se pudieron leer las lineas') + '</div>'; return; }
+      if (!data.lineas.length) { cont.innerHTML = '<div style="padding:10px;color:#f87171">El documento no tiene lineas</div>'; return; }
+      var html = '';
+      data.lineas.forEach(function(l) {
+        html += '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--border)">' +
+          '<div style="flex:1;font-size:13px">' + esc(l.name) + '<div class="small">cant. facturada: ' + l.quantity + (l.sugerido ? ' &middot; <span style="color:#fbbf24">devuelto sugerido: ' + l.sugerido + '</span>' : '') + '</div></div>' +
+          '<input type="number" class="nc-cred" data-idx="' + l.line_index + '" data-max="' + l.quantity + '" min="0" max="' + l.quantity + '" step="1" value="' + (l.sugerido || 0) + '" style="width:90px;padding:6px 8px">' +
+          '</div>';
+      });
+      cont.innerHTML = html;
+    })
+    .catch(function(e){ cont.innerHTML = '<div style="padding:10px;color:#f87171">Error: ' + e.message + '</div>'; });
 }
 
 function cerrarNC() {
@@ -4955,16 +5261,37 @@ function confirmarNC() {
   if (motivo === 'otro') motivo = document.getElementById('ncOtro').value.trim();
   var errDiv = document.getElementById('ncError');
   if (!motivo) { errDiv.textContent = 'Debes seleccionar o ingresar un motivo'; errDiv.style.display = 'block'; return; }
-  errDiv.textContent = 'Creando nota de credito en Odoo...';
+
+  var parcial = document.getElementById('ncParcial').checked;
+  var url = '/ventas/' + _ncCurrentId + '/nota-credito';
+  var payload = {motivo: motivo};
+  if (parcial) {
+    var lineas = [];
+    var inputs = document.querySelectorAll('#ncLineas .nc-cred');
+    var totalCred = 0;
+    for (var i = 0; i < inputs.length; i++) {
+      var cant = parseFloat(inputs[i].value || '0');
+      var max = parseFloat(inputs[i].getAttribute('data-max') || '0');
+      if (isNaN(cant) || cant < 0) cant = 0;
+      if (cant > max) { errDiv.style.color='#f87171'; errDiv.style.display='block'; errDiv.textContent = 'No puedes acreditar mas de lo facturado en una linea'; return; }
+      if (cant > 0) { lineas.push({line_index: parseInt(inputs[i].getAttribute('data-idx'), 10), cantidad: cant}); totalCred += cant; }
+    }
+    if (!lineas.length) { errDiv.style.color='#f87171'; errDiv.style.display='block'; errDiv.textContent = 'Indica al menos un item con cantidad > 0 para la NC parcial'; return; }
+    if (!confirm('NC PARCIAL: se acreditaran ' + totalCred + ' unidad(es) en ' + lineas.length + ' linea(s). La factura original queda vigente. Continuar?')) return;
+    url = '/ventas/' + _ncCurrentId + '/nota-credito-parcial';
+    payload.lineas = lineas;
+  }
+
+  errDiv.textContent = (parcial ? 'Creando nota de credito PARCIAL' : 'Creando nota de credito') + ' en Odoo...';
   errDiv.style.display = 'block';
   errDiv.style.color = '#94a3b8';
-  fetch('/ventas/' + _ncCurrentId + '/nota-credito', {
+  fetch(url, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({motivo: motivo})
+    body: JSON.stringify(payload)
   }).then(function(r){ return r.json(); })
     .then(function(data) {
-      if (data.ok) { cerrarNC(); alert('Nota de credito creada en Odoo. Motivo: ' + motivo); refreshData(); }
+      if (data.ok) { cerrarNC(); alert((data.mensaje || 'Nota de credito creada en Odoo') + '. Motivo: ' + motivo); refreshData(); }
       else { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + (data.detail || 'desconocido'); }
     })
     .catch(function(e) { errDiv.style.color = '#f87171'; errDiv.textContent = 'Error: ' + e.message; });
@@ -5393,6 +5720,20 @@ function reconciliarFL() {
       } else { alert('Error: ' + (data.detail || 'desconocido')); }
     })
     .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar FL'; } alert('Error: ' + e.message); });
+}
+
+function revisarDevolucionesFL() {
+  if (!confirm('Revisar las ventas de Falabella EMITIDAS y crear Nota de Credito en las que la orden fue cancelada o devuelta totalmente?\\n(Idempotente: no repite NC. Las devoluciones parciales quedan en el log para hacerlas a mano.)')) return;
+  var btn = document.querySelector('[onclick="revisarDevolucionesFL()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Revisando...'; }
+  fetch('/fl/revisar-devoluciones', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Devoluciones/Cancelaciones FL'; }
+      if (data.ok) { alert(data.mensaje || ('Revisando ' + data.total_emitidas + ' ventas FL emitidas.')); setTimeout(refreshData, 10000); setTimeout(refreshData, 25000); }
+      else { alert('Error: ' + (data.detail || 'desconocido')); }
+    })
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Devoluciones/Cancelaciones FL'; } alert('Error: ' + e.message); });
 }
 
 function reprocesarDatosFL() {
