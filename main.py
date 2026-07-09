@@ -1454,15 +1454,19 @@ def subir_comprobante_ml(pack_id: str, pdf_bytes: bytes, oid: str) -> dict:
         raise Exception(f"El PDF pesa {len(pdf_bytes)} bytes (> 1MB); ML no lo acepta")
     api_url = f"https://api.mercadolibre.com/packs/{pack_id}/fiscal_documents"
     files = {"fiscal_document": (f"comprobante_{oid}.pdf", pdf_bytes, "application/pdf")}
-    res = requests.post(api_url, headers=ml_headers(), files=files, timeout=90)
+    res = requests.post(api_url, headers=ml_headers(), files=files, timeout=120)
     if res.status_code == 401:
         refresh_ml_token()
-        res = requests.post(api_url, headers=ml_headers(), files=files, timeout=90)
+        res = requests.post(api_url, headers=ml_headers(), files=files, timeout=120)
+    # 409 = el pack YA tiene un comprobante cargado -> idempotente, lo tratamos como OK.
+    if res.status_code == 409:
+        logger.info(f"[{oid}] ML 409 en pack {pack_id}: el comprobante YA estaba cargado (ok idempotente)")
+        return {"ok": True, "ya_cargado": True, "status_code": 409}
     res.raise_for_status()
     try:
         return res.json()
     except Exception:
-        return {"status_code": res.status_code}
+        return {"ok": True, "status_code": res.status_code}
 
 
 def adjuntar_comprobante_ml(oid: str, move_id: int):
@@ -4043,6 +4047,11 @@ def subir_comprobante_fl(order_item_ids: list, pdf_bytes: bytes, invoice_number:
         data = res.json()
     except Exception:
         data = {"status_code": res.status_code, "text": res.text[:500]}
+    # Duplicado = documento ya cargado -> idempotente, se trata como OK.
+    _txt = json.dumps(data).lower() if isinstance(data, (dict, list)) else str(data).lower()
+    if res.status_code == 409 or "duplicat" in _txt or "already" in _txt or "e004" in _txt or "ya existe" in _txt:
+        logger.info(f"[{oid}] Falabella: el documento YA estaba cargado (ok idempotente): {data}")
+        return {"ok": True, "ya_cargado": True, "status_code": res.status_code}
     if res.status_code >= 400 or (isinstance(data, dict) and data.get("ErrorResponse")):
         raise Exception(f"Falabella rechazo el documento (HTTP {res.status_code}): {data}")
     return data
@@ -5606,7 +5615,7 @@ function adjuntarMlManual(id) {
         refreshData();
       } else { alert('Error: ' + (d.detail || 'desconocido')); }
     })
-    .catch(function(e){ alert('Error: ' + e.message); });
+    .catch(function(e){ alert('La conexion se corto antes de recibir respuesta (' + e.message + ').\\nLa carga a ML pudo haberse completado igual. Refresca y, si hace falta, vuelve a intentar (si ya estaba, ML responde "ya cargado").'); refreshData(); });
 }
 
 function adjuntarFlManual(id) {
