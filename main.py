@@ -83,6 +83,24 @@ POST_EMIT = {
     "falabella":    {"pagar": _post_emit_default("FL", "PAGAR"), "email": _post_emit_default("FL", "EMAIL"), "adjuntar_fl": _post_emit_default("FL", "ADJUNTAR")},
 }
 
+# Nota de Credito AUTOMATICA por canal. "on" | "off". Se separa:
+#   total   -> anula la factura completa cuando la orden se cancela / devuelve ENTERA.
+#   parcial -> acredita solo los items devueltos cuando la devolucion es PARCIAL (factura sigue viva).
+# Default: total = on (mantiene el comportamiento previo), parcial = off (antes era solo manual).
+# Env vars dan el valor INICIAL: AUTO_NC_{ML|WC|FL}_{TOTAL|PARCIAL}. Se persiste en la BD y se
+# controla en vivo desde el dashboard.
+def _nc_auto_default(src: str, tipo: str) -> str:
+    v = os.getenv(f"AUTO_NC_{src}_{tipo}")
+    if v:
+        return v.strip().lower()
+    return "on" if tipo == "TOTAL" else "off"
+
+NC_AUTO = {
+    "mercadolibre": {"total": _nc_auto_default("ML", "TOTAL"), "parcial": _nc_auto_default("ML", "PARCIAL")},
+    "woocommerce":  {"total": _nc_auto_default("WC", "TOTAL"), "parcial": _nc_auto_default("WC", "PARCIAL")},
+    "falabella":    {"total": _nc_auto_default("FL", "TOTAL"), "parcial": _nc_auto_default("FL", "PARCIAL")},
+}
+
 # Estado de folios CAF por tipo. "ok" | "agotado". Si al emitir se detecta que no hay folios,
 # se DETIENE la auto-emision de ese tipo (las ventas quedan pendientes) y se avisa en el dashboard
 # hasta que se carguen mas CAF y se pulse "Reanudar". Se persiste en la BD.
@@ -1815,8 +1833,11 @@ def _crear_nota_credito_parcial(venta: dict, creditos: list, motivo: str) -> int
 
 def auto_nota_credito_si_cancelado(venta: dict, ml_status: str):
     """Si una orden ML pasa a 'cancelled' y ya tenia documento emitido, crea la NC sola.
-    Solo aplica a Mercado Libre. Nunca propaga la excepcion."""
+    Solo aplica a Mercado Libre. Respeta el interruptor NC_AUTO[ml][total]. Nunca propaga la excepcion."""
     if ml_status != "cancelled":
+        return
+    if NC_AUTO.get("mercadolibre", {}).get("total") != "on":
+        logger.info(f"[{(venta or {}).get('id')}] NC total automatica ML desactivada; queda para NC manual")
         return
     if not venta or venta.get("move_id") is None:
         return
@@ -2503,6 +2524,12 @@ async def on_startup():
             if _pv in ("on", "off"):
                 POST_EMIT[_fuente][_accion] = _pv
     logger.info(f"Post-emision -> {POST_EMIT}")
+    for _fuente in NC_AUTO:
+        for _tipo in list(NC_AUTO[_fuente].keys()):
+            _nv = get_config(f"nc_auto_{_fuente}_{_tipo}")
+            if _nv in ("on", "off"):
+                NC_AUTO[_fuente][_tipo] = _nv
+    logger.info(f"NC automatica -> {NC_AUTO}")
     for _tc in CAF_STATUS:
         if get_config(f"caf_agotado_{_tc}") == "agotado":
             CAF_STATUS[_tc] = "agotado"
@@ -2536,6 +2563,7 @@ def config_auto_emision():
     return {
         **AUTO_EMIT,
         "post_emit": POST_EMIT,
+        "nc_auto": NC_AUTO,
         "caf": CAF_STATUS,
         "nota": "Valores: 'auto' o 'manual' por canal/tipo. Editable en vivo desde el dashboard (POST /config/auto-emision).",
     }
@@ -2609,6 +2637,30 @@ def set_post_emision(payload: PostEmisionPayload):
         set_config(f"post_emit_{fuente}_{campo}", valor)
     logger.info(f"Post-emision cambiada [{fuente}] -> {POST_EMIT[fuente]}")
     return {"ok": True, "fuente": fuente, **POST_EMIT[fuente]}
+
+
+class NcAutoPayload(BaseModel):
+    fuente: str
+    total: Optional[str] = None
+    parcial: Optional[str] = None
+
+
+@app.post("/config/nc-auto")
+def set_nc_auto(payload: NcAutoPayload):
+    """Activa/desactiva la Nota de Credito automatica (total / parcial) de un canal."""
+    fuente = (payload.fuente or "").strip().lower()
+    if fuente not in NC_AUTO:
+        raise HTTPException(status_code=400, detail="fuente debe ser 'mercadolibre', 'woocommerce' o 'falabella'")
+    for campo, valor in (("total", payload.total), ("parcial", payload.parcial)):
+        if valor is None:
+            continue
+        valor = valor.strip().lower()
+        if valor not in ("on", "off"):
+            raise HTTPException(status_code=400, detail=f"{campo} debe ser 'on' o 'off'")
+        NC_AUTO[fuente][campo] = valor
+        set_config(f"nc_auto_{fuente}_{campo}", valor)
+    logger.info(f"NC automatica cambiada [{fuente}] -> {NC_AUTO[fuente]}")
+    return {"ok": True, "fuente": fuente, **NC_AUTO[fuente]}
 
 
 @app.get("/debug/shipping/{oid}")
@@ -3762,11 +3814,8 @@ def fl_revisar_devoluciones():
         nc = 0
         for oid in ids:
             try:
-                order_id = oid.replace("FL-", "", 1)
-                tipo_rev = fl_detectar_reversion_total(order_id)
-                if tipo_rev:
-                    auto_nota_credito_si_reversion_fl(get_venta(oid), tipo_rev)
-                    nc += 1
+                fl_auto_nc(get_venta(oid))  # total o parcial segun items (respeta toggles)
+                nc += 1
             except Exception as e:
                 logger.error(f"[{oid}] revisar-devoluciones fallo: {e}")
             time.sleep(1)
@@ -3783,11 +3832,8 @@ def fl_revisar_devolucion_una(order_id: str):
     v = get_venta(oid)
     if not v:
         raise HTTPException(status_code=404, detail="Venta no encontrada")
-    tipo_rev = fl_detectar_reversion_total(oid.replace("FL-", "", 1))
-    if not tipo_rev:
-        return {"ok": True, "id": oid, "nc_creada": False, "mensaje": "La orden no esta cancelada/devuelta total (o es parcial)"}
-    auto_nota_credito_si_reversion_fl(v, tipo_rev)
-    return {"ok": True, "id": oid, "nc_creada": True, "tipo": tipo_rev}
+    fl_auto_nc(v)  # decide total o parcial segun items (respeta toggles NC_AUTO)
+    return {"ok": True, "id": oid, "mensaje": "Evaluada; si correspondia se creo la NC (ver estado/nc_motivo)"}
 
 
 @app.get("/fl/debug/{order_id}")
@@ -4318,6 +4364,9 @@ def auto_nota_credito_si_reversion_fl(venta: dict, tipo_rev: str):
     propaga la excepcion: si falla, la venta sigue igual y se registra en el log."""
     if not tipo_rev:
         return
+    if NC_AUTO.get("falabella", {}).get("total") != "on":
+        logger.info(f"[{(venta or {}).get('id')}] NC total automatica FL desactivada; queda para NC manual")
+        return
     if not venta or not venta.get("move_id"):
         return
     if venta.get("estado") == "nota_credito":
@@ -4332,6 +4381,86 @@ def auto_nota_credito_si_reversion_fl(venta: dict, tipo_rev: str):
         logger.info(f"[{venta.get('id')}] NC automatica Falabella ({tipo_rev}): nc_move_id={nc_id}")
     except Exception as e:
         logger.error(f"[{venta.get('id')}] Error en NC automatica Falabella: {e}", exc_info=True)
+
+
+def _fl_devueltos_de_items(items: list) -> dict:
+    """{titulo: cantidad} de los items en estado de reversion (canceled/returned)."""
+    rev = _fl_estados_reversion()
+    out = {}
+    for it in (items or []):
+        st = str(it.get("Status") or "").strip().lower().replace(" ", "_")
+        if st in rev:
+            name = str(it.get("Name") or it.get("SellerSku") or "").strip()
+            out[name] = out.get(name, 0) + float(it.get("Quantity") or it.get("QtyOrdered") or 1)
+    return out
+
+
+def auto_nota_credito_parcial_fl(venta: dict, items: list = None):
+    """Falabella: devolucion PARCIAL (algunos items) con DTE emitido -> crea la NC parcial sola
+    por los items devueltos (la factura sigue vigente). Gated por NC_AUTO[fl][parcial].
+    Idempotente one-shot: no repite si ya se hizo una NC parcial (nc_motivo empieza con 'NC parcial')."""
+    if NC_AUTO.get("falabella", {}).get("parcial") != "on":
+        return
+    if not venta or not venta.get("move_id") or venta.get("estado") != "enviado":
+        return
+    if (venta.get("nc_motivo") or "").lower().startswith("nc parcial"):
+        return  # ya se hizo una NC parcial para esta venta
+    oid = venta["id"]
+    order_id = str(oid).replace("FL-", "", 1)
+    if items is None:
+        try:
+            items = fl_get_order_items(order_id)
+        except Exception as e:
+            logger.warning(f"[{oid}] NC parcial auto: no se pudieron obtener items: {e}")
+            return
+    devueltos = _fl_devueltos_de_items(items)
+    if not devueltos:
+        return
+    try:
+        lineas = obtener_lineas_dte_odoo(venta["move_id"])
+    except Exception as e:
+        logger.warning(f"[{oid}] NC parcial auto: no se pudieron leer lineas DTE: {e}")
+        return
+    creditos = []
+    for ln in lineas:
+        for name, qty in devueltos.items():
+            if name and (name == ln["name"] or name in ln["name"] or ln["name"] in name):
+                cant = min(qty, ln["quantity"])
+                if cant > 0:
+                    creditos.append({"line_index": ln["line_index"], "cantidad": cant})
+                break
+    if not creditos:
+        return
+    try:
+        nc_id = _crear_nota_credito_parcial(venta, creditos, "Devolucion parcial automatica Falabella")
+        logger.info(f"[{oid}] NC PARCIAL automatica Falabella: nc_move_id={nc_id} items={creditos}")
+    except Exception as e:
+        logger.error(f"[{oid}] Error en NC parcial automatica Falabella: {e}", exc_info=True)
+
+
+def fl_auto_nc(venta: dict):
+    """Despachador de NC automatica FL para una venta emitida: con UNA consulta de items decide
+    si la reversion es TOTAL (NC total) o PARCIAL (NC parcial). Respeta los toggles NC_AUTO."""
+    if not venta or venta.get("estado") != "enviado" or not venta.get("move_id"):
+        return
+    if venta.get("estado") == "nota_credito":
+        return
+    oid = venta["id"]
+    order_id = str(oid).replace("FL-", "", 1)
+    try:
+        items = fl_get_order_items(order_id)
+    except Exception as e:
+        logger.warning(f"[{oid}] fl_auto_nc: no se pudieron obtener items: {e}")
+        return
+    if not items:
+        return
+    rev = _fl_estados_reversion()
+    estados = [str(it.get("Status") or "").strip().lower().replace(" ", "_") for it in items]
+    if all(e in rev for e in estados):
+        tipo = "returned" if "returned" in estados else "canceled"
+        auto_nota_credito_si_reversion_fl(venta, tipo)
+    elif any(e in rev for e in estados):
+        auto_nota_credito_parcial_fl(venta, items)
 
 
 def process_fl_order(order_id: str, order_data: dict = None):
@@ -4371,11 +4500,9 @@ def process_fl_order(order_id: str, order_data: dict = None):
         if existing:
             update_venta(oid_str, estado_envio=status_val)
             logger.info(f"[FL:{order_id}] Estado actualizado: {status_val}")
-            # Si la orden cambio a cancelada/devuelta y ya tenia DTE emitido, crear NC sola.
-            if status_val in _fl_estados_reversion() and existing.get("estado") == "enviado" \
-               and existing.get("move_id") and existing.get("estado") != "nota_credito":
-                tipo_rev = fl_detectar_reversion_total(order_id)
-                auto_nota_credito_si_reversion_fl(existing, tipo_rev)
+            # Si ya tenia DTE emitido, evaluar NC automatica (total o parcial) segun items.
+            if existing.get("estado") == "enviado" and existing.get("move_id"):
+                fl_auto_nc(existing)
             return
 
         if status_val not in FL_ESTADOS_VALIDOS:
@@ -4642,9 +4769,7 @@ def reconciliar_fl_ordenes():
                 v = get_venta(oid_o)
                 if not v or v.get("estado") != "enviado" or not v.get("move_id"):
                     continue
-                tipo_rev = fl_detectar_reversion_total(str(o["OrderId"]))
-                if tipo_rev:
-                    auto_nota_credito_si_reversion_fl(v, tipo_rev)
+                fl_auto_nc(v)  # decide total o parcial con una sola consulta de items
                 time.sleep(1)
         except Exception as e:
             logger.error(f"[FL] Error en reconciliacion: {e}")
@@ -4804,6 +4929,28 @@ UI_HTML = """<!doctype html>
       <select id="peFLadjuntar" onchange="guardarPostEmision('falabella')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
     </div>
     <div style="font-size:11px;color:var(--muted);margin-top:8px">"Marcar pagada" registra el pago en Odoo por el diario de banco (queda PAGADA). "Enviar email" manda el comprobante al cliente por el correo interno de Odoo (WooCommerce y Falabella). "Cargar documento tributario" sube el PDF del DTE al marketplace: en ML al pack (packs/fiscal_documents, no aplica a env&iacute;os Full); en Falabella v&iacute;a SetInvoicePDF (solo &oacute;rdenes en ready_to_ship o posterior; no aplica a env&iacute;os por Falabella/FBF).</div>
+  </div>
+  <div style="margin-bottom:12px;padding:12px 14px;background:var(--panel);border:1px solid var(--border);border-radius:12px">
+    <div style="font-size:13px;font-weight:700;margin-bottom:10px">&#128203; Nota de Cr&eacute;dito autom&aacute;tica por canal
+      <span id="cfgNcEstado" style="font-weight:400;font-size:12px;color:var(--muted);margin-left:8px"></span></div>
+    <div style="display:grid;grid-template-columns:auto auto auto;gap:8px 20px;align-items:center">
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">Canal</span>
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">NC total (anula todo)</span>
+      <span style="color:var(--muted);font-size:11px;text-transform:uppercase">NC parcial (solo devuelto)</span>
+
+      <span style="font-size:13px">&#x1F6CD; Mercado Libre</span>
+      <select id="ncMLtotal" onchange="guardarNcAuto('mercadolibre')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+      <select id="ncMLparcial" onchange="guardarNcAuto('mercadolibre')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+
+      <span style="font-size:13px">&#x1F6D2; WooCommerce</span>
+      <select id="ncWCtotal" onchange="guardarNcAuto('woocommerce')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+      <select id="ncWCparcial" onchange="guardarNcAuto('woocommerce')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+
+      <span style="font-size:13px">&#x1F7E1; Falabella</span>
+      <select id="ncFLtotal" onchange="guardarNcAuto('falabella')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+      <select id="ncFLparcial" onchange="guardarNcAuto('falabella')" style="padding:6px 10px"><option value="off">No</option><option value="on">S&iacute;</option></select>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px">"NC total" anula la factura completa cuando la orden se cancela o devuelve ENTERA. "NC parcial" acredita solo los items devueltos (la factura sigue vigente) cuando la devoluci&oacute;n es parcial. La detecci&oacute;n autom&aacute;tica de parciales opera hoy en Falabella (por estado de cada item); en ML las parciales quedan manuales. Con todo en "No", las NC se hacen a mano con el bot&oacute;n N/C.</div>
   </div>
   <div class="toolbar">
     <input id="searchInput" placeholder="Buscar por ID, cliente, RUT, email..." oninput="resetYRender()">
@@ -5679,6 +5826,34 @@ function guardarPostEmision(fuente) {
     .catch(function(e){ if (est) { est.textContent = 'Error: ' + e.message; est.style.color = '#f87171'; } });
 }
 
+var NC_IDS = {
+  mercadolibre: {total: 'ncMLtotal', parcial: 'ncMLparcial'},
+  woocommerce:  {total: 'ncWCtotal', parcial: 'ncWCparcial'},
+  falabella:    {total: 'ncFLtotal', parcial: 'ncFLparcial'}
+};
+
+function guardarNcAuto(fuente) {
+  var ids = NC_IDS[fuente];
+  if (!ids) return;
+  var body = {fuente: fuente,
+              total: document.getElementById(ids.total).value,
+              parcial: document.getElementById(ids.parcial).value};
+  var est = document.getElementById('cfgNcEstado');
+  if (est) { est.textContent = 'Guardando...'; est.style.color = '#94a3b8'; }
+  fetch('/config/nc-auto', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (est) {
+        if (d.ok) { est.textContent = 'Guardado \\u2713 ' + fuente + ': total ' + d.total + ' / parcial ' + d.parcial; est.style.color = '#4ade80'; }
+        else { est.textContent = 'Error: ' + (d.detail || 'desconocido'); est.style.color = '#f87171'; }
+      }
+    })
+    .catch(function(e){ if (est) { est.textContent = 'Error: ' + e.message; est.style.color = '#f87171'; } });
+}
+
 function renderCafAlert(caf) {
   var el = document.getElementById('cafAlert');
   if (!el) return;
@@ -5730,6 +5905,14 @@ function cargarAutoEmision() {
         if (ids.email && c.email) { var _e = document.getElementById(ids.email); if (_e) _e.value = c.email; }
         if (ids.adjuntar_ml && c.adjuntar_ml) { var _a = document.getElementById(ids.adjuntar_ml); if (_a) _a.value = c.adjuntar_ml; }
         if (ids.adjuntar_fl && c.adjuntar_fl) { var _f = document.getElementById(ids.adjuntar_fl); if (_f) _f.value = c.adjuntar_fl; }
+      });
+      var nc = d.nc_auto || {};
+      Object.keys(NC_IDS).forEach(function(fuente) {
+        var c = nc[fuente];
+        if (!c) return;
+        var ids = NC_IDS[fuente];
+        if (c.total) { var _t = document.getElementById(ids.total); if (_t) _t.value = c.total; }
+        if (c.parcial) { var _p = document.getElementById(ids.parcial); if (_p) _p.value = c.parcial; }
       });
       var est = document.getElementById('cfgEstado');
       if (est) est.textContent = '';
