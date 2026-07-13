@@ -3866,6 +3866,65 @@ def fl_debug_order(order_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/fl/buscar/{numero}")
+def fl_buscar(numero: str, days: int = 30, ingresar: bool = False):
+    """Busca una orden Falabella por OrderId O por OrderNumber (el 'Orden Nº' visible) en los
+    ultimos 'days' dias y explica por que no aparece en el listado. Con ?ingresar=true la ingesta
+    si falta. Ej: /fl/buscar/3243802464?days=60  /fl/buscar/3243802464?ingresar=true"""
+    from datetime import timedelta
+    numero = str(numero).strip().replace("FL-", "")
+    created_after = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    try:
+        ordenes = fl_get_orders_recent(created_after=created_after, limit=100)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    def _status(o):
+        s = o.get("Statuses")
+        vals = s.get("Status") if isinstance(s, dict) else s
+        if isinstance(vals, list):
+            vals = vals[0] if vals else ""
+        if isinstance(vals, dict):
+            vals = vals.get("Status")
+        return str(vals or "").strip().lower().replace(" ", "_")
+
+    match = None
+    for o in ordenes:
+        if str(o.get("OrderId")) == numero or str(o.get("OrderNumber") or "") == numero:
+            match = o
+            break
+    if not match:
+        return {"ok": True, "encontrada_en_fl": False, "revisadas": len(ordenes), "days": days,
+                "nota": f"No aparece entre las ultimas {days} dias (max 100 ordenes). Prueba mas dias "
+                        f"(?days=90). Verifica que el numero sea el OrderId o el OrderNumber (Orden Nº) real."}
+    order_id = str(match.get("OrderId"))
+    order_number = str(match.get("OrderNumber") or "")
+    st = _status(match)
+    oid = f"FL-{order_id}"
+    v = get_venta(oid)
+    resp = {"ok": True, "encontrada_en_fl": True, "order_id": order_id, "order_number": order_number,
+            "status": st, "status_valido_para_facturar": st in FL_ESTADOS_VALIDOS,
+            "en_bd": bool(v), "estado_bd": (v or {}).get("estado"), "motivo_no_aparece": None}
+    if not v:
+        if st not in FL_ESTADOS_VALIDOS:
+            resp["motivo_no_aparece"] = (f"Estado '{st}' no esta en el filtro de facturacion "
+                                         f"{sorted(FL_ESTADOS_VALIDOS)}; por eso se ignora al ingestar.")
+        else:
+            resp["motivo_no_aparece"] = ("Estado valido pero aun no ingresada: backlog del reconciliador "
+                                         "(procesa por lotes cada 25 min) o webhook no configurado. Usa ?ingresar=true.")
+    if ingresar and not v:
+        try:
+            process_fl_order(order_id)  # sin order_data -> trae datos completos (GetOrder)
+            v2 = get_venta(oid)
+            resp["ingresada"] = bool(v2)
+            resp["estado_bd"] = (v2 or {}).get("estado")
+            if not v2:
+                resp["nota_ingesta"] = "No se guardo (probablemente el estado no es facturable)."
+        except Exception as e:
+            resp["error_ingesta"] = str(e)
+    return resp
+
+
 @app.get("/fl/debug-orders")
 def fl_debug_orders(days: int = 30, limit: int = 20):
     """Diagnostico: respuesta CRUDA de GetOrders para ver si Falabella devuelve ordenes,
@@ -4739,9 +4798,10 @@ def reconciliar_fl_ordenes():
 
             faltantes = [o for o in ordenes if f"FL-{o['OrderId']}" not in ids_en_bd
                          and fl_get_status(o) in FL_ESTADOS_VALIDOS]
+            _max_recon = int(os.getenv("FL_RECON_MAX", "50"))
             if faltantes:
-                logger.warning(f"[FL] Reconciliacion: {len(faltantes)} faltantes, procesando hasta 10")
-                for o in faltantes[:10]:
+                logger.warning(f"[FL] Reconciliacion: {len(faltantes)} faltantes, procesando hasta {_max_recon}")
+                for o in faltantes[:_max_recon]:
                     try:
                         # Pasar order_data directamente desde GetOrders (evita llamar GetOrder)
                         process_fl_order(str(o["OrderId"]), order_data=o)
