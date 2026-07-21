@@ -1550,10 +1550,15 @@ def ml_es_split_parent(venta: dict) -> bool:
         sid = (order.get("shipping") or {}).get("id")
         if not sid:
             return False
-        sh = ml_get(f"https://api.mercadolibre.com/shipments/{sid}", {"x-format-new": "true"})
-        return str((sh or {}).get("substatus") or "").lower() == "pack_splitted"
+        # Llamada ACOTADA (8s, sin reintentos ni lock global): esta en el camino caliente de la
+        # emision; no debe estancar el worker si ML esta lento/rate-limiteado -> ante duda, False.
+        r = requests.get(f"https://api.mercadolibre.com/shipments/{sid}",
+                         headers={**ml_headers(), "x-format-new": "true"}, timeout=8)
+        if r.status_code != 200:
+            return False
+        return str((r.json() or {}).get("substatus") or "").lower() == "pack_splitted"
     except Exception as e:
-        logger.warning(f"[{venta.get('id')}] no se pudo verificar split: {e}")
+        logger.warning(f"[{venta.get('id')}] no se pudo verificar split (se ignora): {e}")
         return False
 
 
@@ -1604,9 +1609,16 @@ def emitir_venta(oid: str) -> tuple:
 
 
 def es_error_caf(msg: str) -> bool:
-    """Heuristica: el error de Odoo por falta de folios CAF menciona 'caf' o 'folio'."""
+    """Heuristica ESTRICTA: solo es 'sin folios CAF' si el error menciona caf/folio JUNTO a una
+    palabra de agotamiento. Antes bastaba 'folio'/'caf' en cualquier parte, lo que producia falsos
+    positivos que DETENIAN toda la auto-emision por un error no relacionado."""
     m = (msg or "").lower()
-    return ("caf" in m) or ("folio" in m)
+    tiene_folio = ("caf" in m) or ("folio" in m)
+    if not tiene_folio:
+        return False
+    agot = ["no ", "sin ", "agot", "disponible", "available", "insufficient", "insuficient",
+            "expired", "vencid", "quedan", "remaining", "exhaust", "run out", "no hay"]
+    return any(p in m for p in agot)
 
 
 def marcar_caf_agotado(tipo_caf: str, msg: str = ""):
@@ -2016,6 +2028,11 @@ def reprocesar_venta_desde_ml(order_id: str):
 
 webhook_queue = queue_module.Queue()
 
+# Rastreo simple de webhooks ML recibidos (para /ml/webhook-status). Se reinicia al reiniciar app.
+_ml_wh_last = None
+_ml_wh_count = 0
+_ml_wh_last_topic = None
+
 
 def webhook_worker():
     global _consecutive_429
@@ -2083,6 +2100,51 @@ def get_ml_ordenes_recientes(seller_id: str, total: int = 200) -> list:
     return unicas[:total]
 
 
+def get_ml_ordenes_canceladas(seller_id: str, total: int = 100) -> list:
+    """Ordenes ML recientes en estado 'cancelled' (incluye las que se cancelaron al DIVIDIR una
+    venta). El buscador normal solo trae 'paid', por eso las canceladas se consultan aparte."""
+    todas = []
+    offset = 0
+    limit = 50
+    while len(todas) < total:
+        url = (f"https://api.mercadolibre.com/orders/search"
+               f"?seller={seller_id}&order.status=cancelled&sort=date_desc"
+               f"&limit={limit}&offset={offset}")
+        try:
+            data = ml_get(url)
+        except Exception as e:
+            logger.warning(f"Error paginando canceladas ML offset={offset}: {e}")
+            break
+        res = data.get("results") or []
+        if not res:
+            break
+        todas.extend(res)
+        offset += limit
+        if len(res) < limit:
+            break
+        time.sleep(2)
+    return todas[:total]
+
+
+def revisar_canceladas_ml(seller_id: str) -> int:
+    """Para las ordenes ML canceladas recientes que YA tenemos emitidas, dispara la NC total
+    (respeta NC_AUTO[ml][total]). Cubre el caso de una venta que se cancela/divide DESPUES de
+    haberse facturado (el reconciliador normal no la ve porque solo mira 'paid'). Idempotente."""
+    nc = 0
+    for o in get_ml_ordenes_canceladas(seller_id, total=100):
+        try:
+            oid = str(o.get("id") or "")
+            pack_id = str(o.get("pack_id") or "")
+            v = (get_venta_by_pack(pack_id) if pack_id else None) or get_venta(oid)
+            if v and v.get("estado") == "enviado" and v.get("move_id"):
+                auto_nota_credito_si_cancelado(v, "cancelled")
+                nc += 1
+        except Exception as e:
+            logger.error(f"[ML] revisar canceladas: {e}")
+        time.sleep(0.3)
+    return nc
+
+
 def reconciliar_ordenes_ml():
     while True:
         # Si hay 429 recientes, esperar mas antes de reconciliar
@@ -2113,6 +2175,14 @@ def reconciliar_ordenes_ml():
                     time.sleep(0.5)
             else:
                 logger.info(f"Reconciliacion ML OK: {len(ordenes_ml)} ordenes todas en BD")
+            # Re-chequear canceladas recientes ya emitidas -> NC (cubre divisiones/cancelaciones
+            # posteriores a la facturacion, que el buscador de 'paid' no ve).
+            try:
+                _nc = revisar_canceladas_ml(seller_id)
+                if _nc:
+                    logger.info(f"[ML] revisar canceladas: {_nc} ordenes emitidas canceladas evaluadas para NC")
+            except Exception as e:
+                logger.error(f"[ML] Error revisando canceladas: {e}")
         except Exception as e:
             logger.error(f"Error en reconciliacion ML: {e}")
 
@@ -2501,7 +2571,7 @@ async def on_startup():
     logger.info("Worker de cola Falabella iniciado")
     fr = threading.Thread(target=reconciliar_fl_ordenes, daemon=True)
     fr.start()
-    logger.info("Reconciliador Falabella iniciado (cada 25 min)")
+    logger.info(f"Reconciliador Falabella iniciado (cada {os.getenv('FL_RECON_INTERVAL_MIN', '15')} min, hasta {os.getenv('FL_RECON_MAX', '50')} por ciclo)")
     # Cargar overrides persistidos del interruptor (los env vars son solo el default inicial).
     # Migracion: si existen las claves globales viejas, se aplican como default a todos los canales...
     old_b = get_config("auto_emit_boletas")
@@ -2896,12 +2966,17 @@ def debug_ml_fiscal(oid: str):
 
 @app.post("/ml/webhook")
 async def ml_webhook(request: Request):
+    global _ml_wh_last, _ml_wh_count, _ml_wh_last_topic
     try:
         body = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Body invalido"})
     topic = body.get("topic", "")
     resource = body.get("resource", "")
+    # Registrar que ML nos esta llamando (para el diagnostico /ml/webhook-status)
+    _ml_wh_last = datetime.utcnow().isoformat()
+    _ml_wh_count += 1
+    _ml_wh_last_topic = topic
     if topic != "orders_v2" or not resource:
         return {"ok": True, "ignored": True}
     order_id = resource.strip("/").split("/")[-1]
@@ -2913,6 +2988,40 @@ async def ml_webhook(request: Request):
     else:
         logger.info(f"Webhook ML duplicado ignorado: {order_id}")
     return {"ok": True, "order_id": order_id, "queued": webhook_queue.qsize()}
+
+
+@app.get("/ml/webhook-status")
+def ml_webhook_status():
+    """Diagnostico del webhook ML: si estamos recibiendo notificaciones y si ML tiene 'missed feeds'
+    (avisos que intento entregar y fallaron -> URL mal configurada o app caida al enviarlos)."""
+    app_id = os.getenv("ML_CLIENT_ID", "")
+    missed = None
+    missed_error = None
+    try:
+        data = ml_get(f"https://api.mercadolibre.com/missed_feeds?app_id={app_id}") if app_id else {}
+        # La respuesta suele traer 'messages' o similar; devolvemos crudo + un conteo aproximado.
+        if isinstance(data, dict):
+            msgs = data.get("messages") or data.get("results") or []
+            missed = {"total_aprox": len(msgs) if isinstance(msgs, list) else data.get("total"),
+                      "muestra": (msgs[:5] if isinstance(msgs, list) else data)}
+        else:
+            missed = data
+    except Exception as e:
+        missed_error = str(e)
+    return {
+        "ok": True,
+        "callback_esperado": "https://lemulux-odoo-production.up.railway.app/ml/webhook",
+        "topic_esperado": "orders_v2",
+        "recibidos_desde_arranque": _ml_wh_count,
+        "ultimo_recibido_utc": _ml_wh_last,
+        "ultimo_topic": _ml_wh_last_topic,
+        "cola_actual": webhook_queue.qsize(),
+        "missed_feeds_ml": missed,
+        "missed_feeds_error": missed_error,
+        "interpretacion": ("Si 'recibidos_desde_arranque' sube al generarse ventas -> el webhook llega. "
+                           "Si hay 'missed_feeds' -> ML intenta avisar pero la URL/topic falla. "
+                           "Si ambos vacios -> el webhook NO esta configurado en la app de ML."),
+    }
 
 
 @app.post("/wc/webhook")
@@ -3238,6 +3347,25 @@ def reconciliar_manual():
             "mensaje": f"Procesando {len(faltantes)} ventas faltantes en background.",
             "encoladas": faltantes[:5]
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ml/revisar-canceladas")
+def ml_revisar_canceladas():
+    """Revisa las ordenes ML canceladas recientes y crea la NC de las que ya estaban facturadas
+    (cubre ventas divididas/canceladas DESPUES de emitir). Respeta NC_AUTO[ml][total]. Idempotente."""
+    try:
+        seller_id = get_ml_seller_id()
+        if not seller_id:
+            raise HTTPException(status_code=500, detail="No se pudo obtener seller_id de ML")
+        def _run():
+            n = revisar_canceladas_ml(seller_id)
+            logger.info(f"[ML] revisar-canceladas manual completado: {n} evaluadas")
+        threading.Thread(target=_run, daemon=True).start()
+        return {"ok": True, "mensaje": "Revisando canceladas ML en background (NC de las ya facturadas)."}
     except HTTPException:
         raise
     except Exception as e:
@@ -4771,9 +4899,12 @@ def fl_webhook_worker():
 
 
 def reconciliar_fl_ordenes():
-    """Cada 25 min verifica ordenes recientes de Falabella y encola faltantes."""
+    """Reconciliacion AUTOMATICA de Falabella: cada FL_RECON_INTERVAL_MIN (default 15 min) revisa
+    las ordenes recientes e ingesta las faltantes (hasta FL_RECON_MAX por ciclo). Es el respaldo
+    del webhook /fl/webhook (que da tiempo real si esta configurado en Seller Center)."""
+    _intervalo = int(os.getenv("FL_RECON_INTERVAL_MIN", "15")) * 60
     while True:
-        time.sleep(25 * 60)
+        time.sleep(_intervalo)
         try:
             ordenes = fl_get_orders_recent(limit=100)
             if not ordenes:
@@ -5041,6 +5172,7 @@ UI_HTML = """<!doctype html>
     <button class="secondary" onclick="abrirIngresarVenta()" style="background:var(--blue)">+ Ingresar venta</button>
     <button class="warn" onclick="reprocesarTodo()">&#8635; Reprocesar todo</button>
     <button class="secondary" onclick="reconciliarML()" title="Consulta las ultimas 200 ordenes en ML">&#128279; Reconciliar ML</button>
+    <button class="bad" onclick="revisarCanceladasML()" title="Crea NC de ventas ML ya facturadas que se cancelaron o dividieron despues">&#8617; Canceladas/NC ML</button>
     <button class="secondary" onclick="reconciliarWC()" title="Consulta las ultimas 100 ordenes en WooCommerce">&#128666; Reconciliar WC</button>
     <button class="secondary" onclick="reconciliarFL()" title="Consulta las ordenes recientes en Falabella (te pregunta cuantos dias) e ingresa las que falten">&#127873; Reconciliar FL</button>
     <button class="secondary" onclick="ingresarFL()" title="Ingresa una orden de Falabella por su OrderId (para pruebas)">&#128229; Ingresar orden FL</button>
@@ -6133,6 +6265,20 @@ function reconciliarML() {
       } else { alert('Error: ' + (data.detail || 'desconocido')); }
     })
     .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Reconciliar ML'; } alert('Error: ' + e.message); });
+}
+
+function revisarCanceladasML() {
+  if (!confirm('Revisar las ordenes ML canceladas recientes y crear NC de las que ya estaban facturadas (incluye ventas divididas)?\\n(Idempotente y respeta el interruptor de NC total de ML.)')) return;
+  var btn = document.querySelector('[onclick="revisarCanceladasML()"]');
+  if (btn) { btn.disabled = true; btn.textContent = 'Revisando...'; }
+  fetch('/ml/revisar-canceladas', {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Canceladas/NC ML'; }
+      if (data.ok) { alert(data.mensaje || 'Revisando canceladas ML.'); setTimeout(refreshData, 10000); setTimeout(refreshData, 30000); }
+      else { alert('Error: ' + (data.detail || 'desconocido')); }
+    })
+    .catch(function(e) { if (btn) { btn.disabled = false; btn.textContent = 'Canceladas/NC ML'; } alert('Error: ' + e.message); });
 }
 
 function reconciliarWC() {
