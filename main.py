@@ -419,6 +419,27 @@ def set_config(clave: str, valor: str):
         conn.commit()
 
 
+# -- Token de refresco ML: persistencia DURABLE (sobrevive a los redeploys) --
+# ML rota el refresh_token en cada uso y el proceso guardaba el nuevo SOLO en
+# os.environ (efimero en Railway) -> un redeploy arrancaba con el token original
+# ya consumido y ML dejaba de autenticar. Ahora lo persistimos en app_config.
+def get_ml_refresh_token() -> str:
+    tok = get_config("ml_refresh_token")
+    if tok:
+        return tok
+    return get_env("ML_REFRESH_TOKEN", required=False)  # fallback: primer arranque
+
+
+def set_ml_refresh_token(tok: str):
+    if not tok:
+        return
+    os.environ["ML_REFRESH_TOKEN"] = tok          # proceso actual
+    try:
+        set_config("ml_refresh_token", tok)       # durable, sobrevive redeploys
+    except Exception as e:
+        logger.error(f"No se pudo persistir ml_refresh_token: {e}")
+
+
 # =========================
 # MODELOS
 # =========================
@@ -859,7 +880,7 @@ def refresh_ml_token() -> bool:
             "grant_type": "refresh_token",
             "client_id": get_env("ML_CLIENT_ID"),
             "client_secret": get_env("ML_CLIENT_SECRET"),
-            "refresh_token": get_env("ML_REFRESH_TOKEN"),
+            "refresh_token": get_ml_refresh_token(),
         }
         res = requests.post("https://api.mercadolibre.com/oauth/token", data=payload, timeout=30)
         res.raise_for_status()
@@ -867,7 +888,7 @@ def refresh_ml_token() -> bool:
         if data.get("access_token"):
             os.environ["ML_ACCESS_TOKEN"] = data["access_token"]
         if data.get("refresh_token"):
-            os.environ["ML_REFRESH_TOKEN"] = data["refresh_token"]
+            set_ml_refresh_token(data["refresh_token"])
         if data.get("scope"):
             _ml_scope = data["scope"]
         logger.info(f"Token ML renovado (scope: {_ml_scope or 'desconocido'})")
@@ -3140,7 +3161,7 @@ async def oauth_callback(request: Request):
         if data.get("access_token"):
             os.environ["ML_ACCESS_TOKEN"] = data["access_token"]
         if data.get("refresh_token"):
-            os.environ["ML_REFRESH_TOKEN"] = data["refresh_token"]
+            set_ml_refresh_token(data["refresh_token"])
     return JSONResponse(status_code=res.status_code, content={"status_code": res.status_code, "response": data})
 
 
