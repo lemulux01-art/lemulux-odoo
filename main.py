@@ -3220,6 +3220,61 @@ def manual_refresh():
     return {"ok": refresh_ml_token()}
 
 
+@app.post("/ml/backfill-shipping")
+def backfill_shipping(dias: int = 4, limit: int = 100):
+    """Backfill puntual del estado REAL de envío (estado_envio_real) para ventas ML
+    viejas que aún no lo tienen (cargadas antes del webhook 'shipments'). SEGURO:
+    recorre SECUENCIALMENTE y cada get_ml_shipment pasa por _ml_lock (mín 500ms
+    entre requests) → NUNCA satura ML (lo contrario del barrido paralelo que dio
+    429). Acotado por `dias` (ventana) y `limit` (tope). Usa el shipping.id que ya
+    está en order_json → 1 fetch por venta, sin get_ml_order. Idempotente: solo
+    toca las que tienen estado_envio_real vacío."""
+    procesadas = 0
+    actualizadas = 0
+    sin_ship = 0
+    errores = 0
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, order_json FROM ventas
+                WHERE fuente = 'mercadolibre'
+                  AND (estado_envio_real IS NULL OR estado_envio_real = '')
+                  AND creado_en >= NOW() - make_interval(days => %s)
+                ORDER BY creado_en DESC
+                LIMIT %s
+                """,
+                (dias, limit),
+            )
+            rows = cur.fetchall()
+    for r in rows:
+        procesadas += 1
+        try:
+            oj = json.loads(r.get("order_json") or "{}")
+            sid = (oj.get("shipping") or {}).get("id")
+            if not sid:
+                sin_ship += 1
+                continue
+            sh = get_ml_shipment(sid)  # 1 fetch, throttleado por _ml_lock
+            st = (sh or {}).get("status") or ""
+            sub = (sh or {}).get("substatus") or ""
+            if st:
+                update_venta(r["id"], estado_envio_real=st, estado_envio_sub=sub)
+                actualizadas += 1
+        except Exception as e:
+            errores += 1
+            logger.warning(f"[backfill] {r.get('id')}: {e}")
+    logger.info(
+        f"[backfill] dias={dias} limit={limit} -> procesadas={procesadas} "
+        f"actualizadas={actualizadas} sin_ship={sin_ship} err={errores}"
+    )
+    return {
+        "ok": True, "dias": dias, "limit": limit,
+        "procesadas": procesadas, "actualizadas": actualizadas,
+        "sin_shipping_id": sin_ship, "errores": errores,
+    }
+
+
 @app.get("/ventas")
 def ventas(estado: Optional[str] = None):
     items = list_ventas(estado)
