@@ -194,6 +194,8 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS tipo_envio_ml TEXT DEFAULT ''",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS nc_motivo TEXT DEFAULT ''",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fuente TEXT DEFAULT 'mercadolibre'",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_envio_real TEXT DEFAULT ''",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_envio_sub TEXT DEFAULT ''",
             ]:
                 cur.execute(stmt)
             cur.execute(
@@ -364,7 +366,7 @@ def save_venta(
 
 
 def list_ventas(estado: Optional[str] = None) -> list:
-    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml, fuente"
+    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, estado_envio_real, estado_envio_sub, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml, fuente"
     with get_db() as conn:
         with conn.cursor() as cur:
             if estado:
@@ -1981,6 +1983,39 @@ def process_webhook_order(order_id: str):
         logger.error(f"[{order_id}] Error procesando webhook: {e}", exc_info=True)
 
 
+def process_webhook_shipment(shipment_id: str):
+    """Webhook ML topic 'shipments': persiste el estado REAL del envio
+    (status/substatus del shipment) en columnas aparte, SIN tocar estado_envio
+    ni la emision de boletas. PUSH, no barrido: 1 fetch del shipment (throttleado
+    por _ml_lock) por evento; resuelve la venta por order_id directo o por pack.
+    Asi la app de Lemulux ve 'shipped/delivered' sin que nadie consulte ML en masa."""
+    try:
+        shipment = get_ml_shipment(shipment_id)
+        if not shipment:
+            logger.warning(f"[ship:{shipment_id}] Shipment no encontrado en ML")
+            return
+        status = shipment.get("status") or ""
+        substatus = shipment.get("substatus") or ""
+        order_id = str(shipment.get("order_id") or "")
+        if not order_id or not status:
+            return
+        venta = get_venta(order_id)              # venta de orden simple (id=order_id)
+        if not venta:
+            order = get_ml_order(order_id)        # solo si no esta directa: resolver el pack
+            pack_id = str((order or {}).get("pack_id") or "")
+            if pack_id:
+                venta = get_venta_by_pack(pack_id)
+        if not venta:
+            logger.info(f"[ship:{shipment_id}] Sin venta local para order {order_id} (ignorado)")
+            return
+        if venta.get("estado_envio_real") == status and venta.get("estado_envio_sub") == substatus:
+            return  # sin cambios -> no escribir
+        update_venta(venta["id"], estado_envio_real=status, estado_envio_sub=substatus)
+        logger.info(f"[ship:{shipment_id}] envio real={status}/{substatus} -> venta {venta['id']}")
+    except Exception as e:
+        logger.error(f"[ship:{shipment_id}] Error procesando shipment: {e}", exc_info=True)
+
+
 def reprocesar_venta_desde_ml(order_id: str):
     venta = get_venta(order_id)
     order = get_ml_order(order_id)
@@ -2059,14 +2094,17 @@ def webhook_worker():
     global _consecutive_429
     while True:
         try:
-            order_id = webhook_queue.get(timeout=5)
+            item = webhook_queue.get(timeout=5)
             try:
-                process_webhook_order(order_id)
+                if isinstance(item, str) and item.startswith("ship:"):
+                    process_webhook_shipment(item[5:])
+                else:
+                    process_webhook_order(item)
                 base_delay = 3
                 extra = min(_consecutive_429 * 2, 30)
                 time.sleep(base_delay + extra)
             except Exception as e:
-                logger.error(f"[{order_id}] Error en webhook worker: {e}")
+                logger.error(f"[{item}] Error en webhook worker: {e}")
                 if "demasiados errores" in str(e) or "429" in str(e):
                     time.sleep(30)
                 else:
@@ -2998,17 +3036,29 @@ async def ml_webhook(request: Request):
     _ml_wh_last = datetime.utcnow().isoformat()
     _ml_wh_count += 1
     _ml_wh_last_topic = topic
-    if topic != "orders_v2" or not resource:
+    if not resource:
         return {"ok": True, "ignored": True}
-    order_id = resource.strip("/").split("/")[-1]
-    if not order_id:
+    res_id = resource.strip("/").split("/")[-1]
+    if not res_id:
         return {"ok": True}
-    if order_id not in list(webhook_queue.queue):
-        webhook_queue.put(order_id)
-        logger.info(f"Webhook ML encolado: {order_id} (cola: {webhook_queue.qsize()})")
-    else:
-        logger.info(f"Webhook ML duplicado ignorado: {order_id}")
-    return {"ok": True, "order_id": order_id, "queued": webhook_queue.qsize()}
+    if topic == "orders_v2":
+        if res_id not in list(webhook_queue.queue):
+            webhook_queue.put(res_id)
+            logger.info(f"Webhook ML encolado: {res_id} (cola: {webhook_queue.qsize()})")
+        else:
+            logger.info(f"Webhook ML duplicado ignorado: {res_id}")
+        return {"ok": True, "order_id": res_id, "queued": webhook_queue.qsize()}
+    if topic == "shipments":
+        # PUSH del estado de envio: encolar el shipment (dedup). Se procesa
+        # de a uno en el worker (throttleado). Nunca dispara barridos.
+        key = f"ship:{res_id}"
+        if key not in list(webhook_queue.queue):
+            webhook_queue.put(key)
+            logger.info(f"Webhook ML envio encolado: {res_id} (cola: {webhook_queue.qsize()})")
+        else:
+            logger.info(f"Webhook ML envio duplicado ignorado: {res_id}")
+        return {"ok": True, "shipment_id": res_id, "queued": webhook_queue.qsize()}
+    return {"ok": True, "ignored": True}
 
 
 @app.get("/ml/webhook-status")
@@ -3032,7 +3082,7 @@ def ml_webhook_status():
     return {
         "ok": True,
         "callback_esperado": "https://lemulux-odoo-production.up.railway.app/ml/webhook",
-        "topic_esperado": "orders_v2",
+        "topic_esperado": "orders_v2 + shipments",
         "recibidos_desde_arranque": _ml_wh_count,
         "ultimo_recibido_utc": _ml_wh_last,
         "ultimo_topic": _ml_wh_last_topic,
