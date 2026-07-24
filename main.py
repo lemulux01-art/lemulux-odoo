@@ -3220,6 +3220,68 @@ def manual_refresh():
     return {"ok": refresh_ml_token()}
 
 
+@app.get("/ml/debug-hoy")
+def debug_hoy(limit: int = 120):
+    """Diagnóstico SOLO LECTURA: trae las órdenes ML más recientes SIN filtrar por
+    estado (la reconciliación solo busca status=paid), y las compara con la BD.
+    Sirve para ver por qué faltan pedidos de hoy: qué estado traen, si ML las
+    devuelve, y si están o no en la base (por id o por pack)."""
+    import collections
+    seller_id = get_ml_seller_id()
+    if not seller_id:
+        return {"ok": False, "error": "sin seller_id"}
+    results = []
+    offset = 0
+    # Paginar SIN filtro de estado (todos), date_desc, hasta `limit`.
+    while len(results) < limit:
+        url = (f"https://api.mercadolibre.com/orders/search"
+               f"?seller={seller_id}&sort=date_desc&limit=50&offset={offset}")
+        try:
+            data = ml_get(url)
+        except Exception as e:
+            return {"ok": False, "error": f"orders/search fallo: {e}", "traidas": len(results)}
+        res = data.get("results") or []
+        if not res:
+            break
+        results.extend(res)
+        offset += 50
+        if len(res) < 50:
+            break
+    results = results[:limit]
+    ids = [str(o.get("id")) for o in results]
+    packs = [str(o.get("pack_id")) for o in results if o.get("pack_id")]
+    en_bd = set()
+    if ids or packs:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids + packs,))
+                en_bd = {str(r["id"]) for r in cur.fetchall()}
+    por_estado = collections.Counter(o.get("status", "") for o in results)
+    faltan = []
+    detalle = []
+    for o in results:
+        oid = str(o.get("id"))
+        pid = str(o.get("pack_id") or "")
+        esta = (oid in en_bd) or (pid and pid in en_bd)
+        row = {
+            "id": oid, "pack_id": pid or None, "status": o.get("status"),
+            "date_created": o.get("date_created"),
+            "shipping_id": (o.get("shipping") or {}).get("id"),
+            "en_bd": esta,
+        }
+        detalle.append(row)
+        if not esta:
+            faltan.append(row)
+    return {
+        "ok": True, "seller_id": seller_id, "traidas": len(results),
+        "por_estado": dict(por_estado),
+        "en_bd": sum(1 for d in detalle if d["en_bd"]),
+        "faltan": len(faltan),
+        "muestra_faltantes": faltan[:15],
+        "muestra_detalle": detalle[:8],
+    }
+
+
 @app.post("/ml/backfill-shipping")
 def backfill_shipping(dias: int = 4, limit: int = 100):
     """Backfill puntual del estado REAL de envío (estado_envio_real) para ventas ML
