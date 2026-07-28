@@ -365,14 +365,29 @@ def save_venta(
     logger.info(f"[{oid}] Guardada -> tipo={tipo_sugerido} rut={rut_final or 'sin RUT'} cliente={cliente_final}")
 
 
-def list_ventas(estado: Optional[str] = None) -> list:
+def list_ventas(estado: Optional[str] = None, ids: Optional[list] = None,
+                desde: Optional[str] = None, limit: Optional[int] = None) -> list:
+    """Lista ventas. Los filtros (ids / desde / limit) se aplican en SQL para NO
+    traer las ~6200 filas con su order_json completo (payload de ~4.6MB y mucho
+    CPU de parseo) cuando el llamador solo necesita unas pocas."""
     cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, estado_envio_real, estado_envio_sub, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml, fuente"
+    where, params = [], []
+    if estado:
+        where.append("estado = %s"); params.append(estado)
+    if ids:
+        where.append("(id = ANY(%s::text[]) OR pack_id = ANY(%s::text[]))")
+        params.extend([list(ids), list(ids)])
+    if desde:
+        where.append("creado_en >= %s"); params.append(desde)
+    sql = f"SELECT {cols} FROM ventas"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY creado_en DESC"
+    if limit:
+        sql += " LIMIT %s"; params.append(int(limit))
     with get_db() as conn:
         with conn.cursor() as cur:
-            if estado:
-                cur.execute(f"SELECT {cols} FROM ventas WHERE estado = %s ORDER BY creado_en DESC", (estado,))
-            else:
-                cur.execute(f"SELECT {cols} FROM ventas ORDER BY creado_en DESC")
+            cur.execute(sql, tuple(params))
             rows = cur.fetchall()
     return [dict(r) for r in rows]
 
@@ -3220,6 +3235,61 @@ def manual_refresh():
     return {"ok": refresh_ml_token()}
 
 
+@app.get("/ml/probe-rapido")
+def probe_rapido():
+    """Sonda SOLO LECTURA: prueba si existe una vía RÁPIDA para traer el estado de
+    envío de muchas órdenes en pocas llamadas (hoy es 1 request por shipment).
+    Prueba: (a) si orders/search ya trae shipping.status, (b) variantes con
+    x-format-new, (c) endpoints candidatos de búsqueda/multiget de shipments.
+    No modifica nada; solo reporta qué responde ML."""
+    out = {}
+    seller_id = get_ml_seller_id()
+    out["seller_id"] = seller_id
+    if not seller_id:
+        return {"ok": False, "error": "sin seller_id"}
+    # (a) orders/search normal: ¿qué trae el campo shipping de cada orden?
+    sample_order, shipping_id = None, None
+    try:
+        d = ml_get(f"https://api.mercadolibre.com/orders/search?seller={seller_id}&sort=date_desc&limit=3")
+        res = d.get("results") or []
+        if res:
+            sample_order = str(res[0].get("id"))
+            sh = res[0].get("shipping") or {}
+            shipping_id = sh.get("id")
+            out["a_orders_search_shipping_keys"] = sorted(sh.keys())
+            out["a_trae_status"] = "status" in sh
+            out["a_shipping_sample"] = {k: sh.get(k) for k in list(sh.keys())[:12]}
+    except Exception as e:
+        out["a_error"] = str(e)
+    # (b) orders/search con x-format-new: ¿enriquece el shipping?
+    try:
+        d = ml_get(f"https://api.mercadolibre.com/orders/search?seller={seller_id}&sort=date_desc&limit=3",
+                   {"x-format-new": "true"})
+        res = d.get("results") or []
+        if res:
+            sh = res[0].get("shipping") or {}
+            out["b_newformat_shipping_keys"] = sorted(sh.keys())
+            out["b_trae_status"] = "status" in sh
+    except Exception as e:
+        out["b_error"] = str(e)
+    # (c) candidatos de búsqueda/multiget de shipments (esperado: 404/400 si no existen)
+    cands = []
+    if shipping_id:
+        cands.append(("multiget_shipments", f"https://api.mercadolibre.com/multiget/shipments?ids={shipping_id}"))
+        cands.append(("shipments_ids", f"https://api.mercadolibre.com/shipments?ids={shipping_id}"))
+    cands.append(("shipments_search_seller", f"https://api.mercadolibre.com/shipments/search?seller_id={seller_id}&limit=5"))
+    if sample_order:
+        cands.append(("orders_shipments", f"https://api.mercadolibre.com/orders/{sample_order}/shipments"))
+    for nombre, url in cands:
+        try:
+            r = ml_get(url)
+            out[f"c_{nombre}"] = {"ok": True, "tipo": type(r).__name__,
+                                 "claves": sorted(r.keys())[:12] if isinstance(r, dict) else f"lista[{len(r)}]"}
+        except Exception as e:
+            out[f"c_{nombre}"] = {"ok": False, "error": str(e)[:160]}
+    return {"ok": True, **out}
+
+
 @app.get("/ml/debug-hoy")
 def debug_hoy(limit: int = 120):
     """Diagnóstico SOLO LECTURA: trae las órdenes ML más recientes SIN filtrar por
@@ -3338,9 +3408,31 @@ def backfill_shipping(dias: int = 4, limit: int = 100):
 
 
 @app.get("/ventas")
-def ventas(estado: Optional[str] = None):
-    items = list_ventas(estado)
+def ventas(estado: Optional[str] = None, ids: Optional[str] = None,
+           desde: Optional[str] = None, limit: Optional[int] = None,
+           light: Optional[int] = 0):
+    """Lista de ventas. Sin parámetros devuelve TODO (compatibilidad).
+    Filtros para no pagar los ~4.6MB cuando no hace falta:
+      ?ids=1,2,3     -> solo esas ventas (por id o pack_id)
+      ?desde=2026-07-20 -> creadas desde esa fecha
+      ?limit=200     -> tope de filas
+      ?light=1       -> omite 'productos' (no parsea order_json; mucho más rápido)"""
+    id_list = [s.strip() for s in ids.split(",") if s.strip()] if ids else None
+    items = list_ventas(estado, ids=id_list, desde=desde, limit=limit)
     enriched = []
+    if light:
+        # Camino liviano: sin parsear order_json (lo pesado). Solo campos de la fila.
+        for v in items:
+            oj = v.pop("order_json", None)
+            v.pop("billing_json", None)
+            on = ""
+            if oj:
+                try:
+                    on = (json.loads(oj) or {}).get("order_number") or ""
+                except Exception:
+                    on = ""
+            enriched.append({**v, "tipo_envio": v.get("tipo_envio_ml") or "-", "order_number": on})
+        return {"items": enriched}
     for v in items:
         order_number = ""
         try:
