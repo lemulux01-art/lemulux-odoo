@@ -3235,6 +3235,53 @@ def manual_refresh():
     return {"ok": refresh_ml_token()}
 
 
+@app.get("/ml/probe-sla/{oid}")
+def probe_sla(oid: str):
+    """Sonda SOLO LECTURA: busca DÓNDE trae ML la fecha/hora LÍMITE DE DESPACHO
+    (lo que va impreso en la etiqueta) para armar el calendario de despachos.
+    Prueba /shipments/{id} con x-format-new, /sla y /lead_time."""
+    venta = get_venta(oid)
+    if not venta:
+        return {"ok": False, "error": "venta no encontrada"}
+    try:
+        oj = json.loads(venta.get("order_json") or "{}")
+    except Exception:
+        oj = {}
+    sid = (oj.get("shipping") or {}).get("id")
+    if not sid:
+        return {"ok": False, "error": "sin shipping id en order_json"}
+    out = {"shipping_id": sid, "tipo_envio_ml": venta.get("tipo_envio_ml"),
+           "estado_real": venta.get("estado_envio_real")}
+
+    def resumen(d):
+        """Devuelve claves + cualquier campo que huela a fecha límite."""
+        if not isinstance(d, dict):
+            return {"tipo": type(d).__name__, "valor": str(d)[:200]}
+        r = {"claves": sorted(d.keys())[:40]}
+        for k, v in d.items():
+            if any(w in k.lower() for w in ("handling", "limit", "sla", "dispatch", "schedule", "promise", "expected")):
+                r[k] = json.dumps(v, ensure_ascii=False)[:250]
+        return r
+
+    # (a) shipment con formato nuevo
+    try:
+        out["a_shipment_newformat"] = resumen(
+            ml_get(f"https://api.mercadolibre.com/shipments/{sid}", {"x-format-new": "true"}))
+    except Exception as e:
+        out["a_shipment_newformat"] = {"error": str(e)[:200]}
+    # (b) SLA del envío
+    try:
+        out["b_sla"] = resumen(ml_get(f"https://api.mercadolibre.com/shipments/{sid}/sla"))
+    except Exception as e:
+        out["b_sla"] = {"error": str(e)[:200]}
+    # (c) lead_time del envío (suele traer estimated_handling_limit)
+    try:
+        out["c_lead_time"] = resumen(ml_get(f"https://api.mercadolibre.com/shipments/{sid}/lead_time"))
+    except Exception as e:
+        out["c_lead_time"] = {"error": str(e)[:200]}
+    return {"ok": True, **out}
+
+
 @app.get("/ml/probe-rapido")
 def probe_rapido():
     """Sonda SOLO LECTURA: prueba si existe una vía RÁPIDA para traer el estado de
