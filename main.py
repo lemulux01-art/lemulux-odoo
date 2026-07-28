@@ -196,6 +196,9 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fuente TEXT DEFAULT 'mercadolibre'",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_envio_real TEXT DEFAULT ''",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS estado_envio_sub TEXT DEFAULT ''",
+                # Fecha/hora LÍMITE de despacho segun ML (/shipments/{id}/sla -> expected_date).
+                # Es la que va impresa en la etiqueta; cambia por tipo (Flex vs Colecta).
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fecha_despacho TEXT DEFAULT ''",
             ]:
                 cur.execute(stmt)
             cur.execute(
@@ -370,7 +373,7 @@ def list_ventas(estado: Optional[str] = None, ids: Optional[list] = None,
     """Lista ventas. Los filtros (ids / desde / limit) se aplican en SQL para NO
     traer las ~6200 filas con su order_json completo (payload de ~4.6MB y mucho
     CPU de parseo) cuando el llamador solo necesita unas pocas."""
-    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, estado_envio_real, estado_envio_sub, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml, fuente"
+    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, estado_envio_real, estado_envio_sub, fecha_despacho, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml, fuente"
     where, params = [], []
     if estado:
         where.append("estado = %s"); params.append(estado)
@@ -983,6 +986,20 @@ def get_ml_shipment(shipping_id) -> dict:
         return ml_get(f"https://api.mercadolibre.com/shipments/{shipping_id}")
     except Exception:
         return {}
+
+
+def get_ml_shipment_sla(shipping_id) -> str:
+    """Fecha/hora LÍMITE de despacho que fija ML (la impresa en la etiqueta).
+    Sale de /shipments/{id}/sla -> expected_date (ISO con tz). Verificado:
+    Colecta ~23:59:59 y Flex ~23:00 del día que corresponda, o sea la hora la
+    pone ML por tipo de envío (no hay que preestablecerla). '' si no hay dato."""
+    if not shipping_id:
+        return ""
+    try:
+        d = ml_get(f"https://api.mercadolibre.com/shipments/{shipping_id}/sla")
+        return str((d or {}).get("expected_date") or "")
+    except Exception:
+        return ""
 
 
 def get_ml_shipment_info(order: dict) -> tuple:
@@ -2023,10 +2040,23 @@ def process_webhook_shipment(shipment_id: str):
         if not venta:
             logger.info(f"[ship:{shipment_id}] Sin venta local para order {order_id} (ignorado)")
             return
-        if venta.get("estado_envio_real") == status and venta.get("estado_envio_sub") == substatus:
-            return  # sin cambios -> no escribir
-        update_venta(venta["id"], estado_envio_real=status, estado_envio_sub=substatus)
-        logger.info(f"[ship:{shipment_id}] envio real={status}/{substatus} -> venta {venta['id']}")
+        sin_cambio = (venta.get("estado_envio_real") == status
+                      and venta.get("estado_envio_sub") == substatus)
+        # Fecha límite de despacho (calendario): se pide UNA sola vez, cuando aún no
+        # la tenemos → 1 request extra a ML solo la primera vez de cada pedido.
+        campos = {}
+        if not venta.get("fecha_despacho"):
+            sla = get_ml_shipment_sla(shipment_id)
+            if sla:
+                campos["fecha_despacho"] = sla
+        if sin_cambio and not campos:
+            return  # nada que escribir
+        if not sin_cambio:
+            campos["estado_envio_real"] = status
+            campos["estado_envio_sub"] = substatus
+        update_venta(venta["id"], **campos)
+        logger.info(f"[ship:{shipment_id}] envio real={status}/{substatus} "
+                    f"despacho={campos.get('fecha_despacho','(ya tenia)')} -> venta {venta['id']}")
     except Exception as e:
         logger.error(f"[ship:{shipment_id}] Error procesando shipment: {e}", exc_info=True)
 
@@ -3397,6 +3427,53 @@ def debug_hoy(limit: int = 120):
         "muestra_faltantes": faltan[:15],
         "muestra_detalle": detalle[:8],
     }
+
+
+@app.post("/ml/backfill-sla")
+def backfill_sla(dias: int = 10, limit: int = 30, solo_activos: int = 1):
+    """Backfill de `fecha_despacho` (límite de despacho de ML) para ventas ML que
+    aún no lo tienen. SEGURO: SECUENCIAL, cada llamada pasa por _ml_lock (≥500ms).
+    Por defecto solo toca los ACTIVOS (estado_envio_real ready_to_ship/pending/
+    handling), que son los que importan para el calendario — no los ya entregados.
+    Idempotente: solo rellena los vacíos."""
+    procesadas = actualizadas = sin_ship = errores = 0
+    cond_activos = ""
+    if solo_activos:
+        cond_activos = " AND COALESCE(estado_envio_real,'') IN ('ready_to_ship','pending','handling') "
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, order_json FROM ventas
+                WHERE fuente = 'mercadolibre'
+                  AND COALESCE(fecha_despacho,'') = ''
+                  {cond_activos}
+                  AND creado_en >= NOW() - make_interval(days => %s)
+                ORDER BY creado_en DESC
+                LIMIT %s
+                """,
+                (dias, limit),
+            )
+            rows = cur.fetchall()
+    for r in rows:
+        procesadas += 1
+        try:
+            oj = json.loads(r.get("order_json") or "{}")
+            sid = (oj.get("shipping") or {}).get("id")
+            if not sid:
+                sin_ship += 1
+                continue
+            sla = get_ml_shipment_sla(sid)   # 1 request, throttleado
+            if sla:
+                update_venta(r["id"], fecha_despacho=sla)
+                actualizadas += 1
+        except Exception as e:
+            errores += 1
+            logger.warning(f"[backfill-sla] {r.get('id')}: {e}")
+    logger.info(f"[backfill-sla] dias={dias} limit={limit} -> proc={procesadas} act={actualizadas} err={errores}")
+    return {"ok": True, "dias": dias, "limit": limit, "solo_activos": bool(solo_activos),
+            "procesadas": procesadas, "actualizadas": actualizadas,
+            "sin_shipping_id": sin_ship, "errores": errores}
 
 
 @app.post("/ml/backfill-shipping")
