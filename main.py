@@ -1534,10 +1534,34 @@ def subir_comprobante_ml(pack_id: str, pdf_bytes: bytes, oid: str) -> dict:
         raise Exception(f"El PDF pesa {len(pdf_bytes)} bytes (> 1MB); ML no lo acepta")
     api_url = f"https://api.mercadolibre.com/packs/{pack_id}/fiscal_documents"
     files = {"fiscal_document": (f"comprobante_{oid}.pdf", pdf_bytes, "application/pdf")}
-    res = requests.post(api_url, headers=ml_headers(), files=files, timeout=120)
-    if res.status_code == 401:
-        refresh_ml_token()
-        res = requests.post(api_url, headers=ml_headers(), files=files, timeout=120)
+    # Esta subida ANTES iba con requests.post directo: no respetaba el freno de
+    # _ml_lock ni reintentaba ante 429, asi que fallaba apenas ML estaba ocupado.
+    # Ahora pasa por el mismo candado global y reintenta con espera creciente.
+    global _consecutive_429, _ml_last_request
+    res = None
+    with _ml_lock:
+        for intento in range(5):
+            elapsed = time.time() - _ml_last_request
+            min_gap = 0.5 + min(_consecutive_429 * 0.5, 5.0)
+            if elapsed < min_gap:
+                time.sleep(min_gap - elapsed)
+            res = requests.post(api_url, headers=ml_headers(), files=files, timeout=120)
+            _ml_last_request = time.time()
+            if res.status_code == 401:
+                refresh_ml_token()
+                continue
+            if res.status_code == 429:
+                _consecutive_429 += 1
+                espera = min(10 * (intento + 1) + (_consecutive_429 * 3), 90)
+                logger.warning(f"[{oid}] 429 subiendo PDF a ML, reintento en {espera}s "
+                               f"(intento {intento + 1}/5)")
+                time.sleep(espera)
+                continue
+            _consecutive_429 = 0
+            break
+    if res is not None and res.status_code == 429:
+        raise Exception("Mercado Libre esta limitando las peticiones (429). "
+                        "El DTE ya se emitio; reintenta la carga del PDF en unos minutos.")
     # 409 = el pack YA tiene un comprobante cargado -> idempotente, lo tratamos como OK.
     if res.status_code == 409:
         logger.info(f"[{oid}] ML 409 en pack {pack_id}: el comprobante YA estaba cargado (ok idempotente)")
