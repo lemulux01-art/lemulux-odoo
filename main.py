@@ -204,6 +204,13 @@ def init_db():
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS app_config (clave TEXT PRIMARY KEY, valor TEXT)"
             )
+            # Cache de miniaturas por publicacion de ML (item_id -> url).
+            # Se resuelve UNA vez por producto y queda guardado: el catalogo se
+            # repite en las ventas, asi que despues casi no se llama a ML.
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS producto_img ("
+                " item_id TEXT PRIMARY KEY, url TEXT, titulo TEXT, actualizado TEXT)"
+            )
         conn.commit()
     logger.info("Tabla ventas verificada en PostgreSQL")
 
@@ -3263,6 +3270,72 @@ async def oauth_callback(request: Request):
 @app.post("/ml/refresh-token")
 def manual_refresh():
     return {"ok": refresh_ml_token()}
+
+
+@app.get("/ml/imagenes")
+def ml_imagenes(ids: str = "", refrescar: int = 0):
+    """Miniaturas de productos por id de publicacion ML (para que el armador vea
+    la foto). ECONOMICO: primero la cache local (tabla producto_img), y solo las
+    que faltan se piden a ML con MULTIGET (/items?ids=, hasta 20 por llamada).
+    Como el catalogo se repite en las ventas, tras la carga inicial casi no hay
+    llamadas. Las URLs devueltas son del CDN publico de ML: el navegador las
+    carga directo, sin volver a pasar por la API."""
+    pedidos = [s.strip() for s in (ids or "").split(",") if s.strip()][:120]
+    if not pedidos:
+        return {"ok": True, "imagenes": {}}
+    out, faltan = {}, []
+    if not refrescar:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT item_id, url FROM producto_img WHERE item_id = ANY(%s::text[])",
+                            (pedidos,))
+                for r in cur.fetchall():
+                    if r["url"]:
+                        out[str(r["item_id"])] = r["url"]
+    faltan = [i for i in pedidos if i not in out]
+    desde_ml = 0
+    for i in range(0, len(faltan), 20):          # multiget: 20 por llamada
+        lote = faltan[i:i + 20]
+        datos = []
+        try:
+            r = ml_get("https://api.mercadolibre.com/items?ids=" + ",".join(lote) +
+                       "&attributes=id,title,secure_thumbnail,thumbnail")
+            datos = r if isinstance(r, list) else (r.get("body") or [])
+        except Exception as e:
+            logger.warning(f"[imagenes] multiget fallo ({e}); voy uno por uno")
+            datos = []
+            for it in lote:                       # respaldo: individual
+                try:
+                    b = ml_get(f"https://api.mercadolibre.com/items/{it}"
+                               "?attributes=id,title,secure_thumbnail,thumbnail")
+                    datos.append({"code": 200, "body": b})
+                except Exception:
+                    pass
+        for d in datos:
+            b = d.get("body") if isinstance(d, dict) and "body" in d else d
+            if not isinstance(b, dict):
+                continue
+            iid = str(b.get("id") or "")
+            url = b.get("secure_thumbnail") or b.get("thumbnail") or ""
+            if not iid or not url:
+                continue
+            # La miniatura chica (-I.jpg) se ve borrosa; -O es mas grande y nitida.
+            url = url.replace("-I.jpg", "-O.jpg").replace("http://", "https://")
+            out[iid] = url
+            desde_ml += 1
+            try:
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO producto_img (item_id, url, titulo, actualizado)"
+                            " VALUES (%s,%s,%s,%s) ON CONFLICT (item_id) DO UPDATE"
+                            " SET url=EXCLUDED.url, titulo=EXCLUDED.titulo, actualizado=EXCLUDED.actualizado",
+                            (iid, url, str(b.get("title") or "")[:300], datetime.utcnow().isoformat()))
+                    conn.commit()
+            except Exception as e:
+                logger.warning(f"[imagenes] no se pudo cachear {iid}: {e}")
+    return {"ok": True, "pedidas": len(pedidos), "desde_cache": len(pedidos) - len(faltan),
+            "desde_ml": desde_ml, "imagenes": out}
 
 
 @app.get("/ml/probe-sla/{oid}")
