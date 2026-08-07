@@ -2373,6 +2373,17 @@ def wc_webhook_worker():
             continue
 
 
+# El hosting de lemulux.com (Bluehost) intercala un desafio anti-bot: responde 409 con
+# un <script> que setea la cookie humans_NNNNN y recarga. Un navegador lo resuelve solo;
+# un cliente HTTP no. Viene por rachas de varios minutos y afecta a todas las rutas del
+# sitio, asi que no es filtro por IP ni por credencial: hay que reintentar y esperar.
+WC_ANTIBOT_ESPERAS = [5, 10, 20, 30]
+
+
+def _wc_es_antibot(res) -> bool:
+    return res.status_code == 409 and "humans_" in res.text
+
+
 def wc_get(path: str) -> dict:
     url = get_env("WC_URL", required=False, default="").rstrip("/") + "/wp-json/wc/v3/" + path.lstrip("/")
     key    = get_env("WC_CONSUMER_KEY", required=False, default="")
@@ -2380,11 +2391,25 @@ def wc_get(path: str) -> dict:
     if not key or not secret:
         raise Exception("WC_CONSUMER_KEY o WC_CONSUMER_SECRET no configurados")
     try:
-        res = requests.get(url, auth=(key, secret), timeout=30)
-        if res.status_code == 404:
-            return {}
-        res.raise_for_status()
-        return res.json()
+        for intento, espera in enumerate(WC_ANTIBOT_ESPERAS + [None]):
+            res = requests.get(url, auth=(key, secret), timeout=30)
+
+            if _wc_es_antibot(res):
+                if espera is None:
+                    raise Exception(
+                        "WooCommerce bloqueado por el anti-bot del hosting (409) tras "
+                        f"{len(WC_ANTIBOT_ESPERAS) + 1} intentos. Si se repite, pedir a Bluehost "
+                        "que excluya /wp-json/ del bloqueador."
+                    )
+                logger.warning(f"[WC] 409 anti-bot en {path}, reintento "
+                               f"{intento + 1}/{len(WC_ANTIBOT_ESPERAS)} en {espera}s")
+                time.sleep(espera)
+                continue
+
+            if res.status_code == 404:
+                return {}
+            res.raise_for_status()
+            return res.json()
     except Exception as e:
         logger.error(f"[WC] Error GET {path}: {e}")
         raise
