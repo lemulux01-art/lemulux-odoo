@@ -199,6 +199,9 @@ def init_db():
                 # Fecha/hora LÍMITE de despacho segun ML (/shipments/{id}/sla -> expected_date).
                 # Es la que va impresa en la etiqueta; cambia por tipo (Flex vs Colecta).
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fecha_despacho TEXT DEFAULT ''",
+                # Marca manual: excluye la venta de la NC AUTOMATICA (se decidio no acreditarla
+                # o se resuelve a mano). El boton N/C manual la sigue permitiendo.
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS nc_auto_excluida BOOLEAN DEFAULT FALSE",
             ]:
                 cur.execute(stmt)
             cur.execute(
@@ -1974,6 +1977,9 @@ def auto_nota_credito_si_cancelado(venta: dict, ml_status: str):
         return
     if venta.get("estado") != "enviado":
         return
+    if venta.get("nc_auto_excluida"):
+        logger.info(f"[{venta.get('id')}] Excluida de la NC automatica (marca manual); se omite")
+        return
     try:
         nc_id = _crear_nota_credito(venta, "Anulacion automatica (cancelada en Mercado Libre)")
         logger.info(f"[{venta.get('id')}] NC automatica por cancelacion ML: nc_move_id={nc_id}")
@@ -3735,6 +3741,28 @@ def ventas(estado: Optional[str] = None, ids: Optional[str] = None,
     return {"items": enriched}
 
 
+class NcExcluirPayload(BaseModel):
+    ids: list
+    excluir: bool = True
+
+
+@app.post("/ventas/nc-excluir")
+def ventas_nc_excluir(payload: NcExcluirPayload):
+    """Marca (o desmarca) ventas para que la NC AUTOMATICA no las toque. Sirve para prender el
+    automatico sin que salga a acreditar el backlog historico. El boton N/C manual sigue disponible."""
+    ids = [str(i).strip() for i in (payload.ids or []) if str(i).strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="Sin ids")
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE ventas SET nc_auto_excluida = %s WHERE id = ANY(%s::text[])",
+                        (bool(payload.excluir), ids))
+            n = cur.rowcount
+        conn.commit()
+    logger.info(f"NC automatica: {n} ventas marcadas excluida={payload.excluir}")
+    return {"ok": True, "actualizadas": n, "excluir": bool(payload.excluir)}
+
+
 class VentaManualPayload(BaseModel):
     tipo: str = "Boleta"
     order_id: Optional[str] = None
@@ -5120,6 +5148,9 @@ def auto_nota_credito_si_reversion_fl(venta: dict, tipo_rev: str):
         return  # ya tiene NC
     if venta.get("estado") != "enviado":
         return  # sin DTE emitido no hay nada que reversar
+    if venta.get("nc_auto_excluida"):
+        logger.info(f"[{venta.get('id')}] Excluida de la NC automatica (marca manual); se omite")
+        return
     motivo = ("Anulacion automatica Falabella (devolucion del comprador)"
               if tipo_rev == "returned" else
               "Anulacion automatica Falabella (orden cancelada)")
