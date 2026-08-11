@@ -1117,6 +1117,18 @@ def get_move_fields(ctx: OdooCtx) -> set:
     return set(fields.keys())
 
 
+def _odoo_id(val) -> Optional[int]:
+    """Odoo devuelve los many2one como [id, nombre] al leer. Extrae el id (None si viene vacio)."""
+    if isinstance(val, (list, tuple)):
+        return int(val[0]) if val else None
+    if isinstance(val, bool) or val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_journal(ctx: OdooCtx, tipo: str) -> Optional[int]:
     if tipo == "Factura":
         return ODOO_JOURNAL_FACTURA_ID
@@ -1776,7 +1788,7 @@ def _crear_nota_credito(venta: dict, motivo: str) -> Optional[int]:
     if not move_id:
         raise Exception("La venta no tiene documento en Odoo")
     ctx = odoo_connect()
-    moves = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "name"]})
+    moves = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "name", "journal_id"]})
     if not moves:
         raise Exception(f"Documento {move_id} no encontrado en Odoo")
     move = moves[0]
@@ -1789,8 +1801,13 @@ def _crear_nota_credito(venta: dict, motivo: str) -> Optional[int]:
         "move_ids": [(6, 0, [move_id])],
         "date": date.today().isoformat(),
         "reason": motivo,
-        "journal_id": False,
     }
+    # OJO: en Odoo 19 journal_id del wizard es OBLIGATORIO y se calcula desde move_ids;
+    # mandar False lo dejaba vacio y la creacion fallaba ("Missing required value ... Journal").
+    # Se usa el MISMO diario del documento original (es donde viven los folios CAF de la NC).
+    _jid = _odoo_id(move.get("journal_id"))
+    if _jid:
+        reversal_vals["journal_id"] = _jid
     if "refund_method" in reversal_fields:
         reversal_vals["refund_method"] = "cancel"
     elif "refund_type" in reversal_fields:
@@ -1855,7 +1872,7 @@ def _crear_nota_credito_parcial(venta: dict, creditos: list, motivo: str) -> int
     if not creditos:
         raise Exception("No se indicaron items a acreditar")
     ctx = odoo_connect()
-    mv = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "name"]})
+    mv = odoo_exec(ctx, "account.move", "read", [[move_id]], {"fields": ["state", "name", "journal_id"]})
     if not mv:
         raise Exception(f"Documento {move_id} no encontrado en Odoo")
     if mv[0]["state"] != "posted":
@@ -1873,8 +1890,11 @@ def _crear_nota_credito_parcial(venta: dict, creditos: list, motivo: str) -> int
         "move_ids": [(6, 0, [move_id])],
         "date": date.today().isoformat(),
         "reason": motivo,
-        "journal_id": False,
     }
+    # Mismo diario del documento original (en Odoo 19 el wizard lo exige; ver _crear_nota_credito).
+    _jid = _odoo_id(mv[0].get("journal_id"))
+    if _jid:
+        reversal_vals["journal_id"] = _jid
     # 'refund' crea la NC en BORRADOR (copia total) para poder recortarla; 'cancel' reversa todo.
     if "refund_method" in reversal_fields:
         reversal_vals["refund_method"] = "refund"
@@ -1929,6 +1949,19 @@ def _crear_nota_credito_parcial(venta: dict, creditos: list, motivo: str) -> int
     return nc_id
 
 
+def _registrar_error_nc(oid: str, e: Exception):
+    """Deja el motivo del fallo de la NC AUTOMATICA en la venta (nc_motivo) para que no quede
+    solo en el log: la venta sigue 'enviado' y el error se ve en el dashboard."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE ventas SET nc_motivo=%s WHERE id=%s",
+                            (f"Error NC automatica: {str(e)[:400]}", oid))
+            conn.commit()
+    except Exception as e2:
+        logger.error(f"[{oid}] No se pudo registrar el error de NC: {e2}")
+
+
 def auto_nota_credito_si_cancelado(venta: dict, ml_status: str):
     """Si una orden ML pasa a 'cancelled' y ya tenia documento emitido, crea la NC sola.
     Solo aplica a Mercado Libre. Respeta el interruptor NC_AUTO[ml][total]. Nunca propaga la excepcion."""
@@ -1946,6 +1979,7 @@ def auto_nota_credito_si_cancelado(venta: dict, ml_status: str):
         logger.info(f"[{venta.get('id')}] NC automatica por cancelacion ML: nc_move_id={nc_id}")
     except Exception as e:
         logger.error(f"[{venta.get('id')}] Error en NC automatica: {e}", exc_info=True)
+        _registrar_error_nc(venta.get("id"), e)
 
 
 # =========================
@@ -5094,6 +5128,7 @@ def auto_nota_credito_si_reversion_fl(venta: dict, tipo_rev: str):
         logger.info(f"[{venta.get('id')}] NC automatica Falabella ({tipo_rev}): nc_move_id={nc_id}")
     except Exception as e:
         logger.error(f"[{venta.get('id')}] Error en NC automatica Falabella: {e}", exc_info=True)
+        _registrar_error_nc(venta.get("id"), e)
 
 
 def _fl_devueltos_de_items(items: list) -> dict:
