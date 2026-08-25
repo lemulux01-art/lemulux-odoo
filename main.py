@@ -5089,19 +5089,51 @@ def fl_extract_envio(items_raw: list, order: dict) -> float:
 
 
 def fl_build_order_items(items: list, order: dict) -> list:
-    """Convierte items de Falabella al formato interno order_items."""
-    # Agrupar por nombre/SKU para consolidar cantidades
+    """Convierte items de Falabella al formato interno order_items.
+
+    Se guarda el SKU en `seller_sku`, el mismo campo que usa Mercado Libre. Los
+    items de Falabella SI traen el SKU de Lemulux (campo `Sku`, ej. 1233581515),
+    pero antes se descartaba: en la app de pedidos el item llegaba solo con el
+    titulo, sin forma de identificar el producto ni de mostrar su foto.
+    """
     grouped = {}
     for it in items:
         name  = str(it.get("Name") or it.get("SellerSku") or "Producto FL").strip()
+        sku   = str(it.get("Sku") or it.get("SellerSku") or it.get("ShopSku") or "").strip()
         price = float(it.get("ItemPrice") or it.get("PaidPrice") or 0)
         qty   = float(it.get("Quantity") or it.get("QtyOrdered") or 1)
-        key   = name
+        # Se agrupa por nombre+SKU: dos lineas con el mismo titulo pero distinto
+        # SKU son productos distintos (una variante de color, por ejemplo) y
+        # juntarlas haria armar el pedido equivocado.
+        key = (name, sku)
         if key in grouped:
             grouped[key]["quantity"] += qty
         else:
-            grouped[key] = {"item": {"title": name}, "quantity": qty, "unit_price": price}
+            grouped[key] = {"item": {"title": name, "seller_sku": sku},
+                            "quantity": qty, "unit_price": price}
     return list(grouped.values())
+
+
+def fl_promised_shipping(order: dict, items: list = None) -> str:
+    """Limite de despacho que fija Falabella (`PromisedShippingTime`).
+
+    Es el MISMO dato que muestra Seller Center como "Limite de despacho" y el
+    equivalente al SLA de Mercado Libre. Sin el, en la app de pedidos las ordenes
+    de Falabella quedaban sin fecha y no habia con que separar las de hoy de las
+    atrasadas: se mostraban todas juntas como trabajo del dia.
+
+    Viene tanto en la orden como en cada item; se toma el mas temprano, que es el
+    que de verdad aprieta.
+    """
+    fechas = []
+    val = str((order or {}).get("PromisedShippingTime") or "").strip()
+    if val:
+        fechas.append(val)
+    for it in (items or []):
+        v = str((it or {}).get("PromisedShippingTime") or "").strip()
+        if v:
+            fechas.append(v)
+    return min(fechas) if fechas else ""
 
 
 def _fl_estados_reversion() -> set:
@@ -5351,8 +5383,10 @@ def process_fl_order(order_id: str, order_data: dict = None):
                     """
                     INSERT INTO ventas
                         (id, pack_id, cliente, rut, email, giro, direccion, ciudad, region,
-                         tipo_sugerido, estado, estado_envio, order_json, billing_json, fuente)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, 'falabella')
+                         tipo_sugerido, estado, estado_envio, order_json, billing_json, fuente,
+                         fecha_despacho)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pendiente', %s, %s, %s, 'falabella',
+                            %s)
                     ON CONFLICT (id) DO NOTHING
                     """,
                     (
@@ -5367,6 +5401,8 @@ def process_fl_order(order_id: str, order_data: dict = None):
                         tipo, status_val,
                         json.dumps(fake_order, ensure_ascii=False),
                         json.dumps(billing, ensure_ascii=False),
+                        # Limite de despacho de Falabella: el equivalente al SLA de ML.
+                        fl_promised_shipping(order, items_raw),
                     ),
                 )
             conn.commit()
@@ -5448,6 +5484,11 @@ def fl_reingesta_datos(oid: str) -> dict:
         region=(region or "").strip(),
         order_json=json.dumps(fake_order, ensure_ascii=False),
         billing_json=json.dumps(billing, ensure_ascii=False),
+        # Las ordenes ingresadas antes de que se guardara este dato quedaron sin
+        # fecha; reprocesarlas las completa. Si Falabella no la entrega se manda
+        # lo que ya habia, para no borrar un valor bueno con uno vacio.
+        fecha_despacho=(fl_promised_shipping(order, items_raw)
+                        or venta.get("fecha_despacho") or ""),
     )
 
     tel_partner = False
