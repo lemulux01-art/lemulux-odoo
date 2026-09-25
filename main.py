@@ -202,6 +202,13 @@ def init_db():
                 # Marca manual: excluye la venta de la NC AUTOMATICA (se decidio no acreditarla
                 # o se resuelve a mano). El boton N/C manual la sigue permitiendo.
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS nc_auto_excluida BOOLEAN DEFAULT FALSE",
+                # Resultado de la subida del PDF a Falabella (SetInvoicePDF). Antes solo quedaba
+                # en el log (Railway guarda ~1 dia) y los fallos eran invisibles.
+                # fl_pdf_estado: '' (nunca intentado) | pendiente | ok | ya_cargado | error
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_estado TEXT DEFAULT ''",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_error TEXT DEFAULT ''",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_en TIMESTAMP",
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_intentos INTEGER DEFAULT 0",
             ]:
                 cur.execute(stmt)
             cur.execute(
@@ -383,7 +390,7 @@ def list_ventas(estado: Optional[str] = None, ids: Optional[list] = None,
     """Lista ventas. Los filtros (ids / desde / limit) se aplican en SQL para NO
     traer las ~6200 filas con su order_json completo (payload de ~4.6MB y mucho
     CPU de parseo) cuando el llamador solo necesita unas pocas."""
-    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, estado_envio_real, estado_envio_sub, fecha_despacho, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml, fuente"
+    cols = "id, cliente, rut, email, giro, direccion, ciudad, region, tipo_sugerido, estado, estado_envio, estado_envio_real, estado_envio_sub, fecha_despacho, pack_id, move_id, partner_id, error, creado_en, enviado_en, order_json, tipo_envio_ml, fuente, fl_pdf_estado, fl_pdf_error, fl_pdf_en, fl_pdf_intentos"
     where, params = [], []
     if estado:
         where.append("estado = %s"); params.append(estado)
@@ -1628,7 +1635,7 @@ def ejecutar_post_emision(move_id: int, fuente: str, oid: str):
             logger.error(f"[{oid}] Post-emision 'adjuntar_ml' fallo: {e}", exc_info=True)
     if cfg.get("adjuntar_fl") == "on":
         try:
-            adjuntar_comprobante_fl(oid, move_id)
+            adjuntar_fl_registrado(oid, move_id)
         except Exception as e:
             logger.error(f"[{oid}] Post-emision 'adjuntar_fl' fallo: {e}", exc_info=True)
 
@@ -2771,6 +2778,9 @@ async def on_startup():
     logger.info("Worker de cola Falabella iniciado")
     fr = threading.Thread(target=reconciliar_fl_ordenes, daemon=True)
     fr.start()
+    fp = threading.Thread(target=reintentar_pdf_fl, daemon=True)
+    fp.start()
+    logger.info(f"Reintento de PDF Falabella iniciado (cada {os.getenv('FL_PDF_RETRY_MIN', '30')} min)")
     logger.info(f"Reconciliador Falabella iniciado (cada {os.getenv('FL_RECON_INTERVAL_MIN', '15')} min, hasta {os.getenv('FL_RECON_MAX', '50')} por ciclo)")
     # Cargar overrides persistidos del interruptor (los env vars son solo el default inicial).
     # Migracion: si existen las claves globales viejas, se aplican como default a todos los canales...
@@ -4218,6 +4228,24 @@ def adjuntar_ml_manual(oid: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class FlPdfMarcarPayload(BaseModel):
+    ids: list
+    estado: str = "ok"
+
+
+@app.post("/fl/pdf/marcar")
+def fl_pdf_marcar(payload: FlPdfMarcarPayload):
+    """Marca el estado del PDF Falabella sin subir nada (ej. ventas que ya se subieron antes
+    de que existiera el registro). estado: ok | ya_cargado | error | pendiente | ''"""
+    estado = (payload.estado or "").strip()
+    if estado not in ("ok", "ya_cargado", "error", "pendiente", ""):
+        raise HTTPException(status_code=400, detail="estado invalido")
+    ids = [str(i) for i in (payload.ids or [])]
+    for oid in ids:
+        _fl_pdf_registrar(oid, estado, "", contar=False)
+    return {"ok": True, "marcadas": len(ids), "estado": estado}
+
+
 @app.post("/ventas/{oid}/adjuntar-fl")
 def adjuntar_fl_manual(oid: str):
     """Test manual en 1 orden Falabella: si no esta emitida la EMITE (crea boleta/factura
@@ -4238,7 +4266,7 @@ def adjuntar_fl_manual(oid: str):
             manejar_error_emision(oid, venta.get("tipo_sugerido") or "Boleta", e)
             raise HTTPException(status_code=500, detail=f"No se pudo emitir el DTE: {e}")
     try:
-        resp = adjuntar_comprobante_fl(oid, move_id)
+        resp = adjuntar_fl_registrado(oid, move_id)
         return {"ok": True, "id": oid, "emitido_ahora": emitido_ahora, "move_id": move_id, "respuesta": resp}
     except Exception as e:
         logger.error(f"[{oid}] Error adjuntando a Falabella: {e}", exc_info=True)
@@ -4895,6 +4923,75 @@ def adjuntar_comprobante_fl(oid: str, move_id: int) -> dict:
     logger.info(f"[{oid}] Documento tributario subido a Falabella "
                 f"(items {item_ids}, folio {datos['numero']}, {inv_type}, {len(pdf)} bytes): {resp}")
     return resp
+
+
+def _fl_pdf_registrar(oid: str, estado: str, error: str = "", contar: bool = True):
+    """Deja en la venta el resultado de la subida del PDF a Falabella."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE ventas SET fl_pdf_estado = %s, fl_pdf_error = %s, fl_pdf_en = %s, "
+                    "fl_pdf_intentos = COALESCE(fl_pdf_intentos, 0) + %s WHERE id = %s",
+                    (estado, (error or "")[:500], datetime.now(), 1 if contar else 0, oid),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"[{oid}] No se pudo registrar fl_pdf_estado={estado}: {e}")
+
+
+def adjuntar_fl_registrado(oid: str, move_id: int) -> dict:
+    """adjuntar_comprobante_fl + registro del resultado en la venta (ok / ya_cargado / error).
+    Relanza la excepcion para que el llamador decida (post-emision la traga, el endpoint la muestra)."""
+    _fl_pdf_registrar(oid, "pendiente", "", contar=False)
+    try:
+        resp = adjuntar_comprobante_fl(oid, move_id)
+    except Exception as e:
+        _fl_pdf_registrar(oid, "error", str(e))
+        raise
+    estado = "ya_cargado" if isinstance(resp, dict) and resp.get("ya_cargado") else "ok"
+    _fl_pdf_registrar(oid, estado, "")
+    return resp
+
+
+def reintentar_pdf_fl():
+    """Cada FL_PDF_RETRY_MIN minutos reintenta las subidas a Falabella que fallaron o quedaron
+    a medias. Solo ventas con intento registrado (fl_pdf_estado error/pendiente): las viejas sin
+    registro ('') no se tocan. Respeta el interruptor adjuntar_fl y un tope de intentos."""
+    from datetime import timedelta
+    intervalo = int(os.getenv("FL_PDF_RETRY_MIN", "30"))
+    max_int = int(os.getenv("FL_PDF_MAX_INTENTOS", "6"))
+    dias = int(os.getenv("FL_PDF_RETRY_DIAS", "15"))
+    while True:
+        time.sleep(intervalo * 60)
+        try:
+            if POST_EMIT.get("falabella", {}).get("adjuntar_fl") != "on":
+                continue
+            ahora = datetime.now()
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT id, move_id FROM ventas
+                           WHERE fuente = 'falabella' AND estado = 'enviado' AND move_id IS NOT NULL
+                             AND (fl_pdf_estado = 'error'
+                                  OR (fl_pdf_estado = 'pendiente' AND fl_pdf_en < %s))
+                             AND COALESCE(fl_pdf_intentos, 0) < %s
+                             AND enviado_en >= %s
+                           ORDER BY enviado_en DESC LIMIT 20""",
+                        (ahora - timedelta(minutes=10), max_int, ahora - timedelta(days=dias)),
+                    )
+                    filas = cur.fetchall()
+            if filas:
+                logger.info(f"[FL] Reintento PDF: {len(filas)} venta(s) pendientes de subir")
+            for f in filas:
+                try:
+                    adjuntar_fl_registrado(f["id"], f["move_id"])
+                    logger.info(f"[{f['id']}] Reintento PDF Falabella OK")
+                except Exception as e:
+                    logger.warning(f"[{f['id']}] Reintento PDF Falabella fallo: {e}")
+                time.sleep(5)
+        except Exception as e:
+            logger.error(f"[FL] Error en reintento de PDF: {e}", exc_info=True)
 
 
 def fl_get_orders_recent(created_after: str = None, limit: int = 100) -> list:
@@ -6204,11 +6301,29 @@ function filteredVentas() {
   return ventas.filter(function(v) {
     var okS = !s || v.estado === s;
     var okF = !f || (v.fuente || 'mercadolibre') === f;
-    var campos = [v.id, v.order_number, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro].filter(Boolean).join(' ').toLowerCase();
+    var campos = [v.id, v.order_number, v.cliente, v.rut, v.email, v.tipo_sugerido, v.direccion, v.giro, flPdfToken(v)].filter(Boolean).join(' ').toLowerCase();
     var okQ = !q || campos.indexOf(q) >= 0;
     var okT = !turnoActivo || getTurnoKey(v.creado_en) === turnoActivo;
     return okS && okQ && okT && okF;
   });
+}
+
+function flPdfToken(v) {
+  if (v.fuente !== 'falabella' || v.estado !== 'enviado') return '';
+  var e = v.fl_pdf_estado || '';
+  if (e === 'ok' || e === 'ya_cargado') return 'pdf-fl-ok';
+  if (e === 'error') return 'pdf-fl-error';
+  if (e === 'pendiente') return 'pdf-fl-pendiente';
+  return 'pdf-fl-sin-registro';
+}
+
+function flPdfBadge(v) {
+  var t = flPdfToken(v);
+  if (!t) return '';
+  if (t === 'pdf-fl-ok') return '<div class="small" style="color:#4ade80;margin-top:4px">PDF Falabella &#10003;</div>';
+  if (t === 'pdf-fl-error') return '<div class="small" style="color:#f87171;margin-top:4px" title="' + esc(v.fl_pdf_error || '') + '">PDF Falabella &#10007; ' + esc((v.fl_pdf_error || '').substring(0, 70)) + '</div>';
+  if (t === 'pdf-fl-pendiente') return '<div class="small" style="color:#fbbf24;margin-top:4px">PDF Falabella pendiente</div>';
+  return '<div class="small" style="color:#94a3b8;margin-top:4px">PDF Falabella sin registro</div>';
 }
 
 function rowHtml(v) {
@@ -6255,7 +6370,7 @@ function rowHtml(v) {
       (v.productos && v.productos.length ? '<ul class="compact">' + v.productos.slice(0,3).map(function(p){ return '<li>' + safe(p) + '</li>'; }).join('') + '</ul>' : '') + '</td>' +
     '<td>' + safe(v.tipo_sugerido) + '</td>' +
     '<td>' + enviobadge(v.tipo_envio) + '</td>' +
-    '<td>' + badge(v.estado) + fuentebadge(v.fuente) +
+    '<td>' + badge(v.estado) + fuentebadge(v.fuente) + flPdfBadge(v) +
       (v.error ? '<div class="small" style="color:#f87171;margin-top:4px">' + safe(v.error).substring(0,80) + '</div>' : '') + '</td>' +
     '<td><span>' + safe(v.estado_envio || 'paid') + '</span></td>' +
     '<td><div class="row-actions">' + acciones + '</div></td>' +
@@ -6358,7 +6473,7 @@ function refreshSilente() {
           for (var j = 0; j < ventas.length; j++) {
             if (String(ventas[j].id) === String(nv.id)) { ov = ventas[j]; break; }
           }
-          if (!ov || ov.estado !== nv.estado || ov.estado_envio !== nv.estado_envio || ov.move_id !== nv.move_id) {
+          if (!ov || ov.estado !== nv.estado || ov.estado_envio !== nv.estado_envio || ov.move_id !== nv.move_id || ov.fl_pdf_estado !== nv.fl_pdf_estado) {
             cambio = true; break;
           }
         }
