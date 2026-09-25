@@ -204,7 +204,9 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS nc_auto_excluida BOOLEAN DEFAULT FALSE",
                 # Resultado de la subida del PDF a Falabella (SetInvoicePDF). Antes solo quedaba
                 # en el log (Railway guarda ~1 dia) y los fallos eran invisibles.
-                # fl_pdf_estado: '' (nunca intentado) | pendiente | ok | ya_cargado | error
+                # fl_pdf_estado: '' (nunca intentado) | pendiente | ok | ya_cargado | error | manual
+                # manual = orden con 2+ items: Falabella acepta la subida por API pero no la asocia;
+                # el equipo la sube a mano en el Seller Center y la marca con "Ya lo subi".
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_estado TEXT DEFAULT ''",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_error TEXT DEFAULT ''",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_en TIMESTAMP",
@@ -4236,9 +4238,10 @@ class FlPdfMarcarPayload(BaseModel):
 @app.post("/fl/pdf/marcar")
 def fl_pdf_marcar(payload: FlPdfMarcarPayload):
     """Marca el estado del PDF Falabella sin subir nada (ej. ventas que ya se subieron antes
-    de que existiera el registro). estado: ok | ya_cargado | error | pendiente | ''"""
+    de que existiera el registro, o las que el equipo subio a mano).
+    estado: ok | ya_cargado | error | pendiente | manual | ''"""
     estado = (payload.estado or "").strip()
-    if estado not in ("ok", "ya_cargado", "error", "pendiente", ""):
+    if estado not in ("ok", "ya_cargado", "error", "pendiente", "manual", ""):
         raise HTTPException(status_code=400, detail="estado invalido")
     ids = [str(i) for i in (payload.ids or [])]
     for oid in ids:
@@ -4708,6 +4711,11 @@ FL_INVOICE_PDF_URL = os.getenv("FL_INVOICE_PDF_URL",
                                "https://sellercenter-api.falabella.com/v1/marketplace-sellers/invoice/pdf")
 # Codigo de operador segun pais (Chile=FACL, Colombia=FACO, Peru=FAPE).
 FL_OPERATOR_CODE = os.getenv("FL_OPERATOR_CODE", "FACL")
+# Desde ~mediados de sep-2026 SetInvoicePDF responde "PDF uploaded successfully" en ordenes
+# con 2+ items pero Falabella no asocia el documento (Seller Center queda en "0 de N"); hasta
+# el 03-09 funcionaba. No hay forma de verificarlo por API, asi que esas ventas se marcan
+# 'manual' para subirlas a mano. Cuando Falabella lo arregle: FL_PDF_MULTI_MANUAL=0.
+FL_PDF_MULTI_MANUAL = os.getenv("FL_PDF_MULTI_MANUAL", "1") == "1"
 FL_DEFAULT_EMAIL = "boleta@lemulux.com"
 FL_ESTADOS_VALIDOS = {"pending", "ready_to_ship", "shipped", "delivered", "processing"}
 
@@ -4920,6 +4928,8 @@ def adjuntar_comprobante_fl(oid: str, move_id: int) -> dict:
     pdf = obtener_pdf_dte_odoo(move_id)
     inv_type = fl_invoice_type(venta.get("tipo_sugerido") or "Boleta")
     resp = subir_comprobante_fl(item_ids, pdf, datos["numero"], datos["fecha"], inv_type, oid)
+    if isinstance(resp, dict):
+        resp["items_enviados"] = len(item_ids)
     logger.info(f"[{oid}] Documento tributario subido a Falabella "
                 f"(items {item_ids}, folio {datos['numero']}, {inv_type}, {len(pdf)} bytes): {resp}")
     return resp
@@ -4949,7 +4959,14 @@ def adjuntar_fl_registrado(oid: str, move_id: int) -> dict:
     except Exception as e:
         _fl_pdf_registrar(oid, "error", str(e))
         raise
-    estado = "ya_cargado" if isinstance(resp, dict) and resp.get("ya_cargado") else "ok"
+    if isinstance(resp, dict) and resp.get("ya_cargado"):
+        estado = "ya_cargado"
+    elif FL_PDF_MULTI_MANUAL and isinstance(resp, dict) and int(resp.get("items_enviados") or 0) > 1:
+        estado = "manual"
+        logger.warning(f"[{oid}] Orden Falabella con {resp.get('items_enviados')} items: "
+                       f"Falabella no asocia el PDF por API, queda para subir a mano")
+    else:
+        estado = "ok"
     _fl_pdf_registrar(oid, estado, "")
     return resp
 
@@ -6314,6 +6331,7 @@ function flPdfToken(v) {
   if (e === 'ok' || e === 'ya_cargado') return 'pdf-fl-ok';
   if (e === 'error') return 'pdf-fl-error';
   if (e === 'pendiente') return 'pdf-fl-pendiente';
+  if (e === 'manual') return 'pdf-fl-manual';
   return 'pdf-fl-sin-registro';
 }
 
@@ -6323,6 +6341,8 @@ function flPdfBadge(v) {
   if (t === 'pdf-fl-ok') return '<div class="small" style="color:#4ade80;margin-top:4px">PDF Falabella &#10003;</div>';
   if (t === 'pdf-fl-error') return '<div class="small" style="color:#f87171;margin-top:4px" title="' + esc(v.fl_pdf_error || '') + '">PDF Falabella &#10007; ' + esc((v.fl_pdf_error || '').substring(0, 70)) + '</div>';
   if (t === 'pdf-fl-pendiente') return '<div class="small" style="color:#fbbf24;margin-top:4px">PDF Falabella pendiente</div>';
+  if (t === 'pdf-fl-manual') return '<div class="small" style="color:#fb923c;margin-top:4px;font-weight:600" title="Pedido con varios productos: Falabella no lo asocia por API. Subirlo en el Seller Center con Cargar documento - Todos los productos">PDF Falabella: subir a mano ' +
+    '<button data-action="flpdfok" data-id="' + esc(v.id) + '" style="margin-left:4px;padding:2px 8px;font-size:11px;border-radius:6px;border:1px solid #fb923c;background:transparent;color:#fb923c;cursor:pointer">Ya lo sub&iacute;</button></div>';
   return '<div class="small" style="color:#94a3b8;margin-top:4px">PDF Falabella sin registro</div>';
 }
 
@@ -6440,6 +6460,7 @@ function renderTable() {
       else if (action === 'notacredito') abrirNC(id);
       else if (action === 'adjuntarml') adjuntarMlManual(id);
       else if (action === 'adjuntarfl') adjuntarFlManual(id);
+      else if (action === 'flpdfok') marcarFlPdfSubido(id);
       else if (action === 'verpack') verPack(id, el.dataset.pack);
       else if (action === 'copy') { try { navigator.clipboard.writeText(id); } catch(e2) {} }
     });
@@ -6716,6 +6737,14 @@ function adjuntarFlManual(id) {
         refreshData();
       } else { alert('Error: ' + (d.detail || 'desconocido')); }
     })
+    .catch(function(e){ alert('Error: ' + e.message); });
+}
+
+function marcarFlPdfSubido(id) {
+  if (!confirm('Confirmas que el PDF de ' + id + ' ya quedo cargado en el Seller Center de Falabella?')) return;
+  fetch('/fl/pdf/marcar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ids: [id], estado: 'ok'})})
+    .then(function(r){ return r.json(); })
+    .then(function(d) { if (d.ok) { refreshData(); } else { alert('Error: ' + (d.detail || 'desconocido')); } })
     .catch(function(e){ alert('Error: ' + e.message); });
 }
 
