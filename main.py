@@ -4623,15 +4623,6 @@ def fl_buscar(numero: str, days: int = 30, ingresar: bool = False):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    def _status(o):
-        s = o.get("Statuses")
-        vals = s.get("Status") if isinstance(s, dict) else s
-        if isinstance(vals, list):
-            vals = vals[0] if vals else ""
-        if isinstance(vals, dict):
-            vals = vals.get("Status")
-        return str(vals or "").strip().lower().replace(" ", "_")
-
     match = None
     for o in ordenes:
         if str(o.get("OrderId")) == numero or str(o.get("OrderNumber") or "") == numero:
@@ -4643,7 +4634,7 @@ def fl_buscar(numero: str, days: int = 30, ingresar: bool = False):
                         f"(?days=90). Verifica que el numero sea el OrderId o el OrderNumber (Orden Nº) real."}
     order_id = str(match.get("OrderId"))
     order_number = str(match.get("OrderNumber") or "")
-    st = _status(match)
+    st = fl_status_de_orden(match)
     oid = f"FL-{order_id}"
     v = get_venta(oid)
     resp = {"ok": True, "encontrada_en_fl": True, "order_id": order_id, "order_number": order_number,
@@ -4710,6 +4701,22 @@ FL_INVOICE_PDF_URL = os.getenv("FL_INVOICE_PDF_URL",
 FL_OPERATOR_CODE = os.getenv("FL_OPERATOR_CODE", "FACL")
 FL_DEFAULT_EMAIL = "boleta@lemulux.com"
 FL_ESTADOS_VALIDOS = {"pending", "ready_to_ship", "shipped", "delivered", "processing"}
+
+
+def fl_status_de_orden(order: dict) -> str:
+    """Estado de una orden Falabella, sea cual sea la forma en que venga 'Statuses'.
+    GetOrders alterna entre {"Status": "pending"}, {"Status": ["pending"]}, ["pending"] y
+    [{"Status": "pending"}] segun el tamano de la respuesta. Desenvolver mal esto hace que la
+    orden se descarte en silencio: paso el 25-sep-2026 y Falabella dejo de ingresar durante dias."""
+    val = order.get("Statuses")
+    for _ in range(4):  # desenvuelve dict/list anidados sin asumir un orden fijo
+        if isinstance(val, dict):
+            val = val.get("Status", "")
+        elif isinstance(val, list):
+            val = val[0] if val else ""
+        else:
+            break
+    return str(val or "").strip().lower().replace(" ", "_")
 
 WC_STATE_TO_REGION_FL = {
     "AI": "Aysen del Gral. Carlos Ibanez del Campo",
@@ -5393,17 +5400,7 @@ def process_fl_order(order_id: str, order_data: dict = None):
         # Normalizar status de forma robusta.
         # En GetOrders, Statuses suele venir como {"Status": ["delivered"]} (lista anidada);
         # tambien puede ser {"Status": "..."}, una lista, o un string directo.
-        _s = order.get("Statuses")
-        status_raw = None
-        if isinstance(_s, dict):
-            status_raw = _s.get("Status")
-        elif isinstance(_s, (list, str)):
-            status_raw = _s
-        if isinstance(status_raw, list):
-            status_raw = status_raw[0] if status_raw else None
-        if isinstance(status_raw, dict):  # p.ej. {"Status": "..."} anidado
-            status_raw = status_raw.get("Status")
-        status_val = str(status_raw or "pending").strip().lower().replace(" ", "_")
+        status_val = fl_status_de_orden(order) or "pending"
 
         if existing:
             update_venta(oid_str, estado_envio=status_val)
@@ -5644,21 +5641,9 @@ def reconciliar_fl_ordenes():
                 with conn.cursor() as cur:
                     cur.execute("SELECT id FROM ventas WHERE id = ANY(%s::text[])", (ids_fl,))
                     ids_en_bd = {str(row["id"]) for row in cur.fetchall()}
-            def fl_get_status(o):
-                """Extrae status de forma robusta sin importar el shape de Statuses."""
-                s = o.get("Statuses")
-                if isinstance(s, dict):
-                    val = s.get("Status", "")
-                elif isinstance(s, list):
-                    val = s[0] if s else ""
-                elif isinstance(s, str):
-                    val = s
-                else:
-                    val = ""
-                return str(val).strip().lower().replace(" ", "_")
-
-            faltantes = [o for o in ordenes if f"FL-{o['OrderId']}" not in ids_en_bd
-                         and fl_get_status(o) in FL_ESTADOS_VALIDOS]
+            no_en_bd = [o for o in ordenes if f"FL-{o['OrderId']}" not in ids_en_bd]
+            faltantes = [o for o in no_en_bd if fl_status_de_orden(o) in FL_ESTADOS_VALIDOS]
+            descartadas = [o for o in no_en_bd if o not in faltantes]
             _max_recon = int(os.getenv("FL_RECON_MAX", "50"))
             if faltantes:
                 logger.warning(f"[FL] Reconciliacion: {len(faltantes)} faltantes, procesando hasta {_max_recon}")
@@ -5672,6 +5657,12 @@ def reconciliar_fl_ordenes():
                         time.sleep(2)
             else:
                 logger.info(f"[FL] Reconciliacion OK: {len(ordenes)} ordenes en BD")
+            if descartadas:
+                # Nunca en silencio: si se descarta algo, decir por que estado.
+                from collections import Counter as _C
+                _det = dict(_C(fl_status_de_orden(o) for o in descartadas))
+                logger.warning(f"[FL] Reconciliacion: {len(descartadas)} orden(es) fuera de la BD "
+                               f"descartadas por estado {_det}")
 
             # Cancelaciones / devoluciones en ordenes YA emitidas: crear NC automatica.
             rev = _fl_estados_reversion()
