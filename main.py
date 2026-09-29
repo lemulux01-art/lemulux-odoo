@@ -209,6 +209,9 @@ def init_db():
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_error TEXT DEFAULT ''",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_en TIMESTAMP",
                 "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_intentos INTEGER DEFAULT 0",
+                # Etapas de la orden en que ya se subio el PDF (ej. "ready_to_ship,delivered").
+                # Falabella descarta en silencio lo que llega antes de tiempo; ver fl_pdf_etapa_debida.
+                "ALTER TABLE ventas ADD COLUMN IF NOT EXISTS fl_pdf_etapas TEXT DEFAULT ''",
             ]:
                 cur.execute(stmt)
             cur.execute(
@@ -1635,7 +1638,15 @@ def ejecutar_post_emision(move_id: int, fuente: str, oid: str):
             logger.error(f"[{oid}] Post-emision 'adjuntar_ml' fallo: {e}", exc_info=True)
     if cfg.get("adjuntar_fl") == "on":
         try:
-            adjuntar_fl_registrado(oid, move_id)
+            st = str((get_venta(oid) or {}).get("estado_envio") or "").strip().lower()
+            if st not in FL_PDF_ETAPAS_VALIDAS:
+                # Antes de ready_to_ship Falabella lo descarta; lo sube el reconciliador al avanzar.
+                _fl_pdf_registrar(oid, "espera", f"La orden sigue en '{st or 'pending'}' en Falabella; "
+                                  "el PDF se sube al pasar a listo para despacho", contar=False)
+                logger.info(f"[{oid}] PDF Falabella en espera: la orden sigue en '{st or 'pending'}'")
+            else:
+                adjuntar_fl_registrado(oid, move_id)
+                _fl_pdf_marcar_etapa(oid, st)
         except Exception as e:
             logger.error(f"[{oid}] Post-emision 'adjuntar_fl' fallo: {e}", exc_info=True)
 
@@ -4947,6 +4958,85 @@ def _fl_pdf_registrar(oid: str, estado: str, error: str = "", contar: bool = Tru
         logger.error(f"[{oid}] No se pudo registrar fl_pdf_estado={estado}: {e}")
 
 
+# Falabella responde "PDF uploaded successfully" pero descarta el documento si llega antes de tiempo:
+# - con la orden en pending/processing ni siquiera la lista en Documentos tributarios;
+# - en ordenes de 2+ items, lo subido en ready_to_ship/shipped queda "0 de N". El 28-sep-2026 la unica
+#   multiproducto que quedo "4 de 4" (3252981606) fue la que se resubio ya en delivered.
+# Por eso el PDF se sube al llegar a ready_to_ship y, si la orden trae varios items, otra vez en delivered.
+FL_PDF_ETAPAS_VALIDAS = ("ready_to_ship", "shipped", "delivered")
+
+
+def fl_pdf_etapa_debida(estado_orden: str, items: int, etapas_hechas: set) -> Optional[str]:
+    """Que etapa toca subir ahora, o None. Pura: no toca la BD ni la API."""
+    st = (estado_orden or "").strip().lower()
+    if st not in FL_PDF_ETAPAS_VALIDAS:
+        return None
+    if not etapas_hechas:
+        return st
+    if items > 1 and st == "delivered" and "delivered" not in etapas_hechas:
+        return "delivered"
+    return None
+
+
+def _fl_pdf_etapas(venta: dict) -> set:
+    return {e for e in (venta.get("fl_pdf_etapas") or "").split(",") if e}
+
+
+def _fl_pdf_marcar_etapa(oid: str, etapa: str):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE ventas SET fl_pdf_etapas = CASE WHEN COALESCE(fl_pdf_etapas,'') = '' THEN %s "
+                    "ELSE fl_pdf_etapas || ',' || %s END WHERE id = %s "
+                    "AND POSITION(%s IN COALESCE(fl_pdf_etapas,'')) = 0",
+                    (etapa, etapa, oid, etapa),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"[{oid}] No se pudo registrar la etapa {etapa} del PDF: {e}")
+
+
+def fl_pdf_por_etapas(ordenes: list, ids_en_bd: set) -> int:
+    """Sube el PDF de las ordenes ya emitidas que llegaron a una etapa pendiente de subida
+    (ver fl_pdf_etapa_debida). Tope por ciclo para no disparar decenas de subidas de una vez.
+    Devuelve cuantas subidas intento."""
+    if POST_EMIT.get("falabella", {}).get("adjuntar_fl") != "on":
+        return 0
+    tope = int(os.getenv("FL_PDF_ETAPA_MAX", "10"))
+    hechas = 0
+    for o in ordenes:
+        if hechas >= tope:
+            break
+        oid_o = f"FL-{o['OrderId']}" if o.get("OrderId") else None
+        if not oid_o or oid_o not in ids_en_bd:
+            continue
+        v = get_venta(oid_o)
+        if not v or v.get("estado") != "enviado" or not v.get("move_id"):
+            continue
+        if (v.get("fl_pdf_estado") or "") in ("error", "pendiente"):
+            continue  # de esas se encarga reintentar_pdf_fl
+        try:
+            n_items = int(o.get("ItemsCount") or 1)
+        except (TypeError, ValueError):
+            n_items = 1
+        etapas = _fl_pdf_etapas(v)
+        if not etapas and (v.get("fl_pdf_estado") or "") in ("ok", "ya_cargado"):
+            etapas = {"previa"}  # subida antes de este cambio: no repetirla de una
+        etapa = fl_pdf_etapa_debida(fl_status_de_orden(o), n_items, etapas)
+        if not etapa:
+            continue
+        try:
+            adjuntar_fl_registrado(oid_o, v["move_id"])
+            _fl_pdf_marcar_etapa(oid_o, etapa)
+            logger.info(f"[{oid_o}] PDF Falabella subido en etapa '{etapa}' ({n_items} items)")
+        except Exception as e:
+            logger.warning(f"[{oid_o}] PDF Falabella en etapa '{etapa}' fallo: {e}")
+        hechas += 1
+        time.sleep(2)
+    return hechas
+
+
 def adjuntar_fl_registrado(oid: str, move_id: int) -> dict:
     """adjuntar_comprobante_fl + registro del resultado en la venta (ok / ya_cargado / error).
     Relanza la excepcion para que el llamador decida (post-emision la traga, el endpoint la muestra)."""
@@ -5664,6 +5754,9 @@ def reconciliar_fl_ordenes():
                 logger.warning(f"[FL] Reconciliacion: {len(descartadas)} orden(es) fuera de la BD "
                                f"descartadas por estado {_det}")
 
+            # PDF por etapas en ordenes YA emitidas (ver fl_pdf_etapa_debida).
+            fl_pdf_por_etapas(ordenes, ids_en_bd)
+
             # Cancelaciones / devoluciones en ordenes YA emitidas: crear NC automatica.
             rev = _fl_estados_reversion()
             def _statuses_tokens(o):
@@ -6305,6 +6398,7 @@ function flPdfToken(v) {
   if (e === 'ok' || e === 'ya_cargado') return 'pdf-fl-ok';
   if (e === 'error') return 'pdf-fl-error';
   if (e === 'pendiente') return 'pdf-fl-pendiente';
+  if (e === 'espera') return 'pdf-fl-espera';
   return 'pdf-fl-sin-registro';
 }
 
@@ -6314,6 +6408,7 @@ function flPdfBadge(v) {
   if (t === 'pdf-fl-ok') return '<div class="small" style="color:#4ade80;margin-top:4px">PDF Falabella &#10003;</div>';
   if (t === 'pdf-fl-error') return '<div class="small" style="color:#f87171;margin-top:4px" title="' + esc(v.fl_pdf_error || '') + '">PDF Falabella &#10007; ' + esc((v.fl_pdf_error || '').substring(0, 70)) + '</div>';
   if (t === 'pdf-fl-pendiente') return '<div class="small" style="color:#fbbf24;margin-top:4px">PDF Falabella pendiente</div>';
+  if (t === 'pdf-fl-espera') return '<div class="small" style="color:#94a3b8;margin-top:4px" title="' + esc(v.fl_pdf_error || '') + '">PDF Falabella: se sube al despachar</div>';
   return '<div class="small" style="color:#94a3b8;margin-top:4px">PDF Falabella sin registro</div>';
 }
 
