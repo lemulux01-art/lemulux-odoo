@@ -4896,13 +4896,31 @@ def subir_comprobante_fl(order_item_ids: list, pdf_bytes: bytes, invoice_number:
         data = res.json()
     except Exception:
         data = {"status_code": res.status_code, "text": res.text[:500]}
-    # Duplicado = documento ya cargado -> idempotente, se trata como OK.
-    _txt = json.dumps(data).lower() if isinstance(data, (dict, list)) else str(data).lower()
-    if res.status_code == 409 or "duplicat" in _txt or "already" in _txt or "e004" in _txt or "ya existe" in _txt:
+    return fl_validar_respuesta_pdf(res.status_code, data, oid)
+
+
+def fl_validar_respuesta_pdf(status_code: int, data: Any, oid: str) -> dict:
+    """Valida la respuesta de carga; E004 y HTTP 409 no significan duplicado.
+
+    Falabella tambien usa E004 para items inexistentes, estado invalido, fecha
+    futura y limite de documentos. Solo su error especifico de factura existente
+    conserva el tratamiento idempotente. Una aceptacion no verifica Seller Center.
+    """
+    error = data.get("ErrorResponse") if isinstance(data, dict) else None
+    body = error.get("Body") if isinstance(error, dict) else None
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if (status_code in (400, 409) and isinstance(errors, list) and errors
+            and all(isinstance(e, dict) and e.get("message") == "INVOICE_ALREADY_EXISTS"
+                    for e in errors)):
         logger.info(f"[{oid}] Falabella: el documento YA estaba cargado (ok idempotente): {data}")
-        return {"ok": True, "ya_cargado": True, "status_code": res.status_code}
-    if res.status_code >= 400 or (isinstance(data, dict) and data.get("ErrorResponse")):
-        raise Exception(f"Falabella rechazo el documento (HTTP {res.status_code}): {data}")
+        return {"ok": True, "ya_cargado": True, "status_code": status_code}
+    if not 200 <= status_code < 300 or (isinstance(data, dict) and "ErrorResponse" in data):
+        raise Exception(f"Falabella rechazo el documento (HTTP {status_code}): {data}")
+    success = data.get("SuccessResponse") if isinstance(data, dict) else None
+    body = success.get("Body") if isinstance(success, dict) else None
+    invoice = body.get("Invoice") if isinstance(body, dict) else None
+    if not isinstance(invoice, dict) or invoice.get("message") != "PDF uploaded successfully":
+        raise Exception(f"Falabella no confirmo la recepcion del PDF (HTTP {status_code}): {data}")
     return data
 
 
